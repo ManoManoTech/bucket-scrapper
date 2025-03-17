@@ -1,0 +1,36 @@
+# Example configuration file for the log consolidator checker
+bucketsToConsolidate:
+  - bucket: source-logs-bucket-1
+    path:
+      - static: logs
+      - datefmt: 2006/01/02/15
+    only_prefix_patterns:
+      - "^app-.*\\.json\\.gz$"
+      - "^api-.*\\.json\\.zst$"
+    proceed_without_matching_objects: false
+  
+  - bucket: source-logs-bucket-2
+    path:
+      - static: application-logs
+      - static: prod
+      - datefmt: dt=20060102/hour=15
+    proceed_without_matching_objects: true
+
+bucketsConsolidated:
+  - bucket: destination-logs-bucket
+    path:
+      - static: consolidated-logs
+      - datefmt: dt=20060102/hour=15
+    proceed_without_matching_objects: false
+
+bucketsCheckerResults:
+  - bucket: logs-check-results-bucket
+    path:
+      - static: check-results
+      - datefmt: dt=20060102/hour=15
+    proceed_without_matching_objects: true
+
+# Additional configuration parameters
+continuousConsolidation:
+  minAge: 1h
+  maxAge: 72h
