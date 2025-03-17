@@ -1,19 +1,16 @@
 // src/s3/checker.rs
 // Location: src/s3/checker.rs
 
-use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
+use crate::config::types::{BucketConfig, DateString, HourString, S3ObjectInfo};
 use crate::s3::client::S3Client;
 use crate::s3::downloader::S3Downloader;
 use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::{MemoryMonitor, ProgressTracker};
-use anyhow::{Context, Result};
-use aws_sdk_s3::Client as S3SdkClient;
-use chrono::{DateTime, Utc};
+use anyhow::Result;
+use chrono::Utc;
 use crc32fast::Hasher;
-use futures::SinkExt;
 use log::{debug, info, warn};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

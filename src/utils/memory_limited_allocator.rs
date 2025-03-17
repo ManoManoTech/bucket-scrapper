@@ -87,7 +87,7 @@ struct AllocFuture {
 impl Future for AllocFuture {
     type Output = LimitedVec;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut limiter = self.limiter.lock().unwrap();
 
         if limiter.try_allocate(self.size) {
@@ -108,7 +108,7 @@ impl Future for AllocFuture {
 impl Drop for AllocFuture {
     fn drop(&mut self) {
         // Remove any lingering waker, if any
-        let mut limiter = self.limiter.lock().unwrap();
+        let limiter = self.limiter.lock().unwrap();
         limiter.waiters.remove(&self.id);
     }
 }

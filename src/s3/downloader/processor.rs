@@ -2,7 +2,7 @@
 use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::{Result};
-use log::{debug, warn, info};
+use log::{debug, warn};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task;
@@ -53,7 +53,6 @@ impl Processor {
                 let result = Self::process_item(
                     &item.key,
                     &item.data,
-                    item.is_compressed,
                     &item.compression_type,
                 );
     
@@ -103,42 +102,35 @@ impl Processor {
     fn process_item(
         key: &str,
         data: &crate::utils::memory_limited_allocator::LimitedVec,
-        compressed: bool,
         compression_type: &CompressionType,
     ) -> Result<DetailedCharacterCount> {
-        debug!("Processing {} (compressed: {})", key, compressed);
+        debug!("Processing {})", key);
 
         let mut counts = DetailedCharacterCount::new();
-
-        if compressed {
-            match compression_type {
-                CompressionType::Gzip => {
-                    // Process gzip compressed data
-                    use flate2::read::GzDecoder;
-                    let data_vec = data.as_vec();
-                    let mut decoder = GzDecoder::new(data_vec.as_slice());
-                    Self::process_reader(&mut decoder, &mut counts)?;
-                }
-                CompressionType::Zstd => {
-                    // For zstd, use streaming decompression
-                    use std::io::Read;
-                    let data_vec = data.as_vec();
-                    let mut decompressor = zstd::Decoder::new(data_vec.as_slice())
-                        .map_err(|e| anyhow::anyhow!("Failed to create Zstd decompressor: {}", e))?;
-
-                    Self::process_reader(&mut decompressor, &mut counts)?;
-                }
-                CompressionType::None => {
-                    // Should not get here if compressed is true
-                    return Err(anyhow::anyhow!("Internal error: compressed is true but CompressionType is None"));
-                }
+        
+        match compression_type {
+            CompressionType::Gzip => {
+                // Process gzip compressed data
+                use flate2::read::GzDecoder;
+                let data_vec = data.as_vec();
+                let mut decoder = GzDecoder::new(data_vec.as_slice());
+                Self::process_reader(&mut decoder, &mut counts)?;
             }
-        } else {
-            // Process uncompressed data directly
-            counts.increment_batch_unsafe(data.as_vec());
-            // for &byte in data.as_vec() {
-            //     counts.increment(byte);
-            // }
+            CompressionType::Zstd => {
+                // For zstd, use streaming decompression
+                let data_vec = data.as_vec();
+                let mut decompressor = zstd::Decoder::new(data_vec.as_slice())
+                    .map_err(|e| anyhow::anyhow!("Failed to create Zstd decompressor: {}", e))?;
+
+                Self::process_reader(&mut decompressor, &mut counts)?;
+            }
+            CompressionType::None => {
+                // Process uncompressed data directly
+                counts.increment_batch_unsafe(data.as_vec());
+                // for &byte in data.as_vec() {
+                //     counts.increment(byte);
+                // }
+            }
         }
 
         debug!("Finished processing {}: {} characters", key, counts.total());

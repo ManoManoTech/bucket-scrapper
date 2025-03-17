@@ -7,11 +7,10 @@ mod utils;
 use crate::config::loader::{get_archived_buckets, get_consolidated_buckets, load_config};
 use crate::s3::checker::Checker;
 use crate::s3::client::S3Client;
-use crate::utils::signal_handler::MemoryMonitor;
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use log::{debug, error, info, warn, LevelFilter};
+use log::{info, warn, LevelFilter};
 use std::path::PathBuf;
 use utils::date::date_range_to_date_hour_list;
 

@@ -1,8 +1,7 @@
 // src/utils/date.rs
 use crate::config::types::{DateString, HourString};
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, TimeZone, Utc};
-use regex::Regex;
+use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 
 pub struct DateHour {
     pub date: DateString,

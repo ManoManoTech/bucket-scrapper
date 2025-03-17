@@ -33,21 +33,6 @@ pub struct ConfigSchema {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BucketInfo {
-    pub kind: BucketKind,
-    pub bucket: String,
-    pub proceed_without_matching_objects: bool,
-    pub only_prefix_patterns: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum BucketKind {
-    Archived,
-    Consolidated,
-    Results,
-}
-
 pub type DateString = String; // YYYYMMDD format
 pub type HourString = String; // HH format 00-23
 

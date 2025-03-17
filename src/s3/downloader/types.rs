@@ -24,9 +24,7 @@ pub enum CompressionType {
 pub struct ProcessItem {
     pub key: String,
     pub data: LimitedVec,
-    pub is_compressed: bool,
     pub compression_type: CompressionType,
-    pub size: usize, // Original size for progress tracking
 }
 
 /// Main downloader structure that orchestrates the S3 fetching and processing
@@ -40,31 +38,6 @@ pub struct S3Downloader {
 }
 
 impl S3Downloader {
-    pub fn new(
-        client: Client,
-        max_concurrent_downloads: usize,
-        process_threads: usize,
-        memory_pool_mb: usize
-    ) -> Self {
-        // Convert MB to bytes
-        let memory_pool_bytes = memory_pool_mb * 1024 * 1024;
-
-        info!("Initializing S3Downloader with {} concurrent downloads, {} process threads, {}MB memory pool",
-              max_concurrent_downloads, process_threads, memory_pool_mb);
-
-        let memory_allocator = Arc::new(MemoryLimitedAllocator::new(memory_pool_bytes));
-        let download_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
-
-        Self {
-            s3_fetcher: S3Fetcher::new(client, memory_allocator.clone()),
-            processor: Processor::new(),
-            download_semaphore,
-            process_threads,
-            memory_allocator,
-            progress_tracker: None,
-        }
-    }
-
     pub fn new_with_allocator(
         client: Client,
         max_concurrent_downloads: usize,

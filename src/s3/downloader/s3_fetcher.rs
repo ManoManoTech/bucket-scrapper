@@ -1,6 +1,6 @@
 // src/s3/downloader/s3_fetcher.rs
 use crate::config::types::S3ObjectInfo;
-use crate::utils::memory_limited_allocator::{MemoryLimitedAllocator, LimitedVec};
+use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -146,16 +146,11 @@ impl S3Fetcher {
                     tracker.increment_processed(bytes_read);
                 }
 
-                // Determine if this is a compressed file
-                let is_compressed = matches!(compression_type, CompressionType::Gzip | CompressionType::Zstd);
-
                 // Send data for processing
                 match tx.send(ProcessItem {
                     key: obj.key.clone(),
                     data: buffer,
-                    is_compressed,
                     compression_type,
-                    size: obj.size,
                 }).await {
                     Ok(_) => Ok(()),
                     Err(e) => {

@@ -2,18 +2,14 @@
 // Location: src/s3/client.rs
 use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
 use crate::utils::path_formatter::generate_path_formatter;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use log::{debug, info};
 use regex::Regex;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 pub struct S3Client {
     client: Client,
