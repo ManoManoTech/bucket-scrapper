@@ -1,16 +1,18 @@
+use std::collections::VecDeque;
 // src/utils/memory_limited_allocator.rs
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::collections::VecDeque;
+use rand::prelude::*;
+use dashmap::DashMap;
 
 // The core structure that tracks memory allocation
 struct MemoryLimiter {
     total_capacity: usize,
     current_usage: usize,
     active_loans: usize,
-    waiters: VecDeque<(usize, Waker)>,
+    waiters: DashMap<u64, (usize, Waker)>,
 }
 
 impl MemoryLimiter {
@@ -19,7 +21,7 @@ impl MemoryLimiter {
             total_capacity,
             current_usage: 0,
             active_loans: 0,
-            waiters: VecDeque::new(),
+            waiters: DashMap::new(),
         }
     }
 
@@ -44,18 +46,21 @@ impl MemoryLimiter {
         self.active_loans = self.active_loans.saturating_sub(1);
 
         // Wake up waiters if possible
-        let mut i = 0;
-        while i < self.waiters.len() {
-            let (wait_size, waker) = &self.waiters[i];
-            if self.current_usage + wait_size <= self.total_capacity {
-                // This waiter can be satisfied
-                let (wait_size, waker) = self.waiters.remove(i).unwrap();
-                self.current_usage += wait_size; // Pre-allocate for the waiter
+        let mut awaken_usage = 0;
+        let mut waiters_to_pop = VecDeque::<u64>::new();
+        for kv in self.waiters.iter() {
+            let (waiter_id, (wait_size, waker)) = kv.pair();
+            if self.current_usage + awaken_usage + *wait_size <= self.total_capacity {
+                // This is likely to allocate properly
+                waiters_to_pop.push_back(*waiter_id);
+                awaken_usage += wait_size;
                 waker.wake_by_ref();
-            } else {
-                i += 1;
             }
         }
+        
+        waiters_to_pop.iter().for_each(|waiter_id| {
+            self.waiters.remove(&waiter_id);
+        })
     }
 
     fn get_loan_count(&self) -> usize {
@@ -68,25 +73,21 @@ impl MemoryLimiter {
     }
 
     fn get_waiters_total_size(&self) -> usize {
-        self.waiters.iter().map(|(size, _)| size).sum()
+        self.waiters.iter().map(|kv| kv.value().0).sum()
     }
 }
 
 // Future for async allocation
 struct AllocFuture {
+    id: u64,
     limiter: Arc<Mutex<MemoryLimiter>>,
     size: usize,
-    waker: Option<Waker>,
 }
 
 impl Future for AllocFuture {
     type Output = LimitedVec;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Store the waker before locking to avoid borrow conflicts
-        let waker = cx.waker().clone();
-        self.waker = Some(waker.clone());
-
         let mut limiter = self.limiter.lock().unwrap();
 
         if limiter.try_allocate(self.size) {
@@ -99,18 +100,16 @@ impl Future for AllocFuture {
         }
 
         // Couldn't allocate, register waker
-        limiter.waiters.push_back((self.size, waker));
+        limiter.waiters.insert(self.id, (self.size, cx.waker().clone()));
         Poll::Pending
     }
 }
 
 impl Drop for AllocFuture {
     fn drop(&mut self) {
-        if let Some(waker) = &self.waker {
-            let mut limiter = self.limiter.lock().unwrap();
-            // Remove our waiter if we're being dropped
-            limiter.waiters.retain(|(_, w)| !waker.will_wake(w));
-        }
+        // Remove any lingering waker, if any
+        let mut limiter = self.limiter.lock().unwrap();
+        limiter.waiters.remove(&self.id);
     }
 }
 
@@ -172,24 +171,11 @@ impl MemoryLimitedAllocator {
 
     // Allocate a vec of the given size, blocking if capacity limit is reached
     pub fn alloc_vec(&self, size: usize) -> impl Future<Output = LimitedVec> {
+        let mut rng = rand::rng();
         AllocFuture {
+            id: rng.next_u64(),
             limiter: self.limiter.clone(),
             size,
-            waker: None,
-        }
-    }
-
-    // Try to allocate a vec immediately, returning None if at capacity
-    pub fn try_alloc_vec(&self, size: usize) -> Option<LimitedVec> {
-        let mut limiter = self.limiter.lock().unwrap();
-        if limiter.try_allocate(size) {
-            Some(LimitedVec {
-                vec: Vec::with_capacity(size),
-                size,
-                limiter: self.limiter.clone(),
-            })
-        } else {
-            None
         }
     }
 

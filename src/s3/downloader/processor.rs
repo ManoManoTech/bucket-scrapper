@@ -151,11 +151,11 @@ impl Processor {
         counts: &mut DetailedCharacterCount,
     ) -> Result<()> {
         // Use a fixed-size buffer for streaming decompression
-        const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer
+        const BUFFER_SIZE: usize = 128 * 1024; // 64KB buffer
         let mut buffer = vec![0u8; BUFFER_SIZE];
 
         loop {
-            match reader.read(&mut buffer) {
+            match reader.read(&mut buffer[..]) {
                 Ok(0) => break, // End of stream
                 Ok(n) => {
                     // Count characters in this chunk

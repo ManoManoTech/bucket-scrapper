@@ -30,6 +30,8 @@ zstd = { version = "0.13.2" , features = ["experimental"] }
 flate2 = "1.0"
 signal-hook = "0.3.17"
 human_bytes = "0.4.3"
+dashmap = "6.1.0"
+rand = "0.9.0"
 
 [profile.release]
 opt-level = 3
