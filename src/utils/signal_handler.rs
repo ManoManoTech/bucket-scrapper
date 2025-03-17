@@ -62,9 +62,7 @@ impl ProgressTracker {
     }
 
     pub fn reset(&self) {
-        self.total_files.store(0, Ordering::SeqCst);
         self.completed_files.store(0, Ordering::SeqCst);
-        self.total_bytes.store(0, Ordering::SeqCst);
         self.processed_bytes.store(0, Ordering::SeqCst);
     }
 

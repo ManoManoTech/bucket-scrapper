@@ -19,53 +19,6 @@ impl Processor {
     pub fn new() -> Self {
         Self {}
     }
-
-    // pub async fn process_data(
-    //     &self,
-    //     mut rx: mpsc::Receiver<ProcessItem>,
-    //     thread_count: usize,
-    //     progress_tracker: Option<Arc<ProgressTracker>>,
-    // ) -> Result<DetailedCharacterCount> {
-    //     info!("Process data started with {} threads", thread_count);
-    // 
-    //     // Create a simple semaphore to limit concurrent processing tasks
-    //     let semaphore = Arc::new(Semaphore::new(thread_count));
-    //     info!("Semaphore created with {} permits", thread_count);
-    // 
-    //     // Create shared counter for results
-    //     let total_counts = Arc::new(tokio::sync::Mutex::new(DetailedCharacterCount::new()));
-    // 
-    //     // Instrument the receiver
-    //     let mut item_count = 0;
-    //     info!("Waiting for first item...");
-    // 
-    //     while let Some(item) = rx.recv().await {
-    //         item_count += 1;
-    //         info!("Received item #{}: {}", item_count, item.key);
-    // 
-    //         // Rest of processing...
-    //         let semaphore_clone = semaphore.clone();
-    //         let total_counts_clone = Arc::clone(&total_counts);
-    //         let progress_tracker_clone = progress_tracker.clone();
-    // 
-    //         // Log before acquiring permit
-    //         info!("Acquiring semaphore permit for item #{}", item_count);
-    //         let permit = semaphore_clone.acquire_owned().await?;
-    //         info!("Acquired permit for item #{}", item_count);
-    // 
-    //         // Spawn task
-    //         tokio::task::spawn_blocking(move || {
-    //             info!("Processing item #{} in thread", item_count);
-    //             // Process the item
-    //             info!("Finished processing item #{}", item_count);
-    //         });
-    //     }
-    // 
-    //     info!("Channel closed, processed {} items", item_count);
-    // 
-    //     // Return the final counts
-    //     Ok(Arc::into_inner(total_counts).map(|mutex| mutex.into_inner()).unwrap())
-    // }
     
     /// Process data received from the S3 fetcher
     pub async fn process_data(
