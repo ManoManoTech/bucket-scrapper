@@ -15,8 +15,8 @@ A Rust-based CLI tool for verifying log consolidation in S3 buckets. This tool p
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/log-consolidator-checker.git
-cd log-consolidator-checker
+git clone https://git.manomano.tech/pulse/observability/log-consolidator-checker-rs#
+cd log-consolidator-checker-rs
 
 # Build the project
 cargo build --release
@@ -71,6 +71,18 @@ This tool uses the AWS SDK for Rust, which automatically loads credentials from:
 - IAM instance profiles (when running on EC2)
 - IAM roles for tasks (when running on ECS)
 
-## License
+## Performance Tuning
 
-MIT
+This program will use 1/2GB + the size of the raw downloaded files (pending decompression) in a so called memory pool.
+It has been seen processing 250MB/s (_on average_) for 30GB+ of data, over 32 cores and 12GB of pool.
+
+- Use `--max-parallel` to control the amount of simultaneous downloads. Defaults to 32.
+  - Smaller files require more parallel downloads to maximise throughput.
+  - The actual amount of parallel downloads is generally limited by the memory pool size.
+  - If the memory pool size is underused, add download threads!
+  - If the memory pool size is fully used, you may increase its size. You do not need to lower max-parallel in that case.
+  - If the amount of S3 errors and/or retries is high, you need to decrease max-parallel.
+- Use `--memory-pool-mb` to size the download pool.
+    - 12GB is enough to serve 128 download threads and 30 processing threads on 32 cores.
+- Use `--process-threads` to control the amount of processing threads. Defaults to `CPU_COUNT - 2`.
+    - We're aiming for close to 100% utilization here, which will be spend on decompression and character counting tasks.

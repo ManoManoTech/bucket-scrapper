@@ -1,6 +1,7 @@
 // src/s3/downloader/mod.rs
-mod s3_fetcher;
+mod downloader;
+mod download_orchestrator;
 mod processor;
 mod types;
 
-pub use types::DownloadOrchestrator;
+pub use download_orchestrator::DownloadOrchestrator;

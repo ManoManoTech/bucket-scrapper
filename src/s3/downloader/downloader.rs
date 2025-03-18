@@ -4,23 +4,27 @@ use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client;
+use backon::ExponentialBuilder;
+use backon::Retryable;
 use log::{debug, warn, info};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
 use futures::future::join_all;
 
 use super::types::{CompressionType, RawObjectData};
 
-pub struct S3Fetcher {
+pub struct Downloader {
     client: Client,
     memory_allocator: Arc<MemoryLimitedAllocator>,
     download_semaphore: Arc<Semaphore>,
 }
 
-impl S3Fetcher {
+impl Downloader {
     pub fn new(client: Client, max_concurrent_downloads: usize, memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
         let download_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+
         Self {
             client,
             memory_allocator,
@@ -57,20 +61,37 @@ impl S3Fetcher {
             let progress_tracker = progress_tracker.clone();
 
             let handle = tokio::spawn(async move {
-                let result = Self::download_object(
-                    &client_clone,
-                    &bucket_str,
-                    &obj_clone,
-                    tx_clone,
-                    allocator,
-                    progress_tracker
-                ).await;
+                let inner_result = async || {
+                    Self::download_object(
+                        &client_clone.clone(),
+                        &bucket_str.clone(),
+                        &obj_clone.clone(),
+                        tx_clone.clone(),
+                        allocator.clone(),
+                        progress_tracker.clone()
+                    ).await.map_err(|e| {anyhow::Error::msg(format!("download error {}/{}: '{}'", bucket_str, obj_clone.key, e))})
+                };
 
-                drop(permit); // Release permit when done
+                let retry_params = ExponentialBuilder::default()
+                    .with_jitter()
+                    .with_max_delay(Duration::from_secs(15))
+                    .with_max_times(10);
 
-                if let Err(e) = result {
-                    warn!("Error downloading {}: {}", obj_clone.key, e);
-                }
+                let mut attempt = 1;
+                let result = inner_result
+                    .retry(retry_params)
+                    .sleep(tokio::time::sleep)
+                    .notify(|err: &anyhow::Error, dur: Duration| {
+                        attempt += 1;
+                        warn!("will retry attempt {} caused by {} after {:?}", attempt, err, dur);
+                    }).await;
+
+                // XXX on error shouldn't we terminate the whole program?
+
+                // Release permit when done, regardless of error status
+                drop(permit);
+
+                result
             });
 
             download_handles.push(handle);

@@ -13,6 +13,10 @@ use clap::{Parser, Subcommand};
 use log::{info, warn, LevelFilter};
 use std::path::PathBuf;
 use utils::date::date_range_to_date_hour_list;
+use jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 /// S3 Log Consolidator Checker
 #[derive(Parser)]

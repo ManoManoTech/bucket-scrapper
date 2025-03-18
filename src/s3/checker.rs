@@ -109,7 +109,7 @@ impl Checker {
             .await?;
 
         info!(
-            "Bucket {}: {} files, totaling {} bytes, filelist cheskum {}",
+            "Bucket {}: {} files, totaling {} bytes, file list checksum {}",
             bucket,
             file_list.files.len(),
             file_list.total_archives_size,
@@ -191,9 +191,10 @@ impl Checker {
                     Err(e) => return Err(anyhow::anyhow!("Failed to list files in bucket: {}", e)),
                 }
             }
-            
-            let mut rng = rng();
-            file_lists.shuffle(&mut rng);
+
+            // let mut rng = rng();
+            // file_lists.shuffle(&mut rng);
+            file_lists.sort_by(|a, b| b.size.cmp(&a.size));
         }
 
         let character_counts_by_bucket = self
