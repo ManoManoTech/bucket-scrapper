@@ -2,7 +2,7 @@
 use crate::config::types::S3ObjectInfo;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client;
 use log::{debug, warn, info};
 use std::sync::Arc;
@@ -10,48 +10,47 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
 use futures::future::join_all;
 
-use super::types::{CompressionType, ProcessItem};
+use super::types::{CompressionType, RawObjectData};
 
 pub struct S3Fetcher {
     client: Client,
     memory_allocator: Arc<MemoryLimitedAllocator>,
+    download_semaphore: Arc<Semaphore>,
 }
 
 impl S3Fetcher {
-    pub fn new(client: Client, memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
+    pub fn new(client: Client, max_concurrent_downloads: usize, memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
+        let download_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
         Self {
             client,
             memory_allocator,
+            download_semaphore,
         }
     }
 
     /// Concurrently fetch multiple objects from S3
     pub async fn fetch_objects(
         &self,
-        bucket: &str,
         objects: &[S3ObjectInfo],
-        semaphore: &Arc<Semaphore>,
-        tx: mpsc::Sender<ProcessItem>,
-        progress_tracker: Option<Arc<ProgressTracker>>,
+        tx: mpsc::Sender<RawObjectData>,
+        progress_tracker: Arc<ProgressTracker>,
     ) -> Result<()> {
         // Log initial memory allocation stats
-        let (memory_used, memory_total) = self.memory_allocator.stats();
-        info!("Starting downloads. Memory pool: {}/{} bytes", memory_used, memory_total);
+        info!("Starting downloads. Memory pool size: {} bytes", self.memory_allocator.stats().1);
 
         // Handle empty objects list gracefully
         if objects.is_empty() {
-            debug!("No objects to fetch for bucket {}", bucket);
             // Deliberately drop tx to signal end of data
             drop(tx);
-            return Ok(());
+            return Err(anyhow!("No objects to fetch."));
         }
 
         // Start downloading files concurrently
         let mut download_handles = Vec::new();
         for obj in objects {
-            let permit = semaphore.clone().acquire_owned().await?;
+            let permit = self.download_semaphore.clone().acquire_owned().await?;
             let obj_clone = obj.clone();
-            let bucket_str = bucket.to_string();
+            let bucket_str = obj.bucket.to_string();
             let client_clone = self.client.clone();
             let tx_clone = tx.clone();
             let allocator = Arc::clone(&self.memory_allocator);
@@ -89,7 +88,7 @@ impl S3Fetcher {
         // Explicitly drop tx here to close the channel
         drop(tx);
 
-        debug!("All downloads completed for bucket {}", bucket);
+        debug!("All downloads completed.");
         Ok(())
     }
 
@@ -98,9 +97,9 @@ impl S3Fetcher {
         client: &Client,
         bucket: &str,
         obj: &S3ObjectInfo,
-        tx: mpsc::Sender<ProcessItem>,
+        tx: mpsc::Sender<RawObjectData>,
         allocator: Arc<MemoryLimitedAllocator>,
-        progress_tracker: Option<Arc<ProgressTracker>>,
+        progress_tracker: Arc<ProgressTracker>,
     ) -> Result<()> {
         debug!("Downloading {} (size: {} bytes)", obj.key, obj.size);
 
@@ -142,12 +141,11 @@ impl S3Fetcher {
                 debug!("Downloaded {} bytes for {}", bytes_read, obj.key);
 
                 // Update progress tracker for download completion
-                if let Some(tracker) = &progress_tracker {
-                    tracker.increment_processed(bytes_read);
-                }
+                progress_tracker.increment_processed(bytes_read);
 
                 // Send data for processing
-                match tx.send(ProcessItem {
+                match tx.send(RawObjectData {
+                    bucket: bucket.to_string(),
                     key: obj.key.clone(),
                     data: buffer,
                     compression_type,

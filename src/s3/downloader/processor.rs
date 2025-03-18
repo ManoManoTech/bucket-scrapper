@@ -3,42 +3,44 @@ use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::{Result};
 use log::{debug, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task;
 use futures::future::join_all;
 
-use super::types::{CompressionType, ProcessItem};
+use super::types::{CompressionType, RawObjectData};
 
 #[derive(Clone)]
 pub struct Processor {
     // Can be extended with configuration options later
+    max_processor_count: usize
 }
 
 impl Processor {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(max_processor_count: usize) -> Self {
+        Self { max_processor_count}
     }
     
     /// Process data received from the S3 fetcher
-    pub async fn process_data(
+    /// This asynchronous tasks waits for RawObjectData on the rx channel,
+    /// and spawns up to max_processor_count decompress/downloaders
+    pub async fn process_raw_data(
         &self,
-        mut rx: mpsc::Receiver<ProcessItem>,
-        thread_count: usize,
-        progress_tracker: Option<Arc<ProgressTracker>>,
-    ) -> Result<DetailedCharacterCount> {
+        mut rx: mpsc::Receiver<RawObjectData>,
+        progress_tracker: Arc<ProgressTracker>,
+    ) -> Result<HashMap<String, DetailedCharacterCount>> {
         // Create shared counter for results
-        let total_counts = Arc::new(tokio::sync::Mutex::new(DetailedCharacterCount::new()));
-    
+        let total_counts = Arc::new(Mutex::new(HashMap::<String, DetailedCharacterCount>::new()));
+
         // Create a simple semaphore to limit concurrent processing tasks
-        let semaphore = Arc::new(Semaphore::new(thread_count * 2));
+        let semaphore = Arc::new(Semaphore::new(self.max_processor_count));
     
         // Track pending futures
         let mut process_futures = Vec::new();
     
         while let Some(item) = rx.recv().await {
             let semaphore_clone = semaphore.clone();
-            let total_counts_clone = Arc::clone(&total_counts);
             let progress_tracker_clone = progress_tracker.clone();
     
             // Acquire permit before spawning task
@@ -51,36 +53,31 @@ impl Processor {
     
                 // Process the data
                 let result = Self::process_item(
+                    &item.bucket.clone(),
                     &item.key,
                     &item.data,
                     &item.compression_type,
                 );
     
                 // Mark file as completed for progress tracking
-                if let Some(tracker) = &progress_tracker_clone {
-                    tracker.increment_completed();
-                }
+                progress_tracker_clone.increment_completed();
     
-                match result {
-                    Ok(counts) => {
-                        // Return the processed results
-                        (item.key, counts)
-                    }
-                    Err(e) => {
-                        warn!("Error processing data for {}: {}", item.key, e);
-                        (item.key, DetailedCharacterCount::new())
-                    }
-                }
+                result.unwrap()
             });
     
             // Collect the processed results
-            let future = async move {
+            let total_counts_clone = Arc::clone(&total_counts);
+            let aggregated_result = async move {
                 match handle.await {
-                    Ok((key, counts)) => {
+                    Ok(counts) => {
                         // Update the total counts
                         let mut locked_counts = total_counts_clone.lock().await;
-                        locked_counts.add(&counts);
-                        debug!("Processed and added counts for {}", key);
+                        if locked_counts.contains_key(&counts.bucket) {
+                            let bucket_counts = locked_counts.get_mut(&counts.bucket).unwrap();
+                            bucket_counts.add(&counts)
+                        } else {
+                            locked_counts.insert(counts.bucket.clone(), counts);
+                        }
                     }
                     Err(e) => {
                         warn!("Processing task failed: {}", e);
@@ -88,7 +85,7 @@ impl Processor {
                 }
             };
     
-            process_futures.push(future);
+            process_futures.push(aggregated_result);
         }
     
         // Wait for all processing to complete
@@ -100,6 +97,7 @@ impl Processor {
 
     // Process a single downloaded item
     fn process_item(
+        bucket: &str,
         key: &str,
         data: &crate::utils::memory_limited_allocator::LimitedVec,
         compression_type: &CompressionType,
@@ -107,6 +105,8 @@ impl Processor {
         debug!("Processing {})", key);
 
         let mut counts = DetailedCharacterCount::new();
+        counts.bucket = bucket.to_owned();
+        counts.prefix = key.to_owned();
         
         match compression_type {
             CompressionType::Gzip => {

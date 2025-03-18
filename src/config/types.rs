@@ -38,6 +38,7 @@ pub type HourString = String; // HH format 00-23
 
 #[derive(Debug, Clone, Serialize)]
 pub struct S3ObjectInfo {
+    pub bucket: String,
     pub key: String,
     pub size: usize,
     pub last_modified: DateTime<Utc>,
@@ -45,6 +46,9 @@ pub struct S3ObjectInfo {
 
 #[derive(Debug, Clone)]
 pub struct S3FileList {
-    pub filenames: Vec<S3ObjectInfo>,
+    pub bucket: String,
+    pub key_prefix: String,
+    pub checksum: String,
+    pub files: Vec<S3ObjectInfo>,
     pub total_archives_size: usize,
 }

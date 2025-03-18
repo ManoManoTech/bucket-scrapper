@@ -10,21 +10,20 @@ use aws_types::region::Region;
 use log::{debug, info};
 use regex::Regex;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
-pub struct S3Client {
-    client: Client,
-    last_refresh: std::time::Instant,
+pub struct WrappedS3Client {
+    _client: RwLock<(std::time::Instant, Client)>,
     max_age: Duration,
     region: String,
 }
 
-impl S3Client {
+impl WrappedS3Client {
     pub async fn new(region: &str, max_age_minutes: u64) -> Result<Self> {
         let client = Self::create_client(region).await?;
 
         Ok(Self {
-            client,
-            last_refresh: std::time::Instant::now(),
+            _client: RwLock::new((std::time::Instant::now(), client)),
             max_age: Duration::from_secs(max_age_minutes * 60),
             region: region.to_string(),
         })
@@ -39,34 +38,39 @@ impl S3Client {
             .load()
             .await;
 
-        return Ok(Client::new(&config));
+        Ok(Client::new(&config))
     }
 
-    pub async fn refresh_if_needed(&mut self) -> Result<()> {
+    pub async fn get_client(&self) -> Result<Client> {
         let now = std::time::Instant::now();
-        if now.duration_since(self.last_refresh) > self.max_age {
-            info!("Refreshing S3 client");
-            self.client = Self::create_client(&self.region).await?;
-            self.last_refresh = now;
+
+        // Check if we have fresh client using read lock
+        {
+            let guard = self._client.read().await;
+            let (last_refresh, client) = &*guard;
+
+            // Return early if client is still fresh
+            if now.duration_since(*last_refresh) <= self.max_age {
+                return Ok(client.clone());
+            }
         }
-        Ok(())
-    }
 
-    /// Get the raw AWS SDK S3 client
-    pub async fn get_raw_client(&self) -> Result<Client> {
-        Self::create_client(&self.region).await
+        let mut guard = self._client.write().await;
+        if now.duration_since(guard.0) > self.max_age {
+            info!("Refreshing S3 client");
+            *guard = (now, Self::create_client(&self.region).await?);
+        }
+        Ok(guard.1.clone())
     }
-
+    
     /// Lists objects in a bucket with a prefix and returns information about them
     pub async fn get_matching_filenames_from_s3(
-        &mut self,
+        &self,
         bucket_config: &BucketConfig,
         date: &DateString,
         hour: &HourString,
         will_filter: bool,
     ) -> Result<S3FileList> {
-        self.refresh_if_needed().await?;
-
         let formatter = generate_path_formatter(bucket_config);
         let prefix = formatter(date, hour)?;
         let bucket = &bucket_config.bucket;
@@ -96,7 +100,8 @@ impl S3Client {
                 prefix, bucket, continuation_token
             );
 
-            let list_objects_req = self.client.list_objects_v2().bucket(bucket).prefix(&prefix);
+            let client = self.get_client().await?;
+            let list_objects_req = client.list_objects_v2().bucket(bucket).prefix(&prefix);
 
             let list_objects_req = if let Some(token) = &continuation_token {
                 list_objects_req.continuation_token(token)
@@ -131,6 +136,7 @@ impl S3Client {
 
                         (
                             S3ObjectInfo {
+                                bucket: bucket.clone(),
                                 key: filename.to_string(),
                                 size: o.size().unwrap_or_default() as usize,
                                 last_modified: o
@@ -206,8 +212,22 @@ impl S3Client {
             (items, total_size)
         };
 
+        // Calculate a checksum of all filenames to enable identifying changes in file lists
+        let files_checksum = {
+            let mut filenames = filtered.0
+                .iter()
+                .map(|f| f.key.clone())
+                .collect::<Vec<_>>();
+            filenames.sort();
+            let joined = filenames.join("");
+            format!("{:x}", md5::compute(joined))
+        };
+
         Ok(S3FileList {
-            filenames: filtered.0,
+            bucket: bucket.clone(),
+            checksum: files_checksum.clone(),
+            key_prefix: prefix,
+            files: filtered.0,
             total_archives_size: filtered.1,
         })
     }

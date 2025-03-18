@@ -2,7 +2,7 @@
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use log::{info, warn};
 use signal_hook::{consts::SIGUSR2, iterator::Signals};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}, RwLock};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::{Duration, Instant, SystemTime};
 use std::thread;
 use human_bytes::human_bytes;
@@ -17,40 +17,22 @@ pub struct ProgressTracker {
     pub total_bytes: AtomicUsize,
     pub processed_bytes: AtomicUsize,
     pub start_time: Instant,
-    pub current_bucket: RwLock<String>,
 }
 
 impl ProgressTracker {
-    pub fn new(total_files: usize, total_bytes: usize, bucket: &str) -> Self {
+    pub fn new(total_files: usize, total_bytes: usize) -> Self {
         Self {
             total_files: AtomicUsize::new(total_files),
             completed_files: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(total_bytes),
             processed_bytes: AtomicUsize::new(0),
             start_time: Instant::now(),
-            current_bucket: RwLock::new(bucket.to_string()),
         }
     }
 
     pub fn update_total(&self, total_files: usize, total_bytes: usize) {
         self.total_files.store(total_files, Ordering::SeqCst);
         self.total_bytes.store(total_bytes, Ordering::SeqCst);
-    }
-
-    pub fn update_current_bucket(&self, bucket: &str) {
-        if let Ok(mut current_bucket) = self.current_bucket.write() {
-            *current_bucket = bucket.to_string();
-        } else {
-            warn!("Failed to update current bucket name, lock poisoned");
-        }
-    }
-
-    pub fn get_current_bucket(&self) -> String {
-        if let Ok(bucket) = self.current_bucket.read() {
-            bucket.clone()
-        } else {
-            "[unknown]".to_string()
-        }
     }
 
     pub fn increment_processed(&self, bytes: usize) {
@@ -131,7 +113,7 @@ impl ProgressTracker {
 
 impl Default for ProgressTracker {
     fn default() -> Self {
-        Self::new(0, 0, "")
+        Self::new(0, 0)
     }
 }
 
@@ -213,10 +195,8 @@ impl MemoryMonitor {
             let percent_files = progress.percent_complete_files();
             let percent_bytes = progress.percent_complete_bytes();
             let speed = progress.processing_speed_mb_per_sec();
-            let current_bucket = progress.get_current_bucket();
 
             info!("======= PROGRESS STATS =======");
-            info!("Current bucket: {}", current_bucket);
             info!("Files processed: {}/{} ({:.1}%)",
                   progress.completed_files.load(Ordering::SeqCst),
                   progress.total_files.load(Ordering::SeqCst),

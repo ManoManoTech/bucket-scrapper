@@ -3,4 +3,4 @@ mod s3_fetcher;
 mod processor;
 mod types;
 
-pub use types::S3Downloader;
+pub use types::DownloadOrchestrator;

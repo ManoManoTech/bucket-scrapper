@@ -6,7 +6,7 @@ mod utils;
 
 use crate::config::loader::{get_archived_buckets, get_consolidated_buckets, load_config};
 use crate::s3::checker::Checker;
-use crate::s3::client::S3Client;
+use crate::s3::client::WrappedS3Client;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     let config = load_config(&cli.config)?;
 
     // Initialize S3 client
-    let s3_client = S3Client::new(&cli.region, cli.client_max_age).await?;
+    let s3_client = WrappedS3Client::new(&cli.region, cli.client_max_age).await?;
 
     match &cli.command {
         Commands::List { start, end } => {
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
             );
 
             // Create a mutable reference to the client for use in this scope
-            let mut s3_client = s3_client;
+            let s3_client = s3_client;
 
             // List files in archived buckets
             info!("Checking archived buckets");
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
 
                     info!(
                         "Found {} files in archived bucket {} for {}/{} (total size: {} bytes)",
-                        result.filenames.len(),
+                        result.files.len(),
                         bucket.bucket,
                         date_hour.date,
                         date_hour.hour,
@@ -149,9 +149,9 @@ async fn main() -> Result<()> {
                     );
 
                     // Print first few files if any
-                    if !result.filenames.is_empty() {
+                    if !result.files.is_empty() {
                         info!("First few files:");
-                        for (i, file) in result.filenames.iter().take(5).enumerate() {
+                        for (i, file) in result.files.iter().take(5).enumerate() {
                             info!("  {}: {} ({} bytes)", i + 1, file.key, file.size);
                         }
                     }
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
 
                     info!(
                         "Found {} files in consolidated bucket {} for {}/{} (total size: {} bytes)",
-                        result.filenames.len(),
+                        result.files.len(),
                         bucket.bucket,
                         date_hour.date,
                         date_hour.hour,
@@ -184,9 +184,9 @@ async fn main() -> Result<()> {
                     );
 
                     // Print first few files if any
-                    if !result.filenames.is_empty() {
+                    if !result.files.is_empty() {
                         info!("First few files:");
-                        for (i, file) in result.filenames.iter().take(5).enumerate() {
+                        for (i, file) in result.files.iter().take(5).enumerate() {
                             info!("  {}: {} ({} bytes)", i + 1, file.key, file.size);
                         }
                     }
@@ -258,23 +258,23 @@ async fn main() -> Result<()> {
                 info!("✅ Check passed for {}/{}", date, hour);
                 info!("Message: {}", result.message);
 
-                info!("Archived buckets:");
-                for (i, archived) in result.archived_data.iter().enumerate() {
-                    info!(
-                        "  {}: {} files in {} (total size: {} bytes)",
-                        i + 1,
-                        archived.files.len(),
-                        archived.bucket,
-                        archived.total_archives_size
-                    );
-                }
-
-                info!(
-                    "Consolidated bucket: {} files in {} (total size: {} bytes)",
-                    result.consolidated_data.files.len(),
-                    result.consolidated_data.bucket,
-                    result.consolidated_data.total_archives_size
-                );
+                // info!("Archived buckets:");
+                // for (i, archived) in result.archived_data.iter().enumerate() {
+                //     info!(
+                //         "  {}: {} files in {} (total size: {} bytes)",
+                //         i + 1,
+                //         archived.files.len(),
+                //         archived.bucket,
+                //         archived.total_archives_size
+                //     );
+                // }
+                //
+                // info!(
+                //     "Consolidated bucket: {} files in {} (total size: {} bytes)",
+                //     result.consolidated_data.files.len(),
+                //     result.consolidated_data.bucket,
+                //     result.consolidated_data.total_archives_size
+                // );
             } else {
                 warn!("❌ Check failed for {}/{}", date, hour);
                 warn!("Message: {}", result.message);

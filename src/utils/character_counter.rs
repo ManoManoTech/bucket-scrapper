@@ -7,19 +7,21 @@ use std::ops::AddAssign;
 #[derive(Debug, Clone)]
 pub struct DetailedCharacterCount {
     /// Counts of each ASCII character (0-255)
+    pub bucket: String,
+    pub prefix: String,
     pub counts: [u64; 256],
 }
 
-impl Default for DetailedCharacterCount {
-    fn default() -> Self {
-        Self { counts: [0; 256] }
-    }
-}
+// impl Default for DetailedCharacterCount {
+//     fn default() -> Self {
+//         Self { counts: [0; 256] }
+//     }
+// }
 
 impl DetailedCharacterCount {
     /// Creates a new DetailedCharacterCount with all counts set to 0
     pub fn new() -> Self {
-        Self { counts: [0; 256] }
+        Self { bucket: "".to_string(), prefix: "".to_string(), counts: [0; 256] }
     }
 
     /// Increments the count for a specific byte
