@@ -1,8 +1,12 @@
 [tools]
 "cargo:flamegraph" = "latest"
+lefthook = "latest"
 rust = "latest"
 
 [env]
 AWS_DEFAULT_REGION = "eu-west-3"
 AWS_PROFILE = "manomano-support"
 AWS_REGION = "eu-west-3"
+
+[hooks]
+cd = "lefthook install"

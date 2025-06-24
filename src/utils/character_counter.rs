@@ -20,6 +20,16 @@ pub struct DetailedCharacterCount {
 
 impl DetailedCharacterCount {
     /// Creates a new DetailedCharacterCount with all counts set to 0
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use log_consolidator_checker_rust::utils::character_counter::DetailedCharacterCount;
+    ///
+    /// let counter = DetailedCharacterCount::new();
+    /// assert_eq!(counter.total(), 0);
+    /// assert_eq!(counter.total_excluding_newlines(), 0);
+    /// ```
     pub fn new() -> Self {
         Self { bucket: "".to_string(), prefix: "".to_string(), counts: [0; 256] }
     }
@@ -71,6 +81,21 @@ impl DetailedCharacterCount {
     }
 
     /// Gets the total count of characters, excluding newlines and carriage returns
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use log_consolidator_checker_rust::utils::character_counter::DetailedCharacterCount;
+    ///
+    /// let mut counter = DetailedCharacterCount::new();
+    /// counter.increment(b'a');
+    /// counter.increment(b'b');
+    /// counter.increment(b'\n'); // newline - should be excluded
+    /// counter.increment(b'\r'); // carriage return - should be excluded
+    ///
+    /// assert_eq!(counter.total(), 4);
+    /// assert_eq!(counter.total_excluding_newlines(), 2); // Only 'a' and 'b'
+    /// ```
     pub fn total_excluding_newlines(&self) -> u64 {
         let mut total: u64 = 0;
         for (i, &count) in self.counts.iter().enumerate() {
@@ -83,11 +108,67 @@ impl DetailedCharacterCount {
     }
 
     /// Gets the total count of all characters
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use log_consolidator_checker_rust::utils::character_counter::DetailedCharacterCount;
+    ///
+    /// let mut counter = DetailedCharacterCount::new();
+    /// counter.increment(b'a');
+    /// counter.increment(b'b');
+    /// counter.increment(b'\n');
+    ///
+    /// assert_eq!(counter.total(), 3);
+    /// ```
     pub fn total(&self) -> u64 {
         self.counts.iter().fold(0, |acc, &c| acc.wrapping_add(c))
     }
 
     /// Compare with another DetailedCharacterCount, returning differences
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use log_consolidator_checker_rust::utils::character_counter::DetailedCharacterCount;
+    ///
+    /// // Test basic comparison
+    /// let mut counter1 = DetailedCharacterCount::new();
+    /// counter1.increment(b'a');
+    /// counter1.increment(b'b');
+    ///
+    /// let mut counter2 = DetailedCharacterCount::new();
+    /// counter2.increment(b'a');
+    /// counter2.increment(b'c');
+    ///
+    /// let (is_equal, differences) = counter1.compare(&counter2);
+    /// assert_eq!(is_equal, false);
+    /// assert_eq!(differences.len(), 2); // 'b' and 'c' are different
+    ///
+    /// // Test increment_batch_unsafe with 30 chars (tests both aligned and unaligned paths)
+    /// let mut counter3 = DetailedCharacterCount::new();
+    /// let buffer: Vec<u8> = (b'A'..=b'Z').chain(b'a'..=b'd').collect(); // 30 bytes: A-Z + a-d
+    /// counter3.increment_batch_unsafe(&buffer);
+    ///
+    /// assert_eq!(counter3.total(), 30);
+    /// assert_eq!(counter3.counts[b'A' as usize], 1);
+    /// assert_eq!(counter3.counts[b'Z' as usize], 1);
+    /// assert_eq!(counter3.counts[b'a' as usize], 1);
+    /// assert_eq!(counter3.counts[b'd' as usize], 1);
+    ///
+    /// // Test comparison ignoring newlines and CR
+    /// let mut counter4 = DetailedCharacterCount::new();
+    /// counter4.increment(b'x');
+    /// counter4.increment(b'\n'); // Should be ignored in comparison
+    /// counter4.increment(b'\r'); // Should be ignored in comparison
+    ///
+    /// let mut counter5 = DetailedCharacterCount::new();
+    /// counter5.increment(b'x');
+    ///
+    /// let (is_equal_cr, differences_cr) = counter4.compare(&counter5);
+    /// assert_eq!(is_equal_cr, true); // Should be equal since newlines are ignored
+    /// assert_eq!(differences_cr.len(), 0);
+    /// ```
     pub fn compare(
         &self,
         other: &DetailedCharacterCount,
@@ -128,5 +209,244 @@ impl std::fmt::Display for DetailedCharacterCount {
             self.total_excluding_newlines()
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let counter = DetailedCharacterCount::new();
+        assert_eq!(counter.total(), 0);
+        assert_eq!(counter.total_excluding_newlines(), 0);
+        assert_eq!(counter.bucket, "");
+        assert_eq!(counter.prefix, "");
+        for count in counter.counts.iter() {
+            assert_eq!(*count, 0);
+        }
+    }
+
+    #[test]
+    fn test_increment() {
+        let mut counter = DetailedCharacterCount::new();
+        counter.increment(b'a');
+        counter.increment(b'b');
+        counter.increment(b'a'); // Increment 'a' again
+
+        assert_eq!(counter.total(), 3);
+        assert_eq!(counter.counts[b'a' as usize], 2);
+        assert_eq!(counter.counts[b'b' as usize], 1);
+    }
+
+    #[test]
+    fn test_increment_batch_unsafe_aligned() {
+        let mut counter = DetailedCharacterCount::new();
+        let buffer = vec![b'a'; 8]; // Exactly 8 bytes - tests aligned path
+        counter.increment_batch_unsafe(&buffer);
+
+        assert_eq!(counter.total(), 8);
+        assert_eq!(counter.counts[b'a' as usize], 8);
+    }
+
+    #[test]
+    fn test_increment_batch_unsafe_unaligned() {
+        let mut counter = DetailedCharacterCount::new();
+        let buffer = vec![b'x'; 5]; // 5 bytes - tests unaligned path only
+        counter.increment_batch_unsafe(&buffer);
+
+        assert_eq!(counter.total(), 5);
+        assert_eq!(counter.counts[b'x' as usize], 5);
+    }
+
+    #[test]
+    fn test_increment_batch_unsafe_mixed() {
+        let mut counter = DetailedCharacterCount::new();
+        // 30 bytes: tests both aligned (24) and unaligned (6) paths
+        let buffer: Vec<u8> = (b'A'..=b'Z').chain(b'a'..=b'd').collect();
+        counter.increment_batch_unsafe(&buffer);
+
+        assert_eq!(counter.total(), 30);
+        assert_eq!(counter.counts[b'A' as usize], 1);
+        assert_eq!(counter.counts[b'Z' as usize], 1);
+        assert_eq!(counter.counts[b'a' as usize], 1);
+        assert_eq!(counter.counts[b'd' as usize], 1);
+    }
+
+    #[test]
+    fn test_increment_batch_unsafe_empty() {
+        let mut counter = DetailedCharacterCount::new();
+        counter.increment_batch_unsafe(&[]);
+        assert_eq!(counter.total(), 0);
+    }
+
+    #[test]
+    fn test_increment_batch_unsafe_all_sizes() {
+        // Test sizes 1-15 to cover all possible alignments
+        for size in 1..=15 {
+            let mut counter = DetailedCharacterCount::new();
+            let buffer = vec![b'z'; size];
+            counter.increment_batch_unsafe(&buffer);
+            assert_eq!(counter.total(), size as u64);
+            assert_eq!(counter.counts[b'z' as usize], size as u64);
+        }
+    }
+
+    #[test]
+    fn test_total_excluding_newlines() {
+        let mut counter = DetailedCharacterCount::new();
+        counter.increment(b'a');
+        counter.increment(b'b');
+        counter.increment(b'\n'); // newline - should be excluded
+        counter.increment(b'\r'); // carriage return - should be excluded
+        counter.increment(b'c');
+
+        assert_eq!(counter.total(), 5);
+        assert_eq!(counter.total_excluding_newlines(), 3); // Only a, b, c
+    }
+
+    #[test]
+    fn test_add() {
+        let mut counter1 = DetailedCharacterCount::new();
+        counter1.increment(b'a');
+        counter1.increment(b'b');
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment(b'a');
+        counter2.increment(b'c');
+
+        counter1.add(&counter2);
+
+        assert_eq!(counter1.counts[b'a' as usize], 2);
+        assert_eq!(counter1.counts[b'b' as usize], 1);
+        assert_eq!(counter1.counts[b'c' as usize], 1);
+        assert_eq!(counter1.total(), 4);
+    }
+
+    #[test]
+    fn test_add_assign() {
+        let mut counter1 = DetailedCharacterCount::new();
+        counter1.increment(b'x');
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment(b'y');
+
+        counter1 += counter2;
+
+        assert_eq!(counter1.counts[b'x' as usize], 1);
+        assert_eq!(counter1.counts[b'y' as usize], 1);
+        assert_eq!(counter1.total(), 2);
+    }
+
+    #[test]
+    fn test_compare_equal() {
+        let mut counter1 = DetailedCharacterCount::new();
+        counter1.increment(b'a');
+        counter1.increment(b'b');
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment(b'a');
+        counter2.increment(b'b');
+
+        let (is_equal, differences) = counter1.compare(&counter2);
+        assert_eq!(is_equal, true);
+        assert_eq!(differences.len(), 0);
+    }
+
+    #[test]
+    fn test_compare_different() {
+        let mut counter1 = DetailedCharacterCount::new();
+        counter1.increment(b'a');
+        counter1.increment(b'b');
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment(b'a');
+        counter2.increment(b'c');
+
+        let (is_equal, differences) = counter1.compare(&counter2);
+        assert_eq!(is_equal, false);
+        assert_eq!(differences.len(), 2);
+        assert_eq!(differences[&(b'b' as usize)], 1); // counter1 has 1 more 'b'
+        assert_eq!(differences[&(b'c' as usize)], -1); // counter1 has 1 less 'c'
+    }
+
+    #[test]
+    fn test_compare_ignores_newlines() {
+        let mut counter1 = DetailedCharacterCount::new();
+        counter1.increment(b'x');
+        counter1.increment(b'\n'); // Should be ignored
+        counter1.increment(b'\r'); // Should be ignored
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment(b'x');
+
+        let (is_equal, differences) = counter1.compare(&counter2);
+        assert_eq!(is_equal, true);
+        assert_eq!(differences.len(), 0);
+    }
+
+    #[test]
+    fn test_consistency_increment_vs_batch() {
+        let test_data = b"Hello, World! 123\n\r";
+
+        let mut counter1 = DetailedCharacterCount::new();
+        for &byte in test_data {
+            counter1.increment(byte);
+        }
+
+        let mut counter2 = DetailedCharacterCount::new();
+        counter2.increment_batch_unsafe(test_data);
+
+        let (is_equal, differences) = counter1.compare(&counter2);
+        assert_eq!(is_equal, true);
+        assert_eq!(differences.len(), 0);
+        assert_eq!(counter1.total(), counter2.total());
+    }
+
+    #[test]
+    fn test_overflow_wrapping() {
+        let mut counter = DetailedCharacterCount::new();
+        counter.counts[b'a' as usize] = u64::MAX;
+        counter.increment(b'a'); // Should wrap to 0
+        assert_eq!(counter.counts[b'a' as usize], 0);
+    }
+
+    #[test]
+    fn test_display() {
+        let mut counter = DetailedCharacterCount::new();
+        counter.increment(b'a');
+        counter.increment(b'\n');
+
+        let display_string = format!("{}", counter);
+        assert!(display_string.contains("Total characters: 2"));
+        assert!(display_string.contains("excluding newlines: 1"));
+    }
+
+    #[test]
+    fn test_all_bytes() {
+        let mut counter = DetailedCharacterCount::new();
+        let all_bytes: Vec<u8> = (0..=255).collect();
+        counter.increment_batch_unsafe(&all_bytes);
+
+        // Each byte should have count of 1
+        for i in 0..=255 {
+            assert_eq!(counter.counts[i], 1);
+        }
+        assert_eq!(counter.total(), 256);
+        assert_eq!(counter.total_excluding_newlines(), 254); // 256 - 2 (newline and CR)
+    }
+
+    #[test]
+    fn test_performance_alignment() {
+        // Test different data alignments to ensure unsafe code works correctly
+        for offset in 0..8 {
+            let mut data = vec![0u8; offset];
+            data.extend_from_slice(b"abcdefghijklmnop"); // 16 bytes after offset
+
+            let mut counter = DetailedCharacterCount::new();
+            counter.increment_batch_unsafe(&data[offset..]);
+            assert_eq!(counter.total(), 16);
+        }
     }
 }

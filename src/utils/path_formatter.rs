@@ -36,6 +36,29 @@ fn extract_single_format_date_and_prefix(
 }
 
 /// Generates a path formatter function from a bucket config
+///
+/// # Examples
+///
+/// ```
+/// use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+/// use log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter;
+/// use std::collections::HashMap;
+///
+/// let bucket = BucketConfig {
+///     bucket: "test-bucket".to_string(),
+///     path: vec![
+///         PathSchema::Static { static_path: "logs".to_string() },
+///         PathSchema::DateFormat { datefmt: "dt=20231225/hour=14".to_string() }
+///     ],
+///     only_prefix_patterns: None,
+///     proceed_without_matching_objects: false,
+///     extra: HashMap::new(),
+/// };
+///
+/// let formatter = generate_path_formatter(&bucket);
+/// let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+/// assert_eq!(result, "logs/dt=20231225/hour=14");
+/// ```
 pub fn generate_path_formatter(
     bucket: &BucketConfig,
 ) -> Box<dyn Fn(&DateString, &HourString) -> Result<String> + Send + Sync> {
@@ -68,4 +91,221 @@ pub fn generate_path_formatter(
             Ok(path)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{BucketConfig, PathSchema};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_generate_path_formatter_static_only() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::Static {
+                    static_path: "data".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        assert_eq!(result, "logs/data");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_common_date_format() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "dt=20231225/hour=14".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        assert_eq!(result, "logs/dt=20231225/hour=14");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_raw_logs_format() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "raw".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "2006/01/02/15".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        assert_eq!(result, "raw/2023/12/25/14");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_with_prefix() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "app".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "prefix-dt=placeholder/hour=99-suffix".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        // The regex removes "dt=placeholder/hour=99" and replaces with actual date
+        assert_eq!(result, "app/prefix--suffixdt=20231225/hour=14");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_unknown_format() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "unknown-format".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        // Should fall back to empty format
+        assert_eq!(result, "logs/unknown-format");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_empty_parts_filtered() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "".to_string(),
+                }, // Empty - should be filtered
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "dt=20231225/hour=14".to_string(),
+                },
+                PathSchema::Static {
+                    static_path: "".to_string(),
+                }, // Empty - should be filtered
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        assert_eq!(result, "logs/dt=20231225/hour=14");
+    }
+
+    #[test]
+    fn test_generate_path_formatter_invalid_raw_date() {
+        let bucket = BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path: vec![PathSchema::DateFormat {
+                datefmt: "2006/01/02/15".to_string(),
+            }],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        // Invalid date format should return error
+        let result = formatter(&"invalid".to_string(), &"14".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_single_format_date_and_prefix_common() {
+        let formatter = extract_single_format_date_and_prefix(
+            "prefix-dt=placeholder/hour=99-suffix".to_string(),
+        );
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        // Regex removes "dt=placeholder/hour=99", leaves "prefix--suffix", then adds actual date
+        assert_eq!(result, "prefix--suffixdt=20231225/hour=14");
+    }
+
+    #[test]
+    fn test_extract_single_format_date_and_prefix_raw() {
+        let formatter =
+            extract_single_format_date_and_prefix("prefix-2006/01/02/15-suffix".to_string());
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        // Regex removes "2006/01/02/15", leaves "prefix--suffix", then adds actual date
+        assert_eq!(result, "prefix--suffix2023/12/25/14");
+    }
+
+    #[test]
+    fn test_complex_path_structure() {
+        let bucket = BucketConfig {
+            bucket: "complex-bucket".to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "app".to_string(),
+                },
+                PathSchema::Static {
+                    static_path: "env".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "year=2006/month=01/day=02".to_string(),
+                },
+                PathSchema::Static {
+                    static_path: "hour".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "h=15".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        };
+
+        let formatter = generate_path_formatter(&bucket);
+        let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
+        // The first DateFormat doesn't match known patterns, so it's returned as-is
+        // The second DateFormat doesn't match known patterns either
+        assert_eq!(result, "app/env/year=2006/month=01/day=02/hour/h=15");
+    }
 }
