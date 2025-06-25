@@ -81,7 +81,7 @@ impl TestEnvironment {
             time::sleep(time::Duration::from_millis(DELAY_MS)).await;
         }
 
-        anyhow::bail!("Les buckets ne sont pas accessibles après plusieurs tentatives.");
+        anyhow::bail!("One or many buckets are not availables.");
     }
 
     async fn start_container(
@@ -130,8 +130,8 @@ impl Default for TestConstants {
 #[tokio::test]
 async fn test_archiving_logs() -> Result<()> {
     let test = TestEnvironment::new().await?;
-    println!("Saluti");
+    println!("test1");
     let _ = test.wait_for_buckets().await;
-    println!("Salut");
+    println!("test");
     Ok(())
 }
