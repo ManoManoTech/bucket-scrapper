@@ -1,8 +1,6 @@
 // src/s3/checker.rs
 // Location: src/s3/checker.rs
 
-use rand::prelude::SliceRandom;
-use std::collections::HashMap;
 use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
 use crate::s3::client::WrappedS3Client;
 use crate::s3::downloader::DownloadOrchestrator;
@@ -13,8 +11,10 @@ use anyhow::Result;
 use chrono::Utc;
 use crc32fast::Hasher;
 use log::{info, warn};
-use std::sync::Arc;
+use rand::prelude::SliceRandom;
 use rand::rng;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Analysis data for a bucket at a specific date/hour
 #[derive(Debug)]
@@ -68,7 +68,7 @@ impl Checker {
         max_process_threads: Option<usize>,
         memory_pool_mb: usize,
     ) -> Self {
-        let max_process_threads = max_process_threads.unwrap_or_else(|| { num_cpus::get() - 2usize } ) ;
+        let max_process_threads = max_process_threads.unwrap_or_else(|| num_cpus::get() - 2usize);
         let memory_pool_bytes = memory_pool_mb * 1024 * 1024; // MB to Bytes
         let memory_allocator = Arc::new(MemoryLimitedAllocator::new(memory_pool_bytes));
         let progress_tracker = Arc::new(ProgressTracker::default());
@@ -87,7 +87,7 @@ impl Checker {
     pub fn get_memory_monitor(&self) -> Option<MemoryMonitor> {
         Some(MemoryMonitor::with_progress(
             Arc::clone(&self.memory_allocator),
-            self.progress_tracker.clone()
+            self.progress_tracker.clone(),
         ))
     }
 
@@ -104,7 +104,8 @@ impl Checker {
         };
 
         info!("Enumerating files for {} {}", bucket, key_prefix);
-        let file_list = self.s3_client
+        let file_list = self
+            .s3_client
             .get_matching_filenames_from_s3(bucket_config, date, hour, true)
             .await?;
 
@@ -130,7 +131,6 @@ impl Checker {
             Arc::clone(&self.memory_allocator),
             Arc::clone(&self.progress_tracker),
         );
-
 
         // Process all files in parallel in a single batch for maximum efficiency
         info!(
@@ -197,9 +197,7 @@ impl Checker {
             file_lists.sort_by(|a, b| b.size.cmp(&a.size));
         }
 
-        let character_counts_by_bucket = self
-            .download_and_analyze_files(&file_lists[..])
-            .await?;
+        let character_counts_by_bucket = self.download_and_analyze_files(&file_lists[..]).await?;
 
         // Analyze the archived buckets in parallel
         info!("Analyzing archived buckets");
@@ -207,7 +205,9 @@ impl Checker {
         // Compute the sum of all archived character counts
         let mut total_archived_counts = DetailedCharacterCount::new();
         for archived_info in archived_bucket_configs {
-            let bucket_character_count = character_counts_by_bucket.get(&archived_info.bucket).unwrap();
+            let bucket_character_count = character_counts_by_bucket
+                .get(&archived_info.bucket)
+                .unwrap();
             total_archived_counts.add(&bucket_character_count);
         }
 

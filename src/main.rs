@@ -10,10 +10,10 @@ use crate::s3::client::WrappedS3Client;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use jemallocator::Jemalloc;
 use log::{info, warn, LevelFilter};
 use std::path::PathBuf;
 use utils::date::date_range_to_date_hour_list;
-use jemallocator::Jemalloc;
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -202,10 +202,7 @@ async fn main() -> Result<()> {
             info!("Checking consolidation for date: {}, hour: {}", date, hour);
 
             // Log memory buffer settings
-            info!(
-                "Using memory pool of {} MB",
-                cli.memory_pool_mb
-            );
+            info!("Using memory pool of {} MB", cli.memory_pool_mb);
 
             // Create a checker with memory limits
             let checker = Checker::new(

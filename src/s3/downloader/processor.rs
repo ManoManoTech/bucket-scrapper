@@ -1,27 +1,29 @@
 // src/s3/downloader/processor.rs
 use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::signal_handler::ProgressTracker;
-use anyhow::{Result};
+use anyhow::Result;
+use futures::future::join_all;
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task;
-use futures::future::join_all;
 
 use super::types::{CompressionType, RawObjectData};
 
 #[derive(Clone)]
 pub struct Processor {
     // Can be extended with configuration options later
-    max_processor_count: usize
+    max_processor_count: usize,
 }
 
 impl Processor {
     pub fn new(max_processor_count: usize) -> Self {
-        Self { max_processor_count}
+        Self {
+            max_processor_count,
+        }
     }
-    
+
     /// Process data received from the S3 fetcher
     /// This asynchronous tasks waits for RawObjectData on the rx channel,
     /// and spawns up to max_processor_count decompress/downloaders
@@ -35,22 +37,22 @@ impl Processor {
 
         // Create a simple semaphore to limit concurrent processing tasks
         let semaphore = Arc::new(Semaphore::new(self.max_processor_count));
-    
+
         // Track pending futures
         let mut process_futures = Vec::new();
-    
+
         while let Some(item) = rx.recv().await {
             let semaphore_clone = semaphore.clone();
             let progress_tracker_clone = progress_tracker.clone();
-    
+
             // Acquire permit before spawning task
             let permit = semaphore_clone.acquire_owned().await?;
-    
+
             // Spawn blocking task for CPU-intensive decompression and counting
             let handle = task::spawn_blocking(move || {
                 // The permit will be dropped when this closure completes
                 let _permit_guard = permit;
-    
+
                 // Process the data
                 let result = Self::process_item(
                     &item.bucket.clone(),
@@ -58,13 +60,13 @@ impl Processor {
                     &item.data,
                     &item.compression_type,
                 );
-    
+
                 // Mark file as completed for progress tracking
                 progress_tracker_clone.increment_completed();
-    
+
                 result.unwrap()
             });
-    
+
             // Collect the processed results
             let total_counts_clone = Arc::clone(&total_counts);
             let aggregated_result = async move {
@@ -84,15 +86,17 @@ impl Processor {
                     }
                 }
             };
-    
+
             process_futures.push(aggregated_result);
         }
-    
+
         // Wait for all processing to complete
         join_all(process_futures).await;
-    
+
         // Return the final counts using proper pattern matching
-        Ok(Arc::into_inner(total_counts).map(|mutex| mutex.into_inner()).unwrap())
+        Ok(Arc::into_inner(total_counts)
+            .map(|mutex| mutex.into_inner())
+            .unwrap())
     }
 
     // Process a single downloaded item
@@ -107,7 +111,7 @@ impl Processor {
         let mut counts = DetailedCharacterCount::new();
         counts.bucket = bucket.to_owned();
         counts.prefix = key.to_owned();
-        
+
         match compression_type {
             CompressionType::Gzip => {
                 // Process gzip compressed data
@@ -163,4 +167,3 @@ impl Processor {
         Ok(())
     }
 }
-

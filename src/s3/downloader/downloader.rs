@@ -6,12 +6,12 @@ use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client;
 use backon::ExponentialBuilder;
 use backon::Retryable;
-use log::{debug, warn, info};
+use futures::future::join_all;
+use log::{debug, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
-use futures::future::join_all;
 
 use super::types::{CompressionType, RawObjectData};
 
@@ -22,7 +22,11 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(client: Client, max_concurrent_downloads: usize, memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
+    pub fn new(
+        client: Client,
+        max_concurrent_downloads: usize,
+        memory_allocator: Arc<MemoryLimitedAllocator>,
+    ) -> Self {
         let download_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
 
         Self {
@@ -40,7 +44,10 @@ impl Downloader {
         progress_tracker: Arc<ProgressTracker>,
     ) -> Result<()> {
         // Log initial memory allocation stats
-        info!("Starting downloads. Memory pool size: {} bytes", self.memory_allocator.stats().1);
+        info!(
+            "Starting downloads. Memory pool size: {} bytes",
+            self.memory_allocator.stats().1
+        );
 
         // Handle empty objects list gracefully
         if objects.is_empty() {
@@ -68,8 +75,15 @@ impl Downloader {
                         &obj_clone.clone(),
                         tx_clone.clone(),
                         allocator.clone(),
-                        progress_tracker.clone()
-                    ).await.map_err(|e| {anyhow::Error::msg(format!("download error {}/{}: '{}'", bucket_str, obj_clone.key, e))})
+                        progress_tracker.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::Error::msg(format!(
+                            "download error {}/{}: '{}'",
+                            bucket_str, obj_clone.key, e
+                        ))
+                    })
                 };
 
                 let retry_params = ExponentialBuilder::default()
@@ -83,8 +97,12 @@ impl Downloader {
                     .sleep(tokio::time::sleep)
                     .notify(|err: &anyhow::Error, dur: Duration| {
                         attempt += 1;
-                        warn!("will retry attempt {} caused by {} after {:?}", attempt, err, dur);
-                    }).await;
+                        warn!(
+                            "will retry attempt {} caused by {} after {:?}",
+                            attempt, err, dur
+                        );
+                    })
+                    .await;
 
                 // XXX on error shouldn't we terminate the whole program?
 
@@ -165,20 +183,30 @@ impl Downloader {
                 progress_tracker.increment_processed(bytes_read);
 
                 // Send data for processing
-                match tx.send(RawObjectData {
-                    bucket: bucket.to_string(),
-                    key: obj.key.clone(),
-                    data: buffer,
-                    compression_type,
-                }).await {
+                match tx
+                    .send(RawObjectData {
+                        bucket: bucket.to_string(),
+                        key: obj.key.clone(),
+                        data: buffer,
+                        compression_type,
+                    })
+                    .await
+                {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         warn!("Failed to send data for processing (channel closed): {}", e);
-                        Err(anyhow::anyhow!("Channel closed, receiver likely dropped: {}", e))
+                        Err(anyhow::anyhow!(
+                            "Channel closed, receiver likely dropped: {}",
+                            e
+                        ))
                     }
                 }
-            },
-            Err(e) => Err(anyhow::anyhow!("Failed to read data from S3 stream for {}: {}", obj.key, e)),
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to read data from S3 stream for {}: {}",
+                obj.key,
+                e
+            )),
         }
     }
 }

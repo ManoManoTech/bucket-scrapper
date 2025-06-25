@@ -1,7 +1,7 @@
 // src/config/loader.rs
 use crate::config::types::{BucketConfig, ConfigSchema};
 use anyhow::{Context, Result};
-use log::{info};
+use log::info;
 use std::fs;
 use std::path::Path;
 

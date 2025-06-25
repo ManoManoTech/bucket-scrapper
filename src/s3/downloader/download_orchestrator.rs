@@ -8,7 +8,7 @@ use aws_sdk_s3::Client;
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc};
+use tokio::sync::mpsc;
 
 use super::downloader::Downloader;
 use super::processor::Processor;
@@ -40,7 +40,10 @@ impl DownloadOrchestrator {
 
     /// Process a batch of S3 objects with controlled concurrency
     /// Returns a DetailedCharacterCount per bucket.
-    pub async fn download_decompress_count(&self, objects: &[S3ObjectInfo]) -> Result<HashMap<String, DetailedCharacterCount>> {
+    pub async fn download_decompress_count(
+        &self,
+        objects: &[S3ObjectInfo],
+    ) -> Result<HashMap<String, DetailedCharacterCount>> {
         // Early return for empty objects
         if objects.is_empty() {
             return Err(anyhow::anyhow!("No objects to download."));
@@ -48,7 +51,8 @@ impl DownloadOrchestrator {
 
         // Update progress tracker
         let total_bytes = objects.iter().map(|obj| obj.size).sum();
-        self.progress_tracker.update_total(objects.len(), total_bytes);
+        self.progress_tracker
+            .update_total(objects.len(), total_bytes);
         self.progress_tracker.reset();
 
         // Create channel
@@ -65,16 +69,14 @@ impl DownloadOrchestrator {
 
         // Then fetch objects
         info!("Starting downloads");
-        self.s3_fetcher.fetch_objects(
-            objects,
-            tx,
-            self.progress_tracker.clone()
-        ).await?;
+        self.s3_fetcher
+            .fetch_objects(objects, tx, self.progress_tracker.clone())
+            .await?;
 
         // Wait for processing to complete and get result
         info!("Waiting for processor to complete");
-        process_handle.await.unwrap_or_else(|e| {
-            Err(anyhow::anyhow!("Processor task failed: {}", e))
-        })
+        process_handle
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("Processor task failed: {}", e)))
     }
 }

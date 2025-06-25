@@ -1,11 +1,14 @@
 // src/utils/signal_handler.rs
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
+use human_bytes::human_bytes;
 use log::{info, warn};
 use signal_hook::{consts::SIGUSR2, iterator::Signals};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
-use human_bytes::human_bytes;
+use std::time::{Duration, Instant, SystemTime};
 
 // Shared reference to indicate if the signal handler is already running
 static SIGNAL_HANDLER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -123,9 +126,7 @@ pub struct MemoryMonitor {
 }
 
 impl MemoryMonitor {
-    pub fn new(
-        memory_allocator: Arc<MemoryLimitedAllocator>,
-    ) -> Self {
+    pub fn new(memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
         Self {
             memory_allocator,
             progress_tracker: None,
@@ -183,12 +184,20 @@ impl MemoryMonitor {
         };
 
         // Get waiters count
-        let (memory_waiters, memory_waiters_size, loan_count) = self.memory_allocator.waiters_count_and_size();
+        let (memory_waiters, memory_waiters_size, loan_count) =
+            self.memory_allocator.waiters_count_and_size();
         let waiters_size_human = human_bytes(memory_waiters_size as f64);
 
         info!("======= MEMORY USAGE STATS =======");
-        info!("Memory pool: {} loans, {}/{} ({:.1}%) with {} waiters (waiting for {} of memory)",
-            loan_count, memory_used, memory_total, memory_percent, memory_waiters, waiters_size_human);
+        info!(
+            "Memory pool: {} loans, {}/{} ({:.1}%) with {} waiters (waiting for {} of memory)",
+            loan_count,
+            memory_used,
+            memory_total,
+            memory_percent,
+            memory_waiters,
+            waiters_size_human
+        );
 
         // Add progress information if available
         if let Some(progress) = &self.progress_tracker {
@@ -197,14 +206,18 @@ impl MemoryMonitor {
             let speed = progress.processing_speed_mb_per_sec();
 
             info!("======= PROGRESS STATS =======");
-            info!("Files processed: {}/{} ({:.1}%)",
-                  progress.completed_files.load(Ordering::SeqCst),
-                  progress.total_files.load(Ordering::SeqCst),
-                  percent_files);
-            info!("Bytes processed: {}/{} ({:.1}%)",
-                  human_bytes(progress.processed_bytes.load(Ordering::SeqCst) as f64),
-                  human_bytes(progress.total_bytes.load(Ordering::SeqCst) as f64),
-                  percent_bytes);
+            info!(
+                "Files processed: {}/{} ({:.1}%)",
+                progress.completed_files.load(Ordering::SeqCst),
+                progress.total_files.load(Ordering::SeqCst),
+                percent_files
+            );
+            info!(
+                "Bytes processed: {}/{} ({:.1}%)",
+                human_bytes(progress.processed_bytes.load(Ordering::SeqCst) as f64),
+                human_bytes(progress.total_bytes.load(Ordering::SeqCst) as f64),
+                percent_bytes
+            );
             info!("Processing speed: {:.2} MB/s", speed);
 
             // Show elapsed time
@@ -213,7 +226,10 @@ impl MemoryMonitor {
 
             // Show estimated time remaining if available
             if let Some(remaining) = progress.estimated_time_remaining() {
-                info!("Estimated time remaining: {}", Self::format_duration(remaining));
+                info!(
+                    "Estimated time remaining: {}",
+                    Self::format_duration(remaining)
+                );
 
                 // Calculate estimated completion time
                 let now = SystemTime::now();
@@ -221,12 +237,17 @@ impl MemoryMonitor {
                 if let Some(completion_time) = now.checked_add(remaining) {
                     match completion_time.duration_since(SystemTime::UNIX_EPOCH) {
                         Ok(completion_datetime) => {
-                            let datetime = chrono::DateTime::from_timestamp(completion_datetime.as_secs() as i64, 0)
-                                .unwrap_or_else(|| chrono::Utc::now());
+                            let datetime = chrono::DateTime::from_timestamp(
+                                completion_datetime.as_secs() as i64,
+                                0,
+                            )
+                            .unwrap_or_else(|| chrono::Utc::now());
 
-                            info!("Estimated completion time: {}",
-                                  datetime.format("%Y-%m-%d %H:%M:%S %Z"));
-                        },
+                            info!(
+                                "Estimated completion time: {}",
+                                datetime.format("%Y-%m-%d %H:%M:%S %Z")
+                            );
+                        }
                         Err(_) => {
                             // This shouldn't happen with reasonable timestamps
                             warn!("Could not calculate completion time");
@@ -242,9 +263,10 @@ impl MemoryMonitor {
     // Setup signal handler for SIGUSR2
     pub fn setup_signal_handler(&self) -> Result<(), anyhow::Error> {
         // Only set up handler if it's not already running
-        if SIGNAL_HANDLER_RUNNING.compare_exchange(
-            false, true, Ordering::SeqCst, Ordering::SeqCst
-        ).is_err() {
+        if SIGNAL_HANDLER_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             // Handler already running
             return Ok(());
         }
@@ -263,12 +285,10 @@ impl MemoryMonitor {
                         let monitor = if let Some(tracker) = &progress_tracker {
                             MemoryMonitor::with_progress(
                                 Arc::clone(&memory_allocator),
-                                Arc::clone(tracker)
+                                Arc::clone(tracker),
                             )
                         } else {
-                            MemoryMonitor::new(
-                                Arc::clone(&memory_allocator)
-                            )
+                            MemoryMonitor::new(Arc::clone(&memory_allocator))
                         };
                         monitor.log_memory_stats();
                     }

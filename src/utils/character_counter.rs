@@ -31,7 +31,11 @@ impl DetailedCharacterCount {
     /// assert_eq!(counter.total_excluding_newlines(), 0);
     /// ```
     pub fn new() -> Self {
-        Self { bucket: "".to_string(), prefix: "".to_string(), counts: [0; 256] }
+        Self {
+            bucket: "".to_string(),
+            prefix: "".to_string(),
+            counts: [0; 256],
+        }
     }
 
     /// Increments the count for a specific byte

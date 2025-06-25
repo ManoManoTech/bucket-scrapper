@@ -62,7 +62,7 @@ impl WrappedS3Client {
         }
         Ok(guard.1.clone())
     }
-    
+
     /// Lists objects in a bucket with a prefix and returns information about them
     pub async fn get_matching_filenames_from_s3(
         &self,
@@ -214,10 +214,7 @@ impl WrappedS3Client {
 
         // Calculate a checksum of all filenames to enable identifying changes in file lists
         let files_checksum = {
-            let mut filenames = filtered.0
-                .iter()
-                .map(|f| f.key.clone())
-                .collect::<Vec<_>>();
+            let mut filenames = filtered.0.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
             filenames.sort();
             let joined = filenames.join("");
             format!("{:x}", md5::compute(joined))
