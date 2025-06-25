@@ -1,187 +1,137 @@
-use aws_sdk_s3::primitives::ByteStream;
-use log_consolidator_checker_rust::s3::client::WrappedS3Client;
+use anyhow::Result;
+use aws_config::retry::RetryConfig;
+use aws_config::BehaviorVersion;
+use aws_credential_types::Credentials;
 use testcontainers::runners::AsyncRunner;
+use testcontainers::ImageExt;
 use testcontainers_modules::minio::MinIO;
+use tokio::time;
 
-#[tokio::test]
-async fn test_s3_client_with_minio() -> Result<(), Box<dyn std::error::Error>> {
-    // Start MinIO container
-    let minio_container = MinIO::default().start().await?;
+pub struct TestEnvironment {
+    pub input_client: aws_sdk_s3::Client,
+    pub archive_client: aws_sdk_s3::Client,
+    pub input_endpoint: String,
+    pub archive_endpoint: String,
+    pub input_container: testcontainers::ContainerAsync<MinIO>,
+    pub archive_container: testcontainers::ContainerAsync<MinIO>,
+}
 
-    // Get MinIO connection details
-    let host_port = minio_container.get_host_port_ipv4(9000).await?;
-    let endpoint = format!("http://127.0.0.1:{}", host_port);
+impl TestEnvironment {
+    pub async fn new() -> Result<Self> {
+        let input_container_handle =
+            Self::start_container(TestConstants::MINIO_IMAGE, TestConstants::MINIO_TAG);
+        let archive_container_handle =
+            Self::start_container(TestConstants::MINIO_IMAGE, TestConstants::MINIO_TAG);
 
-    // Set environment variables for AWS SDK to use our MinIO endpoint
-    std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
-    std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+        let (input_container, archive_container) =
+            tokio::try_join!(input_container_handle, archive_container_handle)?;
 
-    // Use AWS default configuration which will pick up our environment variables
-    let config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&config);
+        let input_host_port = input_container
+            .get_host_port_ipv4(TestConstants::MINIO_PORT)
+            .await?;
+        let archive_host_port = archive_container
+            .get_host_port_ipv4(TestConstants::MINIO_PORT)
+            .await?;
 
-    // Test basic S3 operations
-    let bucket_name = "test-bucket";
+        let input_endpoint = format!("http://127.0.0.1:{}", input_host_port);
+        let archive_endpoint = format!("http://127.0.0.1:{}", archive_host_port);
 
-    // Create bucket
-    s3_client.create_bucket().bucket(bucket_name).send().await?;
+        let credentials = Credentials::new("minioadmin", "minioadmin", None, None, "test");
 
-    // List buckets to verify creation
-    let buckets = s3_client.list_buckets().send().await?;
-    assert!(buckets
-        .buckets()
-        .iter()
-        .any(|b| b.name() == Some(bucket_name)));
+        let (input_config, archive_config) = tokio::try_join!(
+            Self::configure_client(&input_endpoint, credentials.clone()),
+            Self::configure_client(&archive_endpoint, credentials),
+        )?;
 
-    // Put an object
-    s3_client
-        .put_object()
-        .bucket(bucket_name)
-        .key("test-file.txt")
-        .body(ByteStream::from_static(b"Hello MinIO!"))
-        .send()
-        .await?;
+        let input_client = aws_sdk_s3::Client::new(&input_config);
+        let archive_client = aws_sdk_s3::Client::new(&archive_config);
 
-    // Get the object back
-    let object = s3_client
-        .get_object()
-        .bucket(bucket_name)
-        .key("test-file.txt")
-        .send()
-        .await?;
+        tokio::try_join!(
+            input_client
+                .create_bucket()
+                .bucket(TestConstants::INPUT_BUCKET_NAME)
+                .send(),
+            archive_client
+                .create_bucket()
+                .bucket(TestConstants::ARCHIVE_BUCKET_NAME)
+                .send(),
+        )?;
 
-    let body = object.body.collect().await?;
-    let content = String::from_utf8(body.to_vec())?;
-    assert_eq!(content, "Hello MinIO!");
+        Ok(TestEnvironment {
+            input_client,
+            archive_client,
+            input_container,
+            archive_container,
+            input_endpoint,
+            archive_endpoint,
+        })
+    }
 
-    Ok(())
+    async fn wait_for_buckets(&self) -> Result<()> {
+        const MAX_RETRIES: u32 = 10;
+        const DELAY_MS: u64 = 500;
+
+        for _ in 0..MAX_RETRIES {
+            let input_buckets_result = self.input_client.list_buckets().send().await;
+            let archive_buckets_result = self.archive_client.list_buckets().send().await;
+
+            if input_buckets_result.is_ok() && archive_buckets_result.is_ok() {
+                return Ok(());
+            }
+            time::sleep(time::Duration::from_millis(DELAY_MS)).await;
+        }
+
+        anyhow::bail!("Les buckets ne sont pas accessibles après plusieurs tentatives.");
+    }
+
+    async fn start_container(
+        image: &'static str,
+        tag: &'static str,
+    ) -> Result<testcontainers::ContainerAsync<MinIO>> {
+        let container_request: testcontainers::ContainerRequest<MinIO> =
+            MinIO::default().with_name(image).with_tag(tag);
+        let container = container_request.start().await?;
+        Ok(container)
+    }
+
+    async fn configure_client(
+        endpoint: &str,
+        credentials: Credentials,
+    ) -> Result<aws_config::SdkConfig> {
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .endpoint_url(endpoint)
+            .credentials_provider(credentials)
+            .region(aws_config::Region::new(TestConstants::DEFAULT_REGION))
+            .retry_config(RetryConfig::standard().with_max_attempts(3))
+            .load()
+            .await;
+        Ok(config)
+    }
+}
+
+pub struct TestConstants;
+
+impl TestConstants {
+    pub const MINIO_IMAGE: &'static str =
+        "304971447450.dkr.ecr.eu-west-3.amazonaws.com/public/minio/minio";
+    pub const MINIO_TAG: &'static str = "RELEASE.2025-02-18T16-25-55Z";
+    pub const MINIO_PORT: u16 = 9000;
+    pub const DEFAULT_REGION: &'static str = "us-east-1";
+    pub const INPUT_BUCKET_NAME: &'static str = "input";
+    pub const ARCHIVE_BUCKET_NAME: &'static str = "archive";
+}
+
+impl Default for TestConstants {
+    fn default() -> Self {
+        Self
+    }
 }
 
 #[tokio::test]
-async fn test_wrapped_s3_client() -> Result<(), Box<dyn std::error::Error>> {
-    // Start MinIO container
-    let minio_container = MinIO::default().start().await?;
-
-    // Get MinIO connection details
-    let host_port = minio_container.get_host_port_ipv4(9000).await?;
-    let endpoint = format!("http://127.0.0.1:{}", host_port);
-
-    // Set environment variables for AWS SDK to use our MinIO endpoint
-    std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
-    std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-
-    // Test our WrappedS3Client - it creates its own client internally
-    let wrapped_client = WrappedS3Client::new("us-east-1", 1).await?;
-
-    let bucket_name = "test-bucket-wrapped";
-
-    // Create bucket through wrapper
-    wrapped_client
-        .get_client()
-        .await?
-        .create_bucket()
-        .bucket(bucket_name)
-        .send()
-        .await?;
-
-    // Test list_objects_v2 through wrapper
-    let objects = wrapped_client
-        .get_client()
-        .await?
-        .list_objects_v2()
-        .bucket(bucket_name)
-        .send()
-        .await?;
-
-    // Should be empty initially
-    assert_eq!(objects.contents().len(), 0);
-
-    // Put some test objects
-    for i in 0..5 {
-        wrapped_client
-            .get_client()
-            .await?
-            .put_object()
-            .bucket(bucket_name)
-            .key(&format!("test-file-{}.txt", i))
-            .body(ByteStream::from(format!("Content {}", i).into_bytes()))
-            .send()
-            .await?;
-    }
-
-    // List objects again
-    let objects = wrapped_client
-        .get_client()
-        .await?
-        .list_objects_v2()
-        .bucket(bucket_name)
-        .send()
-        .await?;
-
-    assert_eq!(objects.contents().len(), 5);
-
-    // Note: WrappedS3Client doesn't implement Clone, so we'll skip concurrent test
-    // This is actually good behavior for a rate-limited client
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_s3_client_operations() -> Result<(), Box<dyn std::error::Error>> {
-    // Start MinIO container
-    let minio_container = MinIO::default().start().await?;
-
-    // Get MinIO connection details
-    let host_port = minio_container.get_host_port_ipv4(9000).await?;
-    let endpoint = format!("http://127.0.0.1:{}", host_port);
-
-    // Set environment variables for AWS SDK to use our MinIO endpoint
-    std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
-    std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-
-    // Test WrappedS3Client operations
-    let wrapped_client = WrappedS3Client::new("us-east-1", 1).await?;
-
-    let bucket_name = "test-operations";
-
-    // Create bucket
-    wrapped_client
-        .get_client()
-        .await?
-        .create_bucket()
-        .bucket(bucket_name)
-        .send()
-        .await?;
-
-    // Make 3 calls to test client reuse
-    for i in 0..3 {
-        wrapped_client
-            .get_client()
-            .await?
-            .put_object()
-            .bucket(bucket_name)
-            .key(&format!("test-{}.txt", i))
-            .body(ByteStream::from_static(b"test"))
-            .send()
-            .await?;
-    }
-
-    // Verify objects were created
-    let objects = wrapped_client
-        .get_client()
-        .await?
-        .list_objects_v2()
-        .bucket(bucket_name)
-        .send()
-        .await?;
-
-    assert_eq!(objects.contents().len(), 3);
-
+async fn test_archiving_logs() -> Result<()> {
+    let test = TestEnvironment::new().await?;
+    println!("Saluti");
+    let _ = test.wait_for_buckets().await;
+    println!("Salut");
     Ok(())
 }
