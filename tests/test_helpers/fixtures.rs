@@ -62,9 +62,18 @@ impl FileFixtures {
         vec![
             ("logs/2023/12/25/14/app.log.gz", "Compressed log file"),
             ("logs/2023/12/25/14/data.json.zst", "Compressed JSON file"),
-            ("logs/2023/12/25/14/metrics.json.gz", "Compressed metrics file"),
-            ("logs/2023/12/25/14/config.txt", "Plain text file - should be filtered out"),
-            ("logs/2023/12/25/14/readme.md", "Markdown file - should be filtered out"),
+            (
+                "logs/2023/12/25/14/metrics.json.gz",
+                "Compressed metrics file",
+            ),
+            (
+                "logs/2023/12/25/14/config.txt",
+                "Plain text file - should be filtered out",
+            ),
+            (
+                "logs/2023/12/25/14/readme.md",
+                "Markdown file - should be filtered out",
+            ),
         ]
     }
 }
@@ -74,8 +83,57 @@ impl FileFixtures {
 pub struct BucketNames;
 
 impl BucketNames {
+    // Legacy bucket names (for compatibility)
     pub const INPUT_LOGS: &'static str = "test-input-logs";
     pub const ARCHIVED_LOGS: &'static str = "test-archived-logs";
+
+    // Input bucket names (bucketsToConsolidate)
+    pub const INPUT_BUCKET_1: &'static str = "input-bucket-1";
+    pub const INPUT_BUCKET_2: &'static str = "input-bucket-2";
+
+    // Archive bucket names (for legacy tests)
+    pub const ARCHIVE_BUCKET_1: &'static str = "archive-bucket-1";
+    pub const ARCHIVE_BUCKET_2: &'static str = "archive-bucket-2";
+
+    // Consolidated bucket names (bucketsConsolidated)
+    pub const CONSOLIDATED_BUCKET_1: &'static str = "consolidated-bucket-1";
+    pub const CONSOLIDATED_BUCKET_2: &'static str = "consolidated-bucket-2";
+
+    // Results bucket names (bucketsCheckerResults)
+    pub const RESULTS_BUCKET_1: &'static str = "results-bucket-1";
+    pub const RESULTS_BUCKET_2: &'static str = "results-bucket-2";
+
+    /// Get all standard bucket names as a vector
+    pub fn all_standard_buckets() -> Vec<&'static str> {
+        vec![
+            Self::INPUT_BUCKET_1,
+            Self::INPUT_BUCKET_2,
+            Self::CONSOLIDATED_BUCKET_1,
+            Self::CONSOLIDATED_BUCKET_2,
+            Self::RESULTS_BUCKET_1,
+            Self::RESULTS_BUCKET_2,
+        ]
+    }
+
+    /// Get input bucket names
+    pub fn input_buckets() -> Vec<&'static str> {
+        vec![Self::INPUT_BUCKET_1, Self::INPUT_BUCKET_2]
+    }
+
+    /// Get consolidated bucket names
+    pub fn consolidated_buckets() -> Vec<&'static str> {
+        vec![Self::CONSOLIDATED_BUCKET_1, Self::CONSOLIDATED_BUCKET_2]
+    }
+
+    /// Get results bucket names
+    pub fn results_buckets() -> Vec<&'static str> {
+        vec![Self::RESULTS_BUCKET_1, Self::RESULTS_BUCKET_2]
+    }
+
+    /// Get archive bucket names (legacy)
+    pub fn archive_buckets() -> Vec<&'static str> {
+        vec![Self::ARCHIVE_BUCKET_1, Self::ARCHIVE_BUCKET_2]
+    }
 }
 
 /// Common test configurations as YAML strings

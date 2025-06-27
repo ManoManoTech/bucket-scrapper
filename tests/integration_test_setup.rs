@@ -1,0 +1,577 @@
+use aws_sdk_s3::primitives::ByteStream;
+use chrono::{DateTime, Utc};
+use log_consolidator_checker_rust::config::loader::{
+    get_archived_buckets, get_consolidated_buckets, load_config,
+};
+use log_consolidator_checker_rust::s3::checker::Checker;
+use log_consolidator_checker_rust::s3::client::WrappedS3Client;
+use log_consolidator_checker_rust::utils::date::date_range_to_date_hour_list;
+use std::collections::HashMap;
+use std::fs;
+use tempfile::NamedTempFile;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::minio::MinIO;
+
+mod test_helpers;
+use test_helpers::mock_data_populator::{MockDataPopulator, PopulationUtils};
+
+/// Setup test environment with MinIO container and S3 clients
+pub async fn setup_test_environment() -> Result<
+    (
+        testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO>,
+        HashMap<String, aws_sdk_s3::Client>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    // Start MinIO container
+    let minio_container = MinIO::default().start().await?;
+    let host_port = minio_container.get_host_port_ipv4(9000).await?;
+    let endpoint = format!("http://127.0.0.1:{}", host_port);
+
+    // Set environment variables for AWS SDK
+    std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+    std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
+    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+
+    // Initialize S3 client
+    let s3_client = WrappedS3Client::new("us-east-1", 15).await?;
+    let client = s3_client.get_client().await?;
+
+    // Create bucket mappings for standard 6-bucket environment
+    let bucket_mappings = PopulationUtils::create_standard_bucket_mappings();
+    let mut clients = HashMap::new();
+
+    // Create all buckets and store clients
+    for (container_name, bucket_name) in &bucket_mappings {
+        client.create_bucket().bucket(bucket_name).send().await?;
+        clients.insert(container_name.clone(), client.clone());
+    }
+
+    Ok((minio_container, clients))
+}
+
+#[tokio::test]
+async fn test_end_to_end_list_command_workflow() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup test environment
+    let (_minio_container, clients) = setup_test_environment().await?;
+    let bucket_mappings = PopulationUtils::create_standard_bucket_mappings();
+
+    // Create test configuration matching the standard bucket mappings
+    let config_content = r#"
+bucketsToConsolidate:
+  - bucket: "input-bucket-1"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+  - bucket: "input-bucket-2"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsConsolidated:
+  - bucket: "consolidated-bucket"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsCheckerResults:
+  - bucket: "results-bucket"
+    path:
+      - static_path: "results"
+"#;
+
+    let temp_config = NamedTempFile::new()?;
+    fs::write(temp_config.path(), config_content)?;
+
+    // Load configuration
+    let config = load_config(temp_config.path())?;
+
+    // Initialize S3 client for operations
+    let s3_client = WrappedS3Client::new("us-east-1", 15).await?;
+
+    // Populate buckets with mock data
+    let populator = match MockDataPopulator::from_env() {
+        Ok(populator) => {
+            // Use real mock data if available
+            println!("Using real mock data from $MOCK_DATA_FOLDER");
+            populator
+        }
+        Err(_) => {
+            // Fall back to synthetic data
+            println!("Using synthetic mock data (no $MOCK_DATA_FOLDER set)");
+            MockDataPopulator::new("/tmp") // Dummy path for synthetic mode
+        }
+    };
+
+    // Populate both input and consolidated buckets with realistic consolidation test data
+    let _summary = populator
+        .populate_with_synthetic_data(&clients, &bucket_mappings, 12)
+        .await?;
+
+    // Test the List command workflow
+    let start_date = DateTime::parse_from_rfc3339("2023-12-25T14:00:00Z")?.with_timezone(&Utc);
+    let end_date = DateTime::parse_from_rfc3339("2023-12-25T14:59:59Z")?.with_timezone(&Utc);
+
+    let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
+    assert_eq!(date_hours.len(), 1);
+    assert_eq!(date_hours[0].date, "20231225");
+    assert_eq!(date_hours[0].hour, "14");
+
+    // Test archived buckets listing
+    let archived_buckets = get_archived_buckets(&config);
+    assert_eq!(archived_buckets.len(), 2); // Now have 2 input buckets
+
+    let mut total_files_found = 0;
+    for bucket_config in archived_buckets {
+        for date_hour in &date_hours {
+            let result = s3_client
+                .get_matching_filenames_from_s3(
+                    bucket_config,
+                    &date_hour.date,
+                    &date_hour.hour,
+                    true,
+                )
+                .await?;
+
+            // Each bucket should have synthetic files generated by MockDataPopulator
+            assert!(
+                result.files.len() > 0,
+                "Should have files in archived bucket"
+            );
+            assert!(result.total_archives_size > 0);
+            total_files_found += result.files.len();
+
+            // Verify files follow input data patterns (.gz files)
+            let keys: Vec<&String> = result.files.iter().map(|f| &f.key).collect();
+            // Should contain service files with .log.gz extensions (original input files)
+            assert!(keys.iter().any(|k| k.contains(".log.gz")));
+        }
+    }
+
+    // Should have found files from both input buckets
+    assert!(
+        total_files_found >= 6,
+        "Should have at least 6 files total from synthetic data"
+    );
+
+    // Test consolidated buckets listing
+    let consolidated_buckets = get_consolidated_buckets(&config);
+    assert_eq!(consolidated_buckets.len(), 1);
+
+    for bucket_config in consolidated_buckets {
+        for date_hour in &date_hours {
+            let result = s3_client
+                .get_matching_filenames_from_s3(
+                    bucket_config,
+                    &date_hour.date,
+                    &date_hour.hour,
+                    true,
+                )
+                .await?;
+
+            // Should find consolidated files (.zstd files grouped by env-service)
+            assert!(result.files.len() > 0, "Should have consolidated files");
+            assert!(result.total_archives_size > 0);
+
+            let keys: Vec<&String> = result.files.iter().map(|f| &f.key).collect();
+            // Should contain consolidated files with .json.zst extensions
+            assert!(keys.iter().any(|k| k.contains("-consolidated.json.zst")));
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_end_to_end_check_command_workflow() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup test environment
+    let (_minio_container, clients) = setup_test_environment().await?;
+    let bucket_mappings = PopulationUtils::create_standard_bucket_mappings();
+
+    // Create test configuration for check workflow
+    let config_content = r#"
+bucketsToConsolidate:
+  - bucket: "input-bucket-1"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+  - bucket: "input-bucket-2"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsConsolidated:
+  - bucket: "consolidated-bucket"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsCheckerResults:
+  - bucket: "results-bucket"
+    path:
+      - static_path: "results"
+"#;
+
+    let temp_config = NamedTempFile::new()?;
+    fs::write(temp_config.path(), config_content)?;
+
+    // Load configuration
+    let config = load_config(temp_config.path())?;
+
+    // Initialize S3 client for operations
+    let s3_client = WrappedS3Client::new("us-east-1", 15).await?;
+
+    // Populate buckets with mock data
+    let populator = match MockDataPopulator::from_env() {
+        Ok(populator) => populator,
+        Err(_) => MockDataPopulator::new("/tmp"), // Synthetic mode
+    };
+
+    // Populate both input and consolidated buckets with realistic consolidation test data
+    let summary = populator
+        .populate_with_synthetic_data(&clients, &bucket_mappings, 16)
+        .await?;
+
+    println!(
+        "Populated {} files for consolidation test scenario",
+        summary.total_files()
+    );
+
+    // Test the Check command workflow
+    let checker = Checker::new(
+        s3_client, 8,    // max_parallel (increased for better performance with more files)
+        None, // process_threads (use default)
+        2048, // memory_pool_mb (increased for larger dataset)
+    );
+
+    // Get bucket configurations
+    let archived_buckets = get_archived_buckets(&config);
+    let consolidated_buckets = get_consolidated_buckets(&config);
+    let consolidated_bucket = consolidated_buckets
+        .first()
+        .ok_or("No consolidated bucket found")?;
+
+    // Perform the comparison (this is the core Check command logic)
+    let date_str = "20231225".to_string();
+    let hour_str = "14".to_string();
+    let result = checker
+        .get_comparison_results(&archived_buckets, consolidated_bucket, &date_str, &hour_str)
+        .await?;
+
+    // Verify the check results
+    // The result should indicate whether consolidation was successful
+    // Note: The actual success/failure depends on the Checker implementation
+    // For this test, we mainly verify the workflow completes without errors
+    assert!(
+        !result.message.is_empty(),
+        "Check result should have a message"
+    );
+    assert_eq!(result.date, date_str);
+    assert_eq!(result.hour, hour_str);
+    assert!(
+        !result.analysis_start_date.is_empty(),
+        "Should have analysis start date"
+    );
+    assert!(
+        !result.analysis_end_date.is_empty(),
+        "Should have analysis end date"
+    );
+
+    // The comparison result should be either true or false, depending on the actual data
+    // For this test, we just verify it completed without error and produced meaningful results
+    println!(
+        "Check result with MockDataPopulator: ok={}, message={}",
+        result.ok, result.message
+    );
+    println!(
+        "Analysis period: {} to {}",
+        result.analysis_start_date, result.analysis_end_date
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_end_to_end_multiple_date_hours() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup test environment
+    let (_minio_container, _clients) = setup_test_environment().await?;
+
+    // Create custom bucket mappings for this multi-bucket test
+    let mut custom_bucket_mappings = HashMap::new();
+    custom_bucket_mappings.insert("input-0".to_string(), "app-logs-bucket".to_string());
+    custom_bucket_mappings.insert("input-1".to_string(), "system-logs-bucket".to_string());
+    custom_bucket_mappings.insert(
+        "consolidated".to_string(),
+        "unified-logs-bucket".to_string(),
+    );
+    custom_bucket_mappings.insert(
+        "results".to_string(),
+        "validation-results-bucket".to_string(),
+    );
+
+    // Create additional buckets for this test (only if they don't exist)
+    let additional_buckets = [
+        "app-logs-bucket",
+        "system-logs-bucket",
+        "unified-logs-bucket",
+        "validation-results-bucket",
+    ];
+    let s3_client = WrappedS3Client::new("us-east-1", 15).await?;
+    let client = s3_client.get_client().await?;
+
+    for bucket_name in additional_buckets {
+        match client.create_bucket().bucket(bucket_name).send().await {
+            Ok(_) => {}
+            Err(e) => {
+                // Ignore bucket already exists errors
+                if !e.to_string().contains("BucketAlreadyOwnedByYou") {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    // Create test configuration with multiple archived buckets
+    let config_content = r#"
+bucketsToConsolidate:
+  - bucket: "app-logs-bucket"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+  - bucket: "system-logs-bucket"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsConsolidated:
+  - bucket: "unified-logs-bucket"
+    path:
+      - static_path: "raw-logs"
+      - datefmt: "dt=placeholder/hour=99"
+
+bucketsCheckerResults:
+  - bucket: "validation-results-bucket"
+    path:
+      - static_path: "validation"
+"#;
+
+    let temp_config = NamedTempFile::new()?;
+    fs::write(temp_config.path(), config_content)?;
+
+    // Load configuration
+    let config = load_config(temp_config.path())?;
+
+    // Use MockDataPopulator to create realistic multi-bucket test data
+    let populator = match MockDataPopulator::from_env() {
+        Ok(populator) => populator,
+        Err(_) => MockDataPopulator::new("/tmp"), // Synthetic mode
+    };
+
+    // Create clients map for custom buckets
+    let mut custom_clients = HashMap::new();
+    custom_clients.insert("input-0".to_string(), client.clone());
+    custom_clients.insert("input-1".to_string(), client.clone());
+
+    // Populate both app and system log buckets with synthetic data
+    let summary = populator
+        .populate_with_synthetic_data(&custom_clients, &custom_bucket_mappings, 10)
+        .await?;
+
+    println!(
+        "Multi-bucket test: Populated {} files across {} buckets",
+        summary.total_files(),
+        summary.container_summary().len()
+    );
+
+    // Create unified consolidated data for multiple hours
+    let test_scenarios = vec![("20231225", "14")]; // Using standard test date from MockDataPopulator
+
+    for (date, hour) in &test_scenarios {
+        let unified_files = vec![
+            (
+                format!(
+                    "raw-logs/dt={}/hour={}/unified-all-services.json.zst",
+                    date, hour
+                ),
+                format!(
+                    "Unified logs for {}/{} - comprehensive consolidation",
+                    date, hour
+                ),
+            ),
+            (
+                format!("raw-logs/dt={}/hour={}/stats.json.gz", date, hour),
+                format!("Statistics and metadata for {}/{}", date, hour),
+            ),
+        ];
+
+        for (key, content) in unified_files {
+            client
+                .put_object()
+                .bucket("unified-logs-bucket")
+                .key(&key)
+                .body(ByteStream::from(content.as_bytes().to_vec()))
+                .send()
+                .await?;
+        }
+    }
+
+    // Test List command workflow with date range (matching our test data)
+    let start_date = DateTime::parse_from_rfc3339("2023-12-25T14:00:00Z")?.with_timezone(&Utc);
+    let end_date = DateTime::parse_from_rfc3339("2023-12-25T14:59:59Z")?.with_timezone(&Utc);
+
+    let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
+    assert_eq!(date_hours.len(), 1); // Hour 14
+
+    // Test all archived buckets
+    let archived_buckets = get_archived_buckets(&config);
+    assert_eq!(archived_buckets.len(), 2); // app-logs and system-logs
+
+    let mut total_archived_files = 0;
+    for bucket_config in &archived_buckets {
+        for date_hour in &date_hours {
+            let result = s3_client
+                .get_matching_filenames_from_s3(
+                    bucket_config,
+                    &date_hour.date,
+                    &date_hour.hour,
+                    true,
+                )
+                .await?;
+
+            // Each bucket should have synthetic files from MockDataPopulator
+            assert!(
+                result.files.len() > 0,
+                "Should have files in archived bucket"
+            );
+            assert!(result.total_archives_size > 0);
+            total_archived_files += result.files.len();
+
+            // Verify files follow synthetic data patterns
+            let keys: Vec<&String> = result.files.iter().map(|f| &f.key).collect();
+            assert!(keys
+                .iter()
+                .any(|k| k.contains("service") && k.contains(".json.gz")));
+        }
+    }
+
+    println!(
+        "Found {} total files across {} archived buckets",
+        total_archived_files,
+        archived_buckets.len()
+    );
+
+    // Test consolidated bucket
+    let consolidated_buckets = get_consolidated_buckets(&config);
+    let consolidated_bucket = consolidated_buckets.first().unwrap();
+
+    for date_hour in &date_hours {
+        let result = s3_client
+            .get_matching_filenames_from_s3(
+                consolidated_bucket,
+                &date_hour.date,
+                &date_hour.hour,
+                true,
+            )
+            .await?;
+
+        // Should have 2 unified files (unified + stats)
+        assert_eq!(result.files.len(), 2);
+        let keys: Vec<&String> = result.files.iter().map(|f| &f.key).collect();
+        assert!(keys.iter().any(|k| k.contains("unified-all-services")));
+        assert!(keys.iter().any(|k| k.contains("stats")));
+    }
+
+    // Test Check command for the specific hour
+    let checker = Checker::new(s3_client, 8, None, 2048);
+
+    let date_str = "20231225".to_string();
+    let hour_str = "14".to_string();
+    let result = checker
+        .get_comparison_results(&archived_buckets, consolidated_bucket, &date_str, &hour_str)
+        .await?;
+
+    // Verify the check completed successfully
+    assert_eq!(result.date, date_str);
+    assert_eq!(result.hour, hour_str);
+    assert!(!result.message.is_empty());
+    assert!(!result.analysis_start_date.is_empty());
+    assert!(!result.analysis_end_date.is_empty());
+
+    println!(
+        "Multi-bucket check result with MockDataPopulator: ok={}, message={}",
+        result.ok, result.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_end_to_end_error_scenarios() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup test environment (but don't create the buckets we reference in config)
+    let (_minio_container, _clients) = setup_test_environment().await?;
+
+    // Create test configuration
+    let config_content = r#"
+bucketsToConsolidate:
+  - bucket: "missing-bucket"
+    path:
+      - static_path: "data"
+      - datefmt: "2006/01/02/15"
+
+bucketsConsolidated:
+  - bucket: "also-missing-bucket"
+    path:
+      - static_path: "consolidated"
+      - datefmt: "2006/01/02/15"
+
+bucketsCheckerResults:
+  - bucket: "results-bucket"
+    path:
+      - static_path: "results"
+"#;
+
+    let temp_config = NamedTempFile::new()?;
+    fs::write(temp_config.path(), config_content)?;
+
+    // Load configuration
+    let config = load_config(temp_config.path())?;
+
+    // Initialize S3 client
+    let s3_client = WrappedS3Client::new("us-east-1", 15).await?;
+
+    // Test accessing non-existent buckets (should handle gracefully)
+    let archived_buckets = get_archived_buckets(&config);
+    let bucket_config = archived_buckets.first().unwrap();
+
+    let date_str = "20231225".to_string();
+    let hour_str = "14".to_string();
+    let result = s3_client
+        .get_matching_filenames_from_s3(bucket_config, &date_str, &hour_str, true)
+        .await;
+
+    // Should return an error for non-existent bucket
+    assert!(result.is_err());
+
+    // Test Checker with non-existent buckets
+    let checker = Checker::new(s3_client, 4, None, 1024);
+    let consolidated_buckets = get_consolidated_buckets(&config);
+    let consolidated_bucket = consolidated_buckets.first().unwrap();
+
+    let check_result = checker
+        .get_comparison_results(&archived_buckets, consolidated_bucket, &date_str, &hour_str)
+        .await;
+
+    // Should handle errors gracefully (exact behavior depends on Checker implementation)
+    // At minimum, it should not panic
+    match check_result {
+        Ok(_) => {
+            // If it succeeds, that's fine - it means empty results were handled
+        }
+        Err(_) => {
+            // If it errors, that's also expected for non-existent buckets
+        }
+    }
+
+    Ok(())
+}

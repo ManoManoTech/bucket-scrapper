@@ -1,6 +1,5 @@
 /// Test data factories for generating dynamic test data
 /// These factories create test objects programmatically for various test scenarios
-
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -9,7 +8,11 @@ pub struct JsonLogFactory;
 
 impl JsonLogFactory {
     /// Create a simple JSON log entry with env, service, and custom fields
-    pub fn create_simple(env: &str, service: &str, fields: HashMap<&str, serde_json::Value>) -> String {
+    pub fn create_simple(
+        env: &str,
+        service: &str,
+        fields: HashMap<&str, serde_json::Value>,
+    ) -> String {
         let mut obj = json!({
             "env": env,
             "service": service
@@ -24,12 +27,7 @@ impl JsonLogFactory {
     }
 
     /// Create a realistic log entry with timestamp and standard fields
-    pub fn create_realistic(
-        env: &str,
-        service: &str,
-        level: &str,
-        message: &str
-    ) -> String {
+    pub fn create_realistic(env: &str, service: &str, level: &str, message: &str) -> String {
         json!({
             "env": env,
             "service": service,
@@ -38,7 +36,8 @@ impl JsonLogFactory {
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "host": "test-host",
             "version": "1.0.0"
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Create an error log entry
@@ -52,7 +51,8 @@ impl JsonLogFactory {
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "stack_trace": "...",
             "retry_count": 3
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Create a performance/metrics log entry
@@ -67,25 +67,23 @@ impl JsonLogFactory {
             "duration_ms": duration_ms,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "user_agent": "test-client/1.0"
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Create a batch of JSON entries for the same env-service combination
     pub fn create_batch(env: &str, service: &str, count: usize) -> Vec<String> {
-        (0..count).map(|i| {
-            Self::create_realistic(
-                env,
-                service,
-                "info",
-                &format!("Batch log entry #{}", i)
-            )
-        }).collect()
+        (0..count)
+            .map(|i| {
+                Self::create_realistic(env, service, "info", &format!("Batch log entry #{}", i))
+            })
+            .collect()
     }
 
     /// Create entries for multiple env-service combinations
     pub fn create_multi_env_service(
         combinations: Vec<(&str, &str)>,
-        entries_per_combo: usize
+        entries_per_combo: usize,
     ) -> Vec<String> {
         let mut all_entries = Vec::new();
 
@@ -138,36 +136,57 @@ impl FileListFactory {
         base_path: &str,
         prefix: &str,
         count: usize,
-        extension: &str
+        extension: &str,
     ) -> Vec<(String, String)> {
-        (0..count).map(|i| {
-            let key = format!("{}/{}-{:03}.{}", base_path, prefix, i, extension);
-            let content = format!("Log content for file {} #{}", prefix, i);
-            (key, content)
-        }).collect()
+        (0..count)
+            .map(|i| {
+                let key = format!("{}/{}-{:03}.{}", base_path, prefix, i, extension);
+                let content = format!("Log content for file {} #{}", prefix, i);
+                (key, content)
+            })
+            .collect()
     }
 
     /// Generate files with different service prefixes
     pub fn create_prefixed_files(
         base_path: &str,
         prefixes: Vec<&str>,
-        extension: &str
+        extension: &str,
     ) -> Vec<(String, String)> {
-        prefixes.into_iter().enumerate().map(|(i, prefix)| {
-            let key = format!("{}/{}-service.{}", base_path, prefix, extension);
-            let content = format!("{} service logs #{}", prefix, i);
-            (key, content)
-        }).collect()
+        prefixes
+            .into_iter()
+            .enumerate()
+            .map(|(i, prefix)| {
+                let key = format!("{}/{}-service.{}", base_path, prefix, extension);
+                let content = format!("{} service logs #{}", prefix, i);
+                (key, content)
+            })
+            .collect()
     }
 
     /// Generate a mix of compressed and uncompressed files
     pub fn create_mixed_files(base_path: &str) -> Vec<(String, String)> {
         vec![
-            (format!("{}/app.log.gz", base_path), "Compressed log file".to_string()),
-            (format!("{}/data.json.zst", base_path), "Compressed JSON file".to_string()),
-            (format!("{}/metrics.json.gz", base_path), "Compressed metrics".to_string()),
-            (format!("{}/config.txt", base_path), "Plain text file".to_string()),
-            (format!("{}/readme.md", base_path), "Markdown file".to_string()),
+            (
+                format!("{}/app.log.gz", base_path),
+                "Compressed log file".to_string(),
+            ),
+            (
+                format!("{}/data.json.zst", base_path),
+                "Compressed JSON file".to_string(),
+            ),
+            (
+                format!("{}/metrics.json.gz", base_path),
+                "Compressed metrics".to_string(),
+            ),
+            (
+                format!("{}/config.txt", base_path),
+                "Plain text file".to_string(),
+            ),
+            (
+                format!("{}/readme.md", base_path),
+                "Markdown file".to_string(),
+            ),
         ]
     }
 }
@@ -177,12 +196,198 @@ pub struct BucketConfigFactory;
 
 impl BucketConfigFactory {
     /// Create a quick test bucket config with minimal setup
-    pub fn quick_config(bucket_name: &str) -> log_consolidator_checker_rust::config::types::BucketConfig {
-        super::setup::StandardBucketConfigs::logs_bucket(bucket_name)
+    pub fn quick_config(
+        bucket_name: &str,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "2006/01/02/15".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
     }
 
     /// Create config with custom prefix patterns
-    pub fn with_patterns(bucket_name: &str, patterns: Vec<String>) -> log_consolidator_checker_rust::config::types::BucketConfig {
-        super::setup::StandardBucketConfigs::multi_pattern_bucket(bucket_name, patterns)
+    pub fn with_patterns(
+        bucket_name: &str,
+        patterns: Vec<String>,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "2006/01/02/15".to_string(),
+                },
+            ],
+            only_prefix_patterns: Some(patterns),
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create complete environment configuration with all 6 bucket types
+    pub fn create_full_environment_config(
+    ) -> log_consolidator_checker_rust::config::types::ConfigSchema {
+        use log_consolidator_checker_rust::config::types::ConfigSchema;
+        use std::collections::HashMap;
+
+        ConfigSchema {
+            bucketsToConsolidate: vec![
+                Self::input_bucket_config("input-bucket-1"),
+                Self::input_bucket_config("input-bucket-2"),
+            ],
+            bucketsConsolidated: vec![
+                Self::consolidated_bucket_config("consolidated-bucket-1"),
+                Self::consolidated_bucket_config("consolidated-bucket-2"),
+            ],
+            bucketsCheckerResults: vec![
+                Self::results_bucket_config("results-bucket-1"),
+                Self::results_bucket_config("results-bucket-2"),
+            ],
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create input bucket configuration with filtering patterns
+    pub fn input_bucket_config(
+        bucket_name: &str,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "raw-logs".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "dt=placeholder/hour=99".to_string(),
+                },
+            ],
+            only_prefix_patterns: Some(vec![
+                "^app-.*".to_string(),
+                "^web-.*".to_string(),
+                "^api-.*".to_string(),
+            ]),
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create consolidated bucket configuration
+    pub fn consolidated_bucket_config(
+        bucket_name: &str,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "processed".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "2006/01/02/15".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create results bucket configuration
+    pub fn results_bucket_config(
+        bucket_name: &str,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![PathSchema::Static {
+                static_path: "results".to_string(),
+            }],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create bucket group configurations
+    pub fn create_bucket_group(
+        group_type: &str,
+        count: usize,
+    ) -> Vec<log_consolidator_checker_rust::config::types::BucketConfig> {
+        (0..count)
+            .map(|i| {
+                let bucket_name = format!("{}-bucket-{}", group_type, i + 1);
+                match group_type {
+                    "input" => Self::input_bucket_config(&bucket_name),
+                    "consolidated" => Self::consolidated_bucket_config(&bucket_name),
+                    "results" => Self::results_bucket_config(&bucket_name),
+                    _ => Self::quick_config(&bucket_name),
+                }
+            })
+            .collect()
+    }
+
+    /// Create standard test configuration with customizable bucket counts
+    pub fn create_test_config(
+        input_count: usize,
+        consolidated_count: usize,
+        results_count: usize,
+    ) -> log_consolidator_checker_rust::config::types::ConfigSchema {
+        use log_consolidator_checker_rust::config::types::ConfigSchema;
+        use std::collections::HashMap;
+
+        ConfigSchema {
+            bucketsToConsolidate: Self::create_bucket_group("input", input_count),
+            bucketsConsolidated: Self::create_bucket_group("consolidated", consolidated_count),
+            bucketsCheckerResults: Self::create_bucket_group("results", results_count),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Create configuration for archive bucket pattern (legacy support)
+    pub fn archive_bucket_config(
+        bucket_name: &str,
+    ) -> log_consolidator_checker_rust::config::types::BucketConfig {
+        use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
+        use std::collections::HashMap;
+
+        BucketConfig {
+            bucket: bucket_name.to_string(),
+            path: vec![
+                PathSchema::Static {
+                    static_path: "archived".to_string(),
+                },
+                PathSchema::DateFormat {
+                    datefmt: "2006/01/02/15".to_string(),
+                },
+            ],
+            only_prefix_patterns: None,
+            proceed_without_matching_objects: false,
+            extra: HashMap::new(),
+        }
     }
 }

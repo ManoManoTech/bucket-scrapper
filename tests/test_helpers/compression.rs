@@ -1,6 +1,5 @@
 /// Compression and decompression utilities for tests
 /// Provides helpers for zstd and gzip operations commonly used in tests
-
 use std::io::Write;
 
 /// Compress data using zstd
@@ -57,13 +56,17 @@ impl JsonCompression {
     }
 
     /// Decompress zstd data and return as JSON string
-    pub fn decompress_json_zstd(compressed_data: &[u8]) -> Result<String, std::string::FromUtf8Error> {
+    pub fn decompress_json_zstd(
+        compressed_data: &[u8],
+    ) -> Result<String, std::string::FromUtf8Error> {
         let decompressed = decompress_zstd(compressed_data);
         String::from_utf8(decompressed)
     }
 
     /// Decompress gzip data and return as JSON string
-    pub fn decompress_json_gzip(compressed_data: &[u8]) -> Result<String, std::string::FromUtf8Error> {
+    pub fn decompress_json_gzip(
+        compressed_data: &[u8],
+    ) -> Result<String, std::string::FromUtf8Error> {
         let decompressed = decompress_gzip(compressed_data);
         String::from_utf8(decompressed)
     }
@@ -75,7 +78,9 @@ impl JsonCompression {
     }
 
     /// Decompress zstd data and split into JSON lines
-    pub fn decompress_to_json_lines_zstd(compressed_data: &[u8]) -> Result<Vec<String>, std::string::FromUtf8Error> {
+    pub fn decompress_to_json_lines_zstd(
+        compressed_data: &[u8],
+    ) -> Result<Vec<String>, std::string::FromUtf8Error> {
         let decompressed_str = Self::decompress_json_zstd(compressed_data)?;
         Ok(decompressed_str.lines().map(|s| s.to_string()).collect())
     }
@@ -86,11 +91,9 @@ impl JsonCompression {
 pub struct CompressionTester;
 
 impl CompressionTester {
-
     pub fn test_json_zstd_roundtrip(json_str: &str) -> bool {
-        match JsonCompression::decompress_json_zstd(
-            &JsonCompression::compress_json_zstd(json_str)
-        ) {
+        match JsonCompression::decompress_json_zstd(&JsonCompression::compress_json_zstd(json_str))
+        {
             Ok(decompressed) => json_str == decompressed,
             Err(_) => false,
         }
