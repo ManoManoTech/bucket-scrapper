@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "date": "20231225",
+  "hour": "14",
+  "message": "Mock check completed successfully",
+  "analysis_start_date": "2025-06-30T10:38:02Z",
+  "analysis_end_date": "2025-06-30T10:38:02Z",
+  "buckets_checked": ["bucket-A", "bucket-B", "bucket-C"],
+  "files_processed": 7,
+  "character_count_match": true
+}

@@ -1,0 +1,1 @@
+{"service": "app", "env": "staging", "a": 6, "b": "info", "c": true, "e": "value3"}
