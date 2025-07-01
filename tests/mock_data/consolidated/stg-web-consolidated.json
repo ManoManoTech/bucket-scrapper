@@ -1,3 +1,0 @@
-{"timestamp":"2023-12-25T14:00:45Z","level":"info","message":"Staging web server started","service":"web","env":"stg","port":8080}
-{"timestamp":"2023-12-25T14:01:45Z","level":"debug","message":"SSL certificate loaded","service":"web","env":"stg","cert_expiry":"2024-12-25"}
-{"timestamp":"2023-12-25T14:02:45Z","level":"info","message":"Health check passed","service":"web","env":"stg","checks":["db","cache","api"]}

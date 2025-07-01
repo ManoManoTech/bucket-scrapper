@@ -12,7 +12,8 @@ use test_helpers::{TestConstants, TestEnvironment};
 
 #[tokio::test]
 async fn test_archiving_logs() -> Result<()> {
-    let test = TestEnvironment::create().await?;
+    let test_dataset = "simple-001".to_string();
+    let test = TestEnvironment::create(test_dataset).await?;
     let s3_client = Client::new(&test.client);
 
     // Test that buckets have been created and contain mounted data
@@ -45,14 +46,16 @@ async fn test_archiving_logs() -> Result<()> {
 
 #[tokio::test]
 async fn test_check_consolidation() -> Result<()> {
-    let test_env = TestEnvironment::create().await?;
+    let test_dataset = "simple-001".to_string();
+    let test_env = TestEnvironment::create(test_dataset).await?;
 
     // Load config
     let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
 
     // Create wrapped S3 client using the test environment's client
     let s3_client = Client::new(&test_env.client);
-    let wrapped_s3_client = WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client)).await?;
+    let wrapped_s3_client =
+        WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client)).await?;
 
     // Create checker
     let checker = Checker::new(wrapped_s3_client, 4, Some(2), 128); // Small settings for test
@@ -274,7 +277,7 @@ async fn test_check_consolidation() -> Result<()> {
 
         // Assert uploaded JSON structure
         assert!(
-            uploaded_json["ok"].is_boolean(),
+            uploaded_json["ok"].as_bool().unwrap(),
             "Uploaded result should have 'ok' boolean field"
         );
         assert!(

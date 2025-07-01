@@ -1,4 +1,0 @@
-{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Integration test started","service":"app","env":"int","test_suite":"api_tests"}
-{"timestamp":"2023-12-25T14:01:00Z","level":"debug","message":"Database connection established","service":"app","env":"int","db_host":"test-db"}
-{"timestamp":"2023-12-25T14:02:00Z","level":"info","message":"Test case completed","service":"app","env":"int","test_name":"user_creation","result":"pass"}
-{"timestamp":"2023-12-25T14:03:00Z","level":"error","message":"Test case failed","service":"app","env":"int","test_name":"payment_flow","error":"invalid_token"}

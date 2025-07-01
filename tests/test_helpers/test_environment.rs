@@ -32,10 +32,11 @@ pub struct TestEnvironment {
     pub result_buckets: Vec<String>,
     pub client: SdkConfig,
     pub container: testcontainers::ContainerAsync<MinIO>,
+    pub test_dataset: String,
 }
 
 impl TestEnvironment {
-    pub async fn create() -> Result<Self> {
+    pub async fn create(test_dataset: String) -> Result<Self> {
         let credentials = Credentials::new("minioadmin", "minioadmin", None, None, "test");
 
         let container = MinIO::default().start().await?;
@@ -117,7 +118,7 @@ impl TestEnvironment {
         println!("Populating buckets with mock data...");
 
         // Upload mock data to the buckets using Rust generator
-        let mock_generator = MockDataGenerator::new();
+        let mock_generator = MockDataGenerator::new(test_dataset.clone());
         mock_generator.populate_all_buckets(&s3_client).await?;
 
         println!("Test environment ready!");
@@ -128,6 +129,7 @@ impl TestEnvironment {
             result_buckets,
             client,
             container,
+            test_dataset,
         })
     }
 }

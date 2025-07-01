@@ -1,4 +1,0 @@
-{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Processing user request","service":"app","env":"support","request_id":"req_001"}
-{"timestamp":"2023-12-25T14:01:00Z","level":"warn","message":"Slow database query detected","service":"app","env":"support","query_time":"2.5s"}
-{"timestamp":"2023-12-25T14:02:00Z","level":"error","message":"Failed to connect to external API","service":"app","env":"support","error":"connection timeout"}
-{"timestamp":"2023-12-25T14:03:00Z","level":"info","message":"User session created","service":"app","env":"support","user_id":"user_123"}
