@@ -1,0 +1,3 @@
+{"timestamp":"2023-12-25T14:00:15Z","level":"info","message":"Datadog integration test","service":"web","env":"int","endpoint":"/health"}
+{"timestamp":"2023-12-25T14:01:15Z","level":"warn","message":"High memory usage detected","service":"web","env":"int","memory_percent":85}
+{"timestamp":"2023-12-25T14:02:15Z","level":"info","message":"Load balancer check","service":"web","env":"int","status":"healthy"}

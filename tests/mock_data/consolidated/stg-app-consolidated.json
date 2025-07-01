@@ -1,0 +1,4 @@
+{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Staging deployment completed","service":"app","env":"stg","version":"v1.2.3"}
+{"timestamp":"2023-12-25T14:01:00Z","level":"info","message":"Cache warming started","service":"app","env":"stg","cache_type":"redis"}
+{"timestamp":"2023-12-25T14:02:00Z","level":"warn","message":"Staging data cleanup needed","service":"app","env":"stg","tables_count":1500}
+{"timestamp":"2023-12-25T14:03:00Z","level":"info","message":"Performance test initiated","service":"app","env":"stg","test_type":"load_test"}

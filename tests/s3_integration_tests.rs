@@ -48,22 +48,11 @@ async fn test_check_consolidation() -> Result<()> {
     let test_env = TestEnvironment::create().await?;
 
     // Load config
-    let config = load_config("tests/mocks/config.yaml")?;
+    let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
 
-    // Create S3 client pointing to our test MinIO instance
-    let port = test_env.container
-        .get_host_port_ipv4(TestConstants::MINIO_PORT)
-        .await?;
-    let endpoint = format!("http://127.0.0.1:{}", port);
-
-    // Configure AWS SDK to use test environment
-    std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-    std::env::set_var("AWS_DEFAULT_REGION", TestConstants::DEFAULT_REGION);
-    std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
-
-    // Create wrapped S3 client for checker
-    let wrapped_s3_client = WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15).await?;
+    // Create wrapped S3 client using the test environment's client
+    let s3_client = Client::new(&test_env.client);
+    let wrapped_s3_client = WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client)).await?;
 
     // Create checker
     let checker = Checker::new(wrapped_s3_client, 4, Some(2), 128); // Small settings for test
@@ -82,18 +71,27 @@ async fn test_check_consolidation() -> Result<()> {
     println!("Running consolidation check for {}/{}", date, hour);
 
     // Debug: List what's in each bucket before running the check
-    println!("=== DEBUG: Listing bucket contents before check ===");
+    println!("Listing bucket contents before check:");
     for bucket_config in &archived_buckets {
         println!("Archived bucket: {}", bucket_config.bucket);
         println!("  Path config: {:?}", bucket_config.path);
 
         // Generate expected key prefix
-        let formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(bucket_config);
+        let formatter =
+            log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
+                bucket_config,
+            );
         let expected_key_prefix = formatter(&date, &hour)?;
         println!("  Expected key prefix: {}", expected_key_prefix);
 
-        let file_list = checker.list_bucket_files(bucket_config, &date, &hour).await?;
-        println!("  Found {} files in bucket {}", file_list.files.len(), bucket_config.bucket);
+        let file_list = checker
+            .list_bucket_files(bucket_config, &date, &hour)
+            .await?;
+        println!(
+            "  Found {} files in bucket {}",
+            file_list.files.len(),
+            bucket_config.bucket
+        );
         for file in &file_list.files {
             println!("    - {} (size: {} bytes)", file.key, file.size);
         }
@@ -101,48 +99,80 @@ async fn test_check_consolidation() -> Result<()> {
 
     println!("Consolidated bucket: {}", consolidated_bucket.bucket);
     println!("  Path config: {:?}", consolidated_bucket.path);
-    let formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(consolidated_bucket);
+    let formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
+        consolidated_bucket,
+    );
     let expected_key_prefix = formatter(&date, &hour)?;
     println!("  Expected key prefix: {}", expected_key_prefix);
 
-    let consolidated_file_list = checker.list_bucket_files(consolidated_bucket, &date, &hour).await?;
-    println!("  Found {} files in consolidated bucket {}", consolidated_file_list.files.len(), consolidated_bucket.bucket);
+    let consolidated_file_list = checker
+        .list_bucket_files(consolidated_bucket, &date, &hour)
+        .await?;
+    println!(
+        "  Found {} files in consolidated bucket {}",
+        consolidated_file_list.files.len(),
+        consolidated_bucket.bucket
+    );
     for file in &consolidated_file_list.files {
         println!("    - {} (size: {} bytes)", file.key, file.size);
     }
-    println!("=== END DEBUG ===");
 
     // Assertions: Verify that files were found in all buckets
     let mut bucket_file_results = Vec::new();
     for (i, bucket_config) in archived_buckets.iter().enumerate() {
-        let files = checker.list_bucket_files(bucket_config, &date, &hour).await?;
+        let files = checker
+            .list_bucket_files(bucket_config, &date, &hour)
+            .await?;
         bucket_file_results.push((i, bucket_config, files));
     }
-    let consolidated_files = checker.list_bucket_files(consolidated_bucket, &date, &hour).await?;
+    let consolidated_files = checker
+        .list_bucket_files(consolidated_bucket, &date, &hour)
+        .await?;
 
     // Assert that input buckets contain files and have correct prefixes
     for (i, bucket_config, files) in &bucket_file_results {
-        assert!(files.files.len() > 0, "Input bucket {} ({}) should contain files", i, bucket_config.bucket);
-        
+        assert!(
+            files.files.len() > 0,
+            "Input bucket {} ({}) should contain files",
+            i,
+            bucket_config.bucket
+        );
+
         // Generate expected prefix dynamically from config
-        let formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(bucket_config);
+        let formatter =
+            log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
+                bucket_config,
+            );
         let expected_prefix = formatter(&date, &hour)?;
-        
+
         for file in &files.files {
-            assert!(file.key.starts_with(&expected_prefix), 
-                "File in bucket {} should have prefix '{}', but found: {}", 
-                bucket_config.bucket, expected_prefix, file.key);
+            assert!(
+                file.key.starts_with(&expected_prefix),
+                "File in bucket {} should have prefix '{}', but found: {}",
+                bucket_config.bucket,
+                expected_prefix,
+                file.key
+            );
         }
     }
 
     // Assert consolidated bucket files have correct prefix
-    let consolidated_formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(consolidated_bucket);
+    let consolidated_formatter =
+        log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
+            consolidated_bucket,
+        );
     let expected_consolidated_prefix = consolidated_formatter(&date, &hour)?;
-    assert!(consolidated_files.files.len() > 0, "Consolidated bucket should contain files");
+    assert!(
+        consolidated_files.files.len() > 0,
+        "Consolidated bucket should contain files"
+    );
     for file in &consolidated_files.files {
-        assert!(file.key.starts_with(&expected_consolidated_prefix), 
-            "Consolidated file should have prefix '{}', but found: {}", 
-            expected_consolidated_prefix, file.key);
+        assert!(
+            file.key.starts_with(&expected_consolidated_prefix),
+            "Consolidated file should have prefix '{}', but found: {}",
+            expected_consolidated_prefix,
+            file.key
+        );
     }
 
     let result = checker
@@ -172,8 +202,10 @@ async fn test_check_consolidation() -> Result<()> {
         });
 
         // Generate S3 key for result
-        let result_key = format!("check-results/dt={}/h={}/check-result-{}-{}.json",
-            date, hour, date, hour);
+        let result_key = format!(
+            "check-results/dt={}/h={}/check-result-{}-{}.json",
+            date, hour, date, hour
+        );
 
         // Upload to S3
         s3_client
@@ -185,8 +217,10 @@ async fn test_check_consolidation() -> Result<()> {
             .send()
             .await?;
 
-        println!("Uploaded check result to bucket {} with key {}",
-            results_bucket_config.bucket, result_key);
+        println!(
+            "Uploaded check result to bucket {} with key {}",
+            results_bucket_config.bucket, result_key
+        );
 
         // Verify the result was uploaded
         let objects = s3_client
@@ -197,8 +231,11 @@ async fn test_check_consolidation() -> Result<()> {
             .await?;
 
         let contents = objects.contents();
-        println!("Results bucket {} now contains {} objects:",
-            results_bucket_config.bucket, contents.len());
+        println!(
+            "Results bucket {} now contains {} objects:",
+            results_bucket_config.bucket,
+            contents.len()
+        );
         for obj in contents {
             if let Some(key) = obj.key() {
                 println!("  - {}", key);
@@ -206,11 +243,18 @@ async fn test_check_consolidation() -> Result<()> {
         }
 
         // Assert that the result was properly uploaded
-        assert!(contents.len() >= 1, "Results bucket should contain at least 1 object");
-        let uploaded_result = contents.iter().find(|obj| {
-            obj.key().map_or(false, |key| key.contains(&result_key))
-        });
-        assert!(uploaded_result.is_some(), "Uploaded result should be found in results bucket with key: {}", result_key);
+        assert!(
+            contents.len() >= 1,
+            "Results bucket should contain at least 1 object"
+        );
+        let uploaded_result = contents
+            .iter()
+            .find(|obj| obj.key().map_or(false, |key| key.contains(&result_key)));
+        assert!(
+            uploaded_result.is_some(),
+            "Uploaded result should be found in results bucket with key: {}",
+            result_key
+        );
 
         // Verify the uploaded result content
         let get_result = s3_client
@@ -223,13 +267,38 @@ async fn test_check_consolidation() -> Result<()> {
         let body = get_result.body.collect().await?;
         let uploaded_json: serde_json::Value = serde_json::from_slice(&body.into_bytes())?;
 
+        // Display the complete result file content
+        println!("\nResult file content:");
+        println!("File: s3://{}/{}", results_bucket_config.bucket, result_key);
+        println!("{}", serde_json::to_string_pretty(&uploaded_json)?);
+
         // Assert uploaded JSON structure
-        assert!(uploaded_json["ok"].is_boolean(), "Uploaded result should have 'ok' boolean field");
-        assert!(uploaded_json["date"].is_string(), "Uploaded result should have 'date' string field");
-        assert!(uploaded_json["hour"].is_string(), "Uploaded result should have 'hour' string field");
-        assert!(uploaded_json["message"].is_string(), "Uploaded result should have 'message' string field");
-        assert_eq!(uploaded_json["date"].as_str().unwrap(), date, "Uploaded date should match test date");
-        assert_eq!(uploaded_json["hour"].as_str().unwrap(), hour, "Uploaded hour should match test hour");
+        assert!(
+            uploaded_json["ok"].is_boolean(),
+            "Uploaded result should have 'ok' boolean field"
+        );
+        assert!(
+            uploaded_json["date"].is_string(),
+            "Uploaded result should have 'date' string field"
+        );
+        assert!(
+            uploaded_json["hour"].is_string(),
+            "Uploaded result should have 'hour' string field"
+        );
+        assert!(
+            uploaded_json["message"].is_string(),
+            "Uploaded result should have 'message' string field"
+        );
+        assert_eq!(
+            uploaded_json["date"].as_str().unwrap(),
+            date,
+            "Uploaded date should match test date"
+        );
+        assert_eq!(
+            uploaded_json["hour"].as_str().unwrap(),
+            hour,
+            "Uploaded hour should match test hour"
+        );
 
         println!("✓ All assertions passed - test completed successfully!");
     } else {

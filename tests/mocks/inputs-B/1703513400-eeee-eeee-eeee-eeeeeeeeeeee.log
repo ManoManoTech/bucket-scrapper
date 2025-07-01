@@ -1,1 +1,0 @@
-{"service": "queue", "env": "development", "a": 5, "b": "message", "c": true, "e": "value2"}

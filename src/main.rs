@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     let config = load_config(&cli.config)?;
 
     // Initialize S3 client
-    let s3_client = WrappedS3Client::new(&cli.region, cli.client_max_age).await?;
+    let s3_client = WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?;
 
     match &cli.command {
         Commands::List { start, end } => {

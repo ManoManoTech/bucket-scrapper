@@ -10,12 +10,22 @@ use regex::Regex;
 fn extract_single_format_date_and_prefix(
     prefix: String,
 ) -> Box<dyn Fn(&DateString, &HourString) -> Result<String> + Send + Sync> {
-    if prefix.contains("dt=") && prefix.contains("/hour=") {
-        let regex = Regex::new(r"dt=.*\/hour=\d\d").unwrap();
+    if prefix.contains("dt=") && (prefix.contains("/hour=") || prefix.contains("/h=")) {
+        let use_hour_format = prefix.contains("/hour=");
+        let regex = if use_hour_format {
+            Regex::new(r"dt=.*\/hour=\d\d").unwrap()
+        } else {
+            Regex::new(r"dt=.*\/h=\d\d").unwrap()
+        };
         let key_prefix = regex.replace_all(&prefix, "").to_string();
 
         return Box::new(move |date: &DateString, hour: &HourString| {
-            Ok(format!("{}{}", key_prefix, common_date_format(date, hour)))
+            if use_hour_format {
+                Ok(format!("{}{}", key_prefix, common_date_format(date, hour)))
+            } else {
+                // Use h= format instead of hour=
+                Ok(format!("{}dt={}/h={}", key_prefix, date, hour))
+            }
         });
     } else if prefix.contains("2006/01/02/15") {
         let regex = Regex::new(r"2006\/01\/02\/15").unwrap();

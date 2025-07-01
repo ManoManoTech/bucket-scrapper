@@ -13,17 +13,20 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 pub struct WrappedS3Client {
-    _client: RwLock<(std::time::Instant, Client)>,
+    pub client: RwLock<(std::time::Instant, Client)>,
     max_age: Duration,
     region: String,
 }
 
 impl WrappedS3Client {
-    pub async fn new(region: &str, max_age_minutes: u64) -> Result<Self> {
-        let client = Self::create_client(region).await?;
+    pub async fn new(region: &str, max_age_minutes: u64, client: Option<Client>) -> Result<Self> {
+        let client = match client {
+            Some(existing_client) => existing_client,
+            None => Self::create_client(region).await?,
+        };
 
         Ok(Self {
-            _client: RwLock::new((std::time::Instant::now(), client)),
+            client: RwLock::new((std::time::Instant::now(), client)),
             max_age: Duration::from_secs(max_age_minutes * 60),
             region: region.to_string(),
         })
@@ -46,7 +49,7 @@ impl WrappedS3Client {
 
         // Check if we have fresh client using read lock
         {
-            let guard = self._client.read().await;
+            let guard = self.client.read().await;
             let (last_refresh, client) = &*guard;
 
             // Return early if client is still fresh
@@ -55,7 +58,7 @@ impl WrappedS3Client {
             }
         }
 
-        let mut guard = self._client.write().await;
+        let mut guard = self.client.write().await;
         if now.duration_since(guard.0) > self.max_age {
             info!("Refreshing S3 client");
             *guard = (now, Self::create_client(&self.region).await?);
