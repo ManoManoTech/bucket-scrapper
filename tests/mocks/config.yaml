@@ -1,32 +1,28 @@
 bucketsToConsolidate: # The source buckets
-  # TODO: implement mock with this timestamp format
-  # - bucket: inputs-a
-  #   path:
-  #     - datefmt: 'nginx/dt=20060102/hour=15'
-  - bucket: 'support-infra-raw-logs-archives'
+  - bucket: 'inputs-a'
     path:
-    force_env: support
-  # Fix 2: Consolidate raw-log-archives from int stg prd
-  - bucket: 'int-infra-raw-logs-archives'
-    path:
+      - static_path: 'logs'
       - datefmt: '2006/01/02/15'
+    force_env: support
+  - bucket: 'input-b'
+    path:
+      - static_path: 'datadog'
+      - datefmt: 'dt=20060102/h=15'
     force_env: int
     proceed_without_matching_objects: true
-  - bucket: 'stg-infra-raw-logs-archives'
+  - bucket: 'input-c'
     path:
+      - static_path: 'logs'
       - datefmt: '2006/01/02/15'
     force_env: stg
-  - bucket: 'prd-infra-raw-logs-archives'
-    path:
-      - datefmt: '2006/01/02/15'
-    force_env: prd
 bucketsConsolidated: # Where the consolidated output goes. Only one element is really supported as of now.
-  - bucket: support-infra-log-consolidator-archives
+  - bucket: output-a
   # - bucket: support-infra-logs-consolidated-archives # test bucket
     path:
-      - datefmt: "log-archives/dt=20060102/hour=15"
+      - static_path: log-archives
+      - datefmt: 'dt=20060102/h=15'
 bucketsCheckerResults:  # Where to find checker results
-  - bucket: 'support-infra-log-consolidator-checker-data'
+  - bucket: 'output-b'
     path:
       - datefmt: 'results-continuous/dt=20060102/hour=15'
 continuousConsolidation:  # Parameters for continuous consolidation, where the consolidator determines a single target date on its own
