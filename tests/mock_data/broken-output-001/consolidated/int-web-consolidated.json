@@ -1,0 +1,2 @@
+{"timestamp":"2023-12-25T14:00:15Z","level":"info","message":"Datadog integration test","service":"web","env":"int","endpoint":"/health"}
+{"timestamp":"2023-12-25T14:00:20Z","level":"info","message":"EXTRA DATA: Additional web log that creates inconsistency","service":"web","env":"int","endpoint":"/metrics"}
