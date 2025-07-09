@@ -1,31 +1,33 @@
 bucketsToConsolidate: # The source buckets
   - bucket: 'inputs-a'
     path:
-      - static_path: 'logs'
+      # - static_path: 'logs'
       - datefmt: '2006/01/02/15'
+    # only_prefix_patterns:
+    #   - .*
     force_env: support
-  - bucket: 'input-b'
-    path:
-      - static_path: 'datadog'
-      - datefmt: 'dt=20060102/h=15'
-    force_env: int
-    proceed_without_matching_objects: true
-  - bucket: 'input-c'
-    path:
-      - static_path: 'logs'
-      - datefmt: '2006/01/02/15'
-    force_env: stg
-bucketsConsolidated: # Where the consolidated output goes. Only one element is really supported as of now.
+  # - bucket: 'input-b'
+  #   path:
+  #     - static_path: 'datadog'
+  #     - datefmt: 'dt=20060102/h=15'
+  #   force_env: int
+  #   proceed_without_matching_objects: true
+  # - bucket: 'input-c'
+  #   path:
+  #     - static_path: 'logs'
+  #     - datefmt: '2006/01/02/15'
+  #   force_env: stg
+bucketsConsolidated:
   - bucket: output-a
-  # - bucket: support-infra-logs-consolidated-archives # test bucket
     path:
-      - static_path: log-archives
+      # - static_path: log-archives
+      # - static: log-archives
       - datefmt: 'dt=20060102/h=15'
-bucketsCheckerResults:  # Where to find checker results
+bucketsCheckerResults:
   - bucket: 'output-b'
     path:
       - datefmt: 'results-continuous/dt=20060102/hour=15'
-continuousConsolidation:  # Parameters for continuous consolidation, where the consolidator determines a single target date on its own
+continuousConsolidation:
   maxAge: 528h # 30 days
   minAge: 70m
   step: 1h

@@ -39,7 +39,10 @@ impl MockDataGenerator {
 
         // Discover available environments from actual files
         let available_envs = self.discover_available_environments().await?;
-        println!("Available environments in dataset {}: {:?}", self.test_dataset, available_envs);
+        println!(
+            "Available environments in dataset {}: {:?}",
+            self.test_dataset, available_envs
+        );
 
         // Generate input buckets data
         let archived_buckets = get_archived_buckets(&config);
@@ -51,7 +54,7 @@ impl MockDataGenerator {
                 .get("force_env")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            
+
             println!(
                 "Processing input bucket {}/{}: {} (env: {})",
                 i + 1,
@@ -59,12 +62,15 @@ impl MockDataGenerator {
                 bucket_config.bucket,
                 bucket_env
             );
-            
+
             // Only populate if we have data for this environment
             if available_envs.contains(bucket_env) {
                 self.populate_input_bucket(s3_client, bucket_config).await?;
             } else {
-                println!("  -> Skipping bucket {} - no data available for environment '{}'", bucket_config.bucket, bucket_env);
+                println!(
+                    "  -> Skipping bucket {} - no data available for environment '{}'",
+                    bucket_config.bucket, bucket_env
+                );
             }
         }
 
@@ -88,10 +94,10 @@ impl MockDataGenerator {
     /// Discover available environments from input files
     async fn discover_available_environments(&self) -> Result<std::collections::HashSet<String>> {
         use std::collections::HashSet;
-        
+
         let input_dir = format!("tests/mock_data/{}/inputs", self.test_dataset);
         let mut envs = HashSet::new();
-        
+
         if let Ok(mut entries) = fs::read_dir(&input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 if let Some(file_name) = entry.file_name().to_str() {
@@ -104,7 +110,7 @@ impl MockDataGenerator {
                 }
             }
         }
-        
+
         Ok(envs)
     }
 
@@ -129,7 +135,7 @@ impl MockDataGenerator {
     }
 
     /// Populate input bucket with compressed .gz files
-    async fn populate_input_bucket(
+    pub async fn populate_input_bucket(
         &self,
         s3_client: &Client,
         bucket_config: &BucketConfig,
@@ -147,7 +153,7 @@ impl MockDataGenerator {
 
         // Discover all input files for this bucket's environment
         let combinations = self.discover_input_files().await?;
-        
+
         let mut files_processed = 0;
         for (service, env) in combinations {
             // Only process files matching this bucket's environment
@@ -189,23 +195,20 @@ impl MockDataGenerator {
                         .await?;
 
                     println!(
-                        "  -> {}: {} lines, {} bytes -> {} bytes gzipped ({}%) -> s3://{}/{}",
-                        file_name,
-                        line_count,
-                        original_size,
-                        compressed_size,
-                        compression_ratio,
-                        bucket_config.bucket,
-                        s3_key
+                        "  -> {}: {} lines, {} bytes -> {} bytes gzipped ({}%)",
+                        file_name, line_count, original_size, compressed_size, compression_ratio,
                     );
-                    
+
                     files_processed += 1;
                 }
             }
         }
 
         if files_processed == 0 {
-            println!("  -> No input files found for environment '{}' in bucket {}", bucket_env, bucket_config.bucket);
+            println!(
+                "  -> No input files found for environment '{}' in bucket {}",
+                bucket_env, bucket_config.bucket
+            );
         }
 
         Ok(())
@@ -232,7 +235,7 @@ impl MockDataGenerator {
     }
 
     /// Populate consolidated bucket with compressed .zst files
-    async fn populate_consolidated_bucket(
+    pub async fn populate_consolidated_bucket(
         &self,
         s3_client: &Client,
         bucket_config: &BucketConfig,
@@ -246,8 +249,10 @@ impl MockDataGenerator {
 
         for (env, service) in combinations {
             let consolidated_file_name = format!("{}-{}-consolidated.json", env, service);
-            let input_file_path =
-                format!("tests/mock_data/{}/consolidated/{}", self.test_dataset, consolidated_file_name);
+            let input_file_path = format!(
+                "tests/mock_data/{}/consolidated/{}",
+                self.test_dataset, consolidated_file_name
+            );
 
             // Read the consolidated JSON file from filesystem
             if Path::new(&input_file_path).exists() {

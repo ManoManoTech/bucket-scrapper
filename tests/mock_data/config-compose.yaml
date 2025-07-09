@@ -1,0 +1,23 @@
+bucketsToConsolidate: # The source buckets
+  # NOTE: works with docker-compose
+  - bucket: 'inputs-a'
+    path:
+      - datefmt: 'test-log-archives/dt=20060102/hour=15'
+    only_prefix_patterns:
+      - 'noenv.*'
+      - ".*-\\.json\\.zst"
+      - ".*-noservice\\.json\\.zst"
+    proceed_without_matching_objects: true
+bucketsConsolidated:
+  - bucket: output-a
+    path:
+      - static_path: log-archives
+      - datefmt: 'dt=20060102/h=15'
+bucketsCheckerResults:
+  - bucket: 'output-b'
+    path:
+      - datefmt: 'results-continuous/dt=20060102/hour=15'
+continuousConsolidation:
+  maxAge: 528h # 30 days
+  minAge: 70m
+  step: 1h

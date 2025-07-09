@@ -17,16 +17,23 @@ pub struct ConsolidationResult {
     pub message: String,
     pub date: String,
     pub hour: String,
-    pub analysis_start_date: String,
-    pub analysis_end_date: String,
     pub uploaded_result_key: String,
 }
 
 pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationResult> {
+    check_consolidation_with_config(test_dataset, TestConstants::MOCK_CONFIG_PATH).await
+}
+
+pub async fn check_consolidation_with_config(
+    test_dataset: String,
+    config_path: &str,
+) -> Result<ConsolidationResult> {
     let test_env = TestEnvironment::create(test_dataset.clone()).await?;
 
     // Load config
-    let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
+    let config = load_config(config_path)?;
+    // TODO: externalize this
+    // test_env.populate_all_buckets();
 
     // Create wrapped S3 client using the test environment's client
     let s3_client = Client::new(&test_env.client);
@@ -47,12 +54,18 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
     let date = "20231225".to_string();
     let hour = "14".to_string();
 
-    println!("[{}] Running consolidation check for {}/{}", test_dataset, date, hour);
+    println!(
+        "[{}] Running consolidation check for {}/{}",
+        test_dataset, date, hour
+    );
 
     // Debug: List what's in each bucket before running the check
     println!("[{}] Listing bucket contents before check:", test_dataset);
     for bucket_config in &archived_buckets {
-        println!("[{}] Archived bucket: {}", test_dataset, bucket_config.bucket);
+        println!(
+            "[{}] Archived bucket: {}",
+            test_dataset, bucket_config.bucket
+        );
         println!("[{}]   Path config: {:?}", test_dataset, bucket_config.path);
 
         // Generate expected key prefix
@@ -61,7 +74,10 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
                 bucket_config,
             );
         let expected_key_prefix = formatter(&date, &hour)?;
-        println!("[{}]   Expected key prefix: {}", test_dataset, expected_key_prefix);
+        println!(
+            "[{}]   Expected key prefix: {}",
+            test_dataset, expected_key_prefix
+        );
 
         let file_list = checker
             .list_bucket_files(bucket_config, &date, &hour)
@@ -73,12 +89,21 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
             bucket_config.bucket
         );
         for file in &file_list.files {
-            println!("[{}]     - {} (size: {} bytes)", test_dataset, file.key, file.size);
+            println!(
+                "[{}]     - {} (size: {} bytes)",
+                test_dataset, file.key, file.size
+            );
         }
     }
 
-    println!("[{}] Consolidated bucket: {}", test_dataset, consolidated_bucket.bucket);
-    println!("[{}]   Path config: {:?}", test_dataset, consolidated_bucket.path);
+    println!(
+        "[{}] Consolidated bucket: {}",
+        test_dataset, consolidated_bucket.bucket
+    );
+    println!(
+        "[{}]   Path config: {:?}",
+        test_dataset, consolidated_bucket.path
+    );
     let formatter = log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
         consolidated_bucket,
     );
@@ -111,11 +136,17 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
         .await?;
 
     // Check that at least some input buckets contain files and have correct prefixes
-    let total_input_files: usize = bucket_file_results.iter().map(|(_, _, files)| files.files.len()).sum();
+    let total_input_files: usize = bucket_file_results
+        .iter()
+        .map(|(_, _, files)| files.files.len())
+        .sum();
 
     for (i, bucket_config, files) in &bucket_file_results {
         if files.files.len() == 0 {
-            println!("[{}] WARNING: Input bucket {} ({}) contains no files", test_dataset, i, bucket_config.bucket);
+            println!(
+                "[{}] WARNING: Input bucket {} ({}) contains no files",
+                test_dataset, i, bucket_config.bucket
+            );
         }
     }
 
@@ -127,8 +158,6 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
             message: "All input buckets are empty".to_string(),
             date: date.clone(),
             hour: hour.clone(),
-            analysis_start_date: "".to_string(),
-            analysis_end_date: "".to_string(),
             uploaded_result_key: "".to_string(),
         });
     }
@@ -162,14 +191,15 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
         );
     let expected_consolidated_prefix = consolidated_formatter(&date, &hour)?;
     if consolidated_files.files.len() == 0 {
-        println!("[{}] WARNING: Consolidated bucket contains no files", test_dataset);
+        println!(
+            "[{}] WARNING: Consolidated bucket contains no files",
+            test_dataset
+        );
         return Ok(ConsolidationResult {
             ok: false,
             message: "Consolidated bucket contains no files".to_string(),
             date: date.clone(),
             hour: hour.clone(),
-            analysis_start_date: "".to_string(),
-            analysis_end_date: "".to_string(),
             uploaded_result_key: "".to_string(),
         });
     }
@@ -189,14 +219,21 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
         .map(|(_, bucket_config, _)| **bucket_config)
         .collect();
 
-    println!("[{}] Passing {} non-empty buckets to checker (filtered from {} total)",
-             test_dataset, non_empty_buckets.len(), archived_buckets.len());
+    println!(
+        "[{}] Passing {} non-empty buckets to checker (filtered from {} total)",
+        test_dataset,
+        non_empty_buckets.len(),
+        archived_buckets.len()
+    );
 
     let result = checker
         .get_comparison_results(&non_empty_buckets, consolidated_bucket, &date, &hour)
         .await?;
 
-    println!("[{}] Check result: ok={}, message={}", test_dataset, result.ok, result.message);
+    println!(
+        "[{}] Check result: ok={}, message={}",
+        test_dataset, result.ok, result.message
+    );
 
     // Assert that the comparison completed (result should be either true or false, not error)
     assert!(result.message.len() > 0, "Result should have a message");
@@ -205,7 +242,10 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
 
     // Upload result to bucketsCheckerResults (output-b)
     let results_bucket = get_results_bucket(&config);
-    assert!(results_bucket.is_some(), "Result hour should match input hour");
+    assert!(
+        results_bucket.is_some(),
+        "Result hour should match input hour"
+    );
 
     if let Some(results_bucket_config) = results_bucket {
         // Create result JSON
@@ -236,8 +276,7 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
 
         println!(
             "[{}] Uploaded check result to bucket {} with key {}",
-            test_dataset,
-            results_bucket_config.bucket, result_key
+            test_dataset, results_bucket_config.bucket, result_key
         );
 
         // Verify the result was uploaded
@@ -288,8 +327,15 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
 
         // Display the complete result file content
         println!("[{}] Result file content:", test_dataset);
-        println!("[{}] File: s3://{}/{}", test_dataset, results_bucket_config.bucket, result_key);
-        println!("[{}] {}", test_dataset, serde_json::to_string_pretty(&uploaded_json)?);
+        println!(
+            "[{}] File: s3://{}/{}",
+            test_dataset, results_bucket_config.bucket, result_key
+        );
+        println!(
+            "[{}] {}",
+            test_dataset,
+            serde_json::to_string_pretty(&uploaded_json)?
+        );
 
         // Assert uploaded JSON structure
         assert!(
@@ -319,8 +365,10 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
             "Uploaded hour should match test hour"
         );
 
+        println!(
+            "[{}] ✓ All assertions passed - test completed successfully!", t
+           est_dataset);
 
-        println!("[{}] ✓ All assertions passed - test completed successfully!", test_dataset);
         println!("[{}] Metrics:", test_dataset);
         println!("[{}]   - Checked result: {}\n", test_dataset, uploaded_json);
 
@@ -329,8 +377,6 @@ pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationRe
             message: result.message.clone(),
             date: result.date.clone(),
             hour: result.hour.clone(),
-            analysis_start_date: result.analysis_start_date.clone(),
-            analysis_end_date: result.analysis_end_date.clone(),
             uploaded_result_key: result_key,
         })
     } else {

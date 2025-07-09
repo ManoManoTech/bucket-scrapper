@@ -10,6 +10,7 @@ use test_helpers::TestEnvironment;
 async fn test_archiving_logs() -> Result<()> {
     let test_dataset = "simple-001".to_string();
     let test = TestEnvironment::create(test_dataset).await?;
+    test.populate_all_buckets();
     let s3_client = Client::new(&test.client);
 
     // Test that buckets have been created and contain mounted data

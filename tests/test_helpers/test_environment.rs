@@ -4,7 +4,11 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use aws_types::SdkConfig;
-use testcontainers::runners::AsyncRunner;
+use testcontainers::{
+    core::{logs::LogFrame, Mount},
+    runners::AsyncRunner,
+    ImageExt,
+};
 use testcontainers_modules::minio::MinIO;
 
 use super::mock_data_generator::MockDataGenerator;
@@ -33,13 +37,24 @@ pub struct TestEnvironment {
     pub client: SdkConfig,
     pub container: testcontainers::ContainerAsync<MinIO>,
     pub test_dataset: String,
+    pub mock: MockDataGenerator,
 }
 
 impl TestEnvironment {
     pub async fn create(test_dataset: String) -> Result<Self> {
         let credentials = Credentials::new("minioadmin", "minioadmin", None, None, "test");
 
-        let container = MinIO::default().start().await?;
+        let container = MinIO::default()
+            .with_log_consumer(|frame: &LogFrame| {
+                let mut msg =
+                    std::str::from_utf8(frame.bytes()).expect("Failed to parse log message");
+                if msg.ends_with('\n') {
+                    msg = &msg[..msg.len() - 1];
+                }
+                println!("Minio log: {msg}");
+            })
+            .start()
+            .await?;
         let port = container
             .get_host_port_ipv4(TestConstants::MINIO_PORT)
             .await?;
@@ -52,15 +67,12 @@ impl TestEnvironment {
             .load()
             .await;
 
-        // Load configuration from mock config file
         let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
 
-        // Extract bucket names from config using native functions
         let archived_buckets = get_archived_buckets(&config);
         let consolidated_buckets = get_consolidated_buckets(&config);
         let results_bucket = get_results_bucket(&config);
 
-        // Generate bucket lists from config
         let inputs_buckets: Vec<String> = archived_buckets
             .iter()
             .map(|bucket| bucket.bucket.clone())
@@ -118,8 +130,7 @@ impl TestEnvironment {
         println!("Populating buckets with mock data...");
 
         // Upload mock data to the buckets using Rust generator
-        let mock_generator = MockDataGenerator::new(test_dataset.clone());
-        mock_generator.populate_all_buckets(&s3_client).await?;
+        let mock = MockDataGenerator::new(test_dataset.clone());
 
         println!("Test environment ready!");
 
@@ -130,6 +141,28 @@ impl TestEnvironment {
             client,
             container,
             test_dataset,
+            mock,
         })
+    }
+
+    pub async fn populate_all_buckets(&self) {
+        let s3_client = Client::new(&self.client);
+        self.mock
+            .populate_all_buckets(&s3_client)
+            .await
+            .expect("Failed to populate buckets");
+    }
+
+    pub async fn populate_inputs_buckets(&self) {
+        let s3_client = Client::new(&self.client);
+        let config = load_config("tests/mock_data/config.yaml").expect("Failed to load config");
+        let archived_buckets = get_archived_buckets(&config);
+
+        for bucket_config in archived_buckets {
+            self.mock
+                .populate_input_bucket(&s3_client, &bucket_config)
+                .await
+                .expect("Failed to populate input bucket");
+        }
     }
 }
