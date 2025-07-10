@@ -3,8 +3,9 @@ mod test_helpers;
 use anyhow::Result;
 use aws_sdk_s3::Client;
 
-use test_helpers::test_consolidation::check_consolidation;
-use test_helpers::TestEnvironment;
+use test_helpers::test_consolidation::{check_consolidation, check_consolidation_with_config};
+use test_helpers::{TestEnvironment, TestConstants};
+use log_consolidator_checker_rust::config::loader::load_config;
 
 #[tokio::test]
 async fn test_archiving_logs() -> Result<()> {
@@ -43,7 +44,12 @@ async fn test_archiving_logs() -> Result<()> {
 
 #[tokio::test]
 async fn test_check_consolidation() -> Result<()> {
-    let consolidation_result = check_consolidation("simple-001".to_string()).await?;
+    let test_dataset = "simple-001".to_string();
+    let test_env = TestEnvironment::create(test_dataset.clone()).await?;
+    test_env.populate_all_buckets().await;
+    
+    let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
+    let consolidation_result = check_consolidation_with_config(test_dataset, &config, &test_env).await?;
 
     // Assert consolidation completed successfully
     assert!(
@@ -69,9 +75,17 @@ async fn test_check_consolidation() -> Result<()> {
 
 #[tokio::test]
 async fn test_check_consolidation_with_line_return() -> Result<()> {
-    let line_return_result = check_consolidation("line-return-001".to_string()).await?;
-    let without_line_return_result =
-        check_consolidation("without-line-return-001".to_string()).await?;
+    let test_dataset_1 = "line-return-001".to_string();
+    let test_env_1 = TestEnvironment::create(test_dataset_1.clone()).await?;
+    test_env_1.populate_all_buckets().await;
+    let config_1 = load_config(TestConstants::MOCK_CONFIG_PATH)?;
+    let line_return_result = check_consolidation_with_config(test_dataset_1, &config_1, &test_env_1).await?;
+    
+    let test_dataset_2 = "without-line-return-001".to_string();
+    let test_env_2 = TestEnvironment::create(test_dataset_2.clone()).await?;
+    test_env_2.populate_all_buckets().await;
+    let config_2 = load_config(TestConstants::MOCK_CONFIG_PATH)?;
+    let without_line_return_result = check_consolidation_with_config(test_dataset_2, &config_2, &test_env_2).await?;
     assert!(
         without_line_return_result.ok,
         "Consolidation check should succeed. Message: {}",
