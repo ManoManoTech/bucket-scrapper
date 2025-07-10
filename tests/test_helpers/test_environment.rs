@@ -12,9 +12,9 @@ use testcontainers::{
 use testcontainers_modules::minio::MinIO;
 
 use super::mock_data_generator::MockDataGenerator;
-use log_consolidator_checker_rust::config::loader::{
+use log_consolidator_checker_rust::config::{loader::{
     get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config,
-};
+}, types::ConfigSchema};
 
 pub struct TestConstants;
 
@@ -38,6 +38,7 @@ pub struct TestEnvironment {
     pub container: testcontainers::ContainerAsync<MinIO>,
     pub test_dataset: String,
     pub mock: MockDataGenerator,
+    pub config: ConfigSchema,
 }
 
 impl TestEnvironment {
@@ -142,6 +143,7 @@ impl TestEnvironment {
             container,
             test_dataset,
             mock,
+            config,
         })
     }
 
