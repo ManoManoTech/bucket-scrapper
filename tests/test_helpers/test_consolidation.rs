@@ -5,7 +5,7 @@ use serde_json;
 use log_consolidator_checker_rust::config::loader::{
     get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config,
 };
-use log_consolidator_checker_rust::config::types::BucketConfig;
+use log_consolidator_checker_rust::config::types::{BucketConfig, ConfigSchema};
 use log_consolidator_checker_rust::s3::checker::Checker;
 use log_consolidator_checker_rust::s3::client::WrappedS3Client;
 
@@ -21,17 +21,17 @@ pub struct ConsolidationResult {
 }
 
 pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationResult> {
-    check_consolidation_with_config(test_dataset, TestConstants::MOCK_CONFIG_PATH).await
+    let test_env = TestEnvironment::create(test_dataset.clone()).await?;
+    let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
+    check_consolidation_with_config(test_dataset, &config, &test_env).await
 }
 
 pub async fn check_consolidation_with_config(
     test_dataset: String,
-    config_path: &str,
+    config: &ConfigSchema,
+    test_env: &TestEnvironment,
 ) -> Result<ConsolidationResult> {
-    let test_env = TestEnvironment::create(test_dataset.clone()).await?;
-
     // Load config
-    let config = load_config(config_path)?;
     // TODO: externalize this
     // test_env.populate_all_buckets();
 
@@ -366,8 +366,9 @@ pub async fn check_consolidation_with_config(
         );
 
         println!(
-            "[{}] ✓ All assertions passed - test completed successfully!", t
-           est_dataset);
+            "[{}] ✓ All assertions passed - test completed successfully!",
+            test_dataset
+        );
 
         println!("[{}] Metrics:", test_dataset);
         println!("[{}]   - Checked result: {}\n", test_dataset, uploaded_json);

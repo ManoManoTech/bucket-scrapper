@@ -35,7 +35,6 @@ services:
       LOG_CONSOLIDATOR_S3_RETRY_COST: "1"
       LOG_CONSOLIDATOR_S3_RETRY_TIMEOUT_COST: "2"
       LOG_CONSOLIDATOR_TARGET_SPEC_PATH: /config.yaml
-      # LOG_CONSOLIDATOR_TARGET_TIME: 2025-06-08T08:00:00Z
       LOG_CONSOLIDATOR_TARGET_TIME: "2025-06-08T08:00:00+00:00"
     volumes:
       # - ./mock_data/config.yaml:/app/config.yaml:ro
