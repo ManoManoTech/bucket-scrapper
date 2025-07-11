@@ -31,6 +31,16 @@ pub async fn check_consolidation_with_config(
     config: &ConfigSchema,
     test_env: &TestEnvironment,
 ) -> Result<ConsolidationResult> {
+    check_consolidation_with_config_and_date(test_dataset, config, test_env, "20231225", "14").await
+}
+
+pub async fn check_consolidation_with_config_and_date(
+    test_dataset: String,
+    config: &ConfigSchema,
+    test_env: &TestEnvironment,
+    date: &str,
+    hour: &str,
+) -> Result<ConsolidationResult> {
     // Load config
     // TODO: externalize this
     // test_env.populate_all_buckets();
@@ -50,9 +60,9 @@ pub async fn check_consolidation_with_config(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No consolidated bucket found"))?;
 
-    // Run the check for the date/hour in our test data (20231225/14)
-    let date = "20231225".to_string();
-    let hour = "14".to_string();
+    // Use the provided date/hour
+    let date = date.to_string();
+    let hour = hour.to_string();
 
     println!(
         "[{}] Running consolidation check for {}/{}",

@@ -6,29 +6,19 @@ use anyhow::Result;
 
 use aws_sdk_s3::Client;
 use test_helpers::{
-    check_consolidation_with_config, check_output_bucket_not_empty, AwsS3Client,
-    ConsolidatorRunner, ContainerConfig, S3FileDisplayer, TestEnvironment,
+    check_consolidation_with_config_and_date, check_output_bucket_not_empty, AwsS3Client,
+    ConsolidatorRunner, ContainerConfig, DynamicMockGenerator, S3FileDisplayer, TestEnvironment,
 };
 
-/// Convert MockDataGenerator date/hour to consolidator target time format
-/// Converts "20231225" + "14" to "2023-12-25T14:00:00+00:00"
-fn generate_target_time(date: &str, hour: &str) -> String {
-    let year = &date[0..4];
-    let month = &date[4..6];
-    let day = &date[6..8];
-    format!("{}-{}-{}T{}:00:00+00:00", year, month, day, hour)
-}
-
 #[tokio::test]
-async fn test_check_consolidation_with_consolidator() -> Result<()> {
+async fn test_check_consolidation_with_continuous_consolidator() -> Result<()> {
     let test_dataset = "simple-001".to_string();
     let test_env = TestEnvironment::create(test_dataset.clone()).await?;
 
-    let target_time = generate_target_time("20231225", "14");
-
-    test_env.populate_inputs_buckets().await;
-
+    // Use dynamic mock generator with timestamps suitable for continuous mode
+    let mock_generator = DynamicMockGenerator::new_for_continuous();
     let s3_client = Client::new(&test_env.client);
+    mock_generator.populate_s3_for_continuous_mode(&s3_client).await?;
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
@@ -46,13 +36,12 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
         image: "log-consolidator".to_string(),
         tag: "dev".to_string(),
         config_path: absolute_path,
-        target_time,
+        target_time: String::new(), // Not used in continuous mode
         minio_endpoint: format!("http://{}:9000", minio_network),
-        sleep_duration_secs: 5,
+        sleep_duration_secs: 10, // Allow time for continuous consolidation to process files
     };
 
-    let consolidator_runner = ConsolidatorRunner::new(&container_config).with_default();
-    // consolidator_runner.with_default();
+    let consolidator_runner = ConsolidatorRunner::new(&container_config).with_continuous();
     consolidator_runner.run().await?;
 
     let result_buckets = "output-a";
@@ -65,9 +54,11 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
         .display_bucket_files(result_buckets, "consolidated")
         .await?;
 
+    // Get the dynamic date/hour from the mock generator and use them for verification
+    let (date, hour) = mock_generator.get_date_hour_strings();
     let config = test_env.config.clone();
     let consolidation_result =
-        check_consolidation_with_config(test_dataset, &config, &test_env).await?;
+        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour).await?;
 
     assert!(
         consolidation_result.ok,
@@ -78,15 +69,14 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> {
+async fn test_check_consolidation_with_continuous_consolidator_line_return() -> Result<()> {
     let test_dataset = "line-return-001".to_string();
     let test_env = TestEnvironment::create(test_dataset.clone()).await?;
 
-    let target_time = generate_target_time("20231225", "14");
-
-    test_env.populate_inputs_buckets().await;
-
+    // Use dynamic mock generator with line returns for continuous mode
+    let mock_generator = DynamicMockGenerator::new_for_continuous();
     let s3_client = Client::new(&test_env.client);
+    mock_generator.populate_s3_for_continuous_mode_line_returns(&s3_client).await?;
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
@@ -104,13 +94,13 @@ async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> 
         image: "log-consolidator".to_string(),
         tag: "dev".to_string(),
         config_path: absolute_path,
-        target_time,
+        target_time: String::new(), // Not used in continuous mode
         minio_endpoint: format!("http://{}:9000", minio_network),
-        sleep_duration_secs: 5,
+        sleep_duration_secs: 10, // Allow time for continuous consolidation to process files
     };
 
-    let consolidator_runner = ConsolidatorRunner::new(&container_config);
-    consolidator_runner.with_default().run().await?;
+    let consolidator_runner = ConsolidatorRunner::new(&container_config).with_continuous();
+    consolidator_runner.run().await?;
 
     let result_buckets = "output-a";
     let aws_s3_client_output = AwsS3Client::new(s3_client.clone());
@@ -121,10 +111,11 @@ async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> 
     output_file_displayer
         .display_bucket_files(result_buckets, "consolidated")
         .await?;
-
+    // Get the dynamic date/hour from the mock generator and use them for verification
+    let (date, hour) = mock_generator.get_date_hour_strings();
     let config = test_env.config.clone();
     let consolidation_result =
-        check_consolidation_with_config(test_dataset, &config, &test_env).await?;
+        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour).await?;
 
     assert!(
         consolidation_result.ok,
