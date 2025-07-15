@@ -18,17 +18,18 @@ use log_consolidator_checker_rust::config::{loader::{
 
 pub struct TestConstants;
 
+impl Default for TestConstants {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl TestConstants {
     pub const MINIO_PORT: u16 = 9000;
     pub const DEFAULT_REGION: &'static str = "us-east-1";
     pub const MOCK_CONFIG_PATH: &'static str = "tests/mock_data/config.yaml";
 }
 
-impl Default for TestConstants {
-    fn default() -> Self {
-        Self
-    }
-}
 
 pub struct TestEnvironment {
     pub inputs_buckets: Vec<String>,

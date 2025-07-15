@@ -20,6 +20,7 @@ pub struct ConsolidationResult {
     pub uploaded_result_key: String,
 }
 
+
 pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationResult> {
     let test_env = TestEnvironment::create(test_dataset.clone()).await?;
     let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
