@@ -1,2 +1,1 @@
-{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Processing user request with
-line returns","service":"app","env":"support","request_id":"req_001"}
+{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Processing user request with\nline returns","service":"app","env":"support","request_id":"req_001"}

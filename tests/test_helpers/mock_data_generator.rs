@@ -31,20 +31,17 @@ impl MockDataGenerator {
         }
     }
 
-    /// Generate and upload all mock data to S3 buckets based on config
     pub async fn populate_all_buckets(&self, s3_client: &Client) -> Result<()> {
         let config = load_config(super::test_environment::TestConstants::MOCK_CONFIG_PATH)?;
 
         println!("Reading mock data from filesystem...");
 
-        // Discover available environments from actual files
         let available_envs = self.discover_available_environments().await?;
         println!(
             "Available environments in dataset {}: {:?}",
             self.test_dataset, available_envs
         );
 
-        // Generate input buckets data
         let archived_buckets = get_archived_buckets(&config);
         println!("Processing {} input buckets...", archived_buckets.len());
 
@@ -63,7 +60,6 @@ impl MockDataGenerator {
                 bucket_env
             );
 
-            // Only populate if we have data for this environment
             if available_envs.contains(bucket_env) {
                 self.populate_input_bucket(s3_client, bucket_config).await?;
             } else {
@@ -74,7 +70,6 @@ impl MockDataGenerator {
             }
         }
 
-        // Generate consolidated bucket data
         let consolidated_buckets = get_consolidated_buckets(&config);
         if let Some(consolidated_bucket) = consolidated_buckets.first() {
             println!(
@@ -85,13 +80,11 @@ impl MockDataGenerator {
                 .await?;
         }
 
-        // Note: Results bucket is populated by the checker itself, not by mock generator
         println!("Results bucket will be populated by the checker during tests");
 
         Ok(())
     }
 
-    /// Discover available environments from input files
     async fn discover_available_environments(&self) -> Result<std::collections::HashSet<String>> {
         use std::collections::HashSet;
 
@@ -114,7 +107,6 @@ impl MockDataGenerator {
         Ok(envs)
     }
 
-    /// Discover input files and extract service/env combinations
     async fn discover_input_files(&self) -> Result<Vec<(String, String)>> {
         let input_dir = format!("tests/mock_data/{}/inputs", self.test_dataset);
         let mut entries = fs::read_dir(&input_dir).await?;
@@ -134,35 +126,29 @@ impl MockDataGenerator {
         Ok(combinations)
     }
 
-    /// Populate input bucket with compressed .gz files
     pub async fn populate_input_bucket(
         &self,
         s3_client: &Client,
         bucket_config: &BucketConfig,
     ) -> Result<()> {
-        // Extract force_env from extra HashMap
         let bucket_env = bucket_config
             .extra
             .get("force_env")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // Generate path prefix using the formatter
         let formatter = generate_path_formatter(bucket_config);
         let path_prefix = formatter(&self.base_date, &self.base_hour)?;
 
-        // Discover all input files for this bucket's environment
         let combinations = self.discover_input_files().await?;
 
         let mut files_processed = 0;
         for (service, env) in combinations {
-            // Only process files matching this bucket's environment
             if env == bucket_env {
                 let file_name = format!("{}-{}.json", service, env);
                 let input_file_path =
                     format!("tests/mock_data/{}/inputs/{}", self.test_dataset, file_name);
 
-                // Read the JSON file from filesystem
                 if Path::new(&input_file_path).exists() {
                     println!(
                         "Processing input file: {} from {}",
@@ -172,19 +158,15 @@ impl MockDataGenerator {
                     let json_content = fs::read(&input_file_path).await?;
                     let original_size = json_content.len();
 
-                    // Count lines in the JSON file for logging
                     let line_count = json_content.iter().filter(|&&b| b == b'\n').count();
 
-                    // Compress with gzip
                     let compressed_data = self.compress_with_gzip(&json_content)?;
                     let compressed_size = compressed_data.len();
                     let compression_ratio =
                         (compressed_size as f64 / original_size as f64 * 100.0) as u32;
 
-                    // Generate S3 key
                     let s3_key = format!("{}/{}.gz", path_prefix, file_name);
 
-                    // Upload to S3
                     s3_client
                         .put_object()
                         .bucket(&bucket_config.bucket)
@@ -214,7 +196,6 @@ impl MockDataGenerator {
         Ok(())
     }
 
-    /// Discover consolidated files and extract env/service combinations
     async fn discover_consolidated_files(&self) -> Result<Vec<(String, String)>> {
         let consolidated_dir = format!("tests/mock_data/{}/consolidated", self.test_dataset);
         let mut entries = fs::read_dir(&consolidated_dir).await?;
@@ -234,17 +215,14 @@ impl MockDataGenerator {
         Ok(combinations)
     }
 
-    /// Populate consolidated bucket with compressed .zst files
     pub async fn populate_consolidated_bucket(
         &self,
         s3_client: &Client,
         bucket_config: &BucketConfig,
     ) -> Result<()> {
-        // Generate path prefix using the formatter
         let formatter = generate_path_formatter(bucket_config);
         let path_prefix = formatter(&self.base_date, &self.base_hour)?;
 
-        // Discover all consolidated files
         let combinations = self.discover_consolidated_files().await?;
 
         for (env, service) in combinations {
@@ -254,7 +232,6 @@ impl MockDataGenerator {
                 self.test_dataset, consolidated_file_name
             );
 
-            // Read the consolidated JSON file from filesystem
             if Path::new(&input_file_path).exists() {
                 let json_content = fs::read(&input_file_path).await?;
                 let original_size = json_content.len();
@@ -297,16 +274,14 @@ impl MockDataGenerator {
         Ok(())
     }
 
-    /// Compress data using gzip
     fn compress_with_gzip(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data)?;
         Ok(encoder.finish()?)
     }
 
-    /// Compress data using zstd
     fn compress_with_zstd(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut encoder = ZstdEncoder::new(Vec::new(), 3)?; // compression level 3
+        let mut encoder = ZstdEncoder::new(Vec::new(), 3)?;
         encoder.write_all(data)?;
         Ok(encoder.finish()?)
     }

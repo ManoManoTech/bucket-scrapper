@@ -92,7 +92,6 @@ impl TestEnvironment {
 
         println!("Creating S3 buckets for test environment...");
 
-        // Create all buckets dynamically from config
         for bucket_config in &archived_buckets {
             s3_client
                 .create_bucket()
@@ -130,7 +129,6 @@ impl TestEnvironment {
 
         println!("Populating buckets with mock data...");
 
-        // Upload mock data to the buckets using Rust generator
         let mock = MockDataGenerator::new(test_dataset.clone());
 
         println!("Test environment ready!");

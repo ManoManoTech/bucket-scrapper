@@ -9,9 +9,34 @@ use test_helpers::{
     check_consolidation_with_config, check_output_bucket_not_empty, AwsS3Client,
     ConsolidatorRunner, ContainerConfig, S3FileDisplayer, TestEnvironment,
 };
+use serde::{Deserialize};
 
-/// Convert MockDataGenerator date/hour to consolidator target time format
-/// Converts "20231225" + "14" to "2023-12-25T14:00:00+00:00"
+#[derive(Debug, Deserialize)]
+struct BucketConfig {
+    bucket: String,
+    path: Vec<serde_yaml::Value>,
+    #[serde(default)]
+    force_env: Option<String>,
+    #[serde(default)]
+    proceed_without_matching_objects: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    #[serde(rename = "bucketsToConsolidate")]
+    buckets_to_consolidate: Vec<BucketConfig>,
+    #[serde(rename = "bucketsConsolidated")]
+    buckets_consolidated: Vec<BucketConfig>,
+    #[serde(rename = "bucketsCheckerResults")]
+    buckets_checker_results: Vec<BucketConfig>,
+}
+
+fn load_config_buckets(config_path: &str) -> Result<Config> {
+    let config_content = std::fs::read_to_string(config_path)?;
+    let config: Config = serde_yaml::from_str(&config_content)?;
+    Ok(config)
+}
+
 fn generate_target_time(date: &str, hour: &str) -> String {
     let year = &date[0..4];
     let month = &date[4..6];
@@ -32,10 +57,13 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
-    // Display input bucket contents
-    let input_buckets = ["input-a", "input-b", "input-c"];
+    let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
+    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+        .iter()
+        .map(|b| b.bucket.as_str())
+        .collect();
     file_displayer
-        .display_multiple_buckets(&input_buckets, "input")
+        .display_multiple_buckets(&input_bucket_names, "input")
         .await?;
 
     let absolute_path = path::absolute("tests/mock_data/config.yaml")?;
@@ -52,10 +80,9 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
     };
 
     let consolidator_runner = ConsolidatorRunner::new(&container_config).with_default();
-    // consolidator_runner.with_default();
     consolidator_runner.run().await?;
 
-    let result_buckets = "output-a";
+    let result_buckets = &config_buckets.buckets_consolidated[0].bucket;
     let aws_s3_client_output = AwsS3Client::new(s3_client.clone());
 
     check_output_bucket_not_empty(&aws_s3_client_output, result_buckets).await?;
@@ -90,10 +117,13 @@ async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> 
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
-    // Display input bucket contents
-    let input_buckets = ["input-a", "input-b", "input-c"];
+    let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
+    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+        .iter()
+        .map(|b| b.bucket.as_str())
+        .collect();
     file_displayer
-        .display_multiple_buckets(&input_buckets, "input")
+        .display_multiple_buckets(&input_bucket_names, "input")
         .await?;
 
     let absolute_path = path::absolute("tests/mock_data/config.yaml")?;
@@ -112,7 +142,7 @@ async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> 
     let consolidator_runner = ConsolidatorRunner::new(&container_config);
     consolidator_runner.with_default().run().await?;
 
-    let result_buckets = "output-a";
+    let result_buckets = &config_buckets.buckets_consolidated[0].bucket;
     let aws_s3_client_output = AwsS3Client::new(s3_client.clone());
 
     check_output_bucket_not_empty(&aws_s3_client_output, result_buckets).await?;

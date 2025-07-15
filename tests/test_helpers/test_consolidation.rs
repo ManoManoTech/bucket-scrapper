@@ -41,26 +41,19 @@ pub async fn check_consolidation_with_config_and_date(
     date: &str,
     hour: &str,
 ) -> Result<ConsolidationResult> {
-    // Load config
-    // TODO: externalize this
-    // test_env.populate_all_buckets();
 
-    // Create wrapped S3 client using the test environment's client
     let s3_client = Client::new(&test_env.client);
     let wrapped_s3_client =
         WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client.clone())).await?;
 
-    // Create checker
     let checker = Checker::new(wrapped_s3_client, 4, Some(2), 128); // Small settings for test
 
-    // Get bucket configs
     let archived_buckets = get_archived_buckets(&config);
     let consolidated_buckets = get_consolidated_buckets(&config);
     let consolidated_bucket = consolidated_buckets
         .first()
         .ok_or_else(|| anyhow::anyhow!("No consolidated bucket found"))?;
 
-    // Use the provided date/hour
     let date = date.to_string();
     let hour = hour.to_string();
 
@@ -69,7 +62,6 @@ pub async fn check_consolidation_with_config_and_date(
         test_dataset, date, hour
     );
 
-    // Debug: List what's in each bucket before running the check
     println!("[{}] Listing bucket contents before check:", test_dataset);
     for bucket_config in &archived_buckets {
         println!(
@@ -78,7 +70,6 @@ pub async fn check_consolidation_with_config_and_date(
         );
         println!("[{}]   Path config: {:?}", test_dataset, bucket_config.path);
 
-        // Generate expected key prefix
         let formatter =
             log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
                 bucket_config,
@@ -133,7 +124,6 @@ pub async fn check_consolidation_with_config_and_date(
         println!("    - {} (size: {} bytes)", file.key, file.size);
     }
 
-    // Assertions: Verify that files were found in all buckets
     let mut bucket_file_results = Vec::new();
     for (i, bucket_config) in archived_buckets.iter().enumerate() {
         let files = checker
@@ -145,7 +135,6 @@ pub async fn check_consolidation_with_config_and_date(
         .list_bucket_files(consolidated_bucket, &date, &hour)
         .await?;
 
-    // Check that at least some input buckets contain files and have correct prefixes
     let total_input_files: usize = bucket_file_results
         .iter()
         .map(|(_, _, files)| files.files.len())
@@ -160,7 +149,6 @@ pub async fn check_consolidation_with_config_and_date(
         }
     }
 
-    // Only fail if ALL input buckets are empty
     if total_input_files == 0 {
         println!("[{}] ERROR: ALL input buckets are empty", test_dataset);
         return Ok(ConsolidationResult {
@@ -172,10 +160,8 @@ pub async fn check_consolidation_with_config_and_date(
         });
     }
 
-    // Validate file prefixes for non-empty buckets
     for (i, bucket_config, files) in &bucket_file_results {
         if files.files.len() > 0 {
-            // Generate expected prefix dynamically from config
             let formatter =
                 log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
                     bucket_config,
@@ -194,7 +180,6 @@ pub async fn check_consolidation_with_config_and_date(
         }
     }
 
-    // Check consolidated bucket files have correct prefix
     let consolidated_formatter =
         log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter(
             consolidated_bucket,
@@ -222,7 +207,6 @@ pub async fn check_consolidation_with_config_and_date(
         );
     }
 
-    // Filter out empty buckets before passing to checker
     let non_empty_buckets: Vec<&BucketConfig> = bucket_file_results
         .iter()
         .filter(|(_, _, files)| files.files.len() > 0)
@@ -245,12 +229,10 @@ pub async fn check_consolidation_with_config_and_date(
         test_dataset, result.ok, result.message
     );
 
-    // Assert that the comparison completed (result should be either true or false, not error)
     assert!(result.message.len() > 0, "Result should have a message");
     assert!(result.date == date, "Result date should match input date");
     assert!(result.hour == hour, "Result hour should match input hour");
 
-    // Upload result to bucketsCheckerResults (output-b)
     let results_bucket = get_results_bucket(&config);
     assert!(
         results_bucket.is_some(),
@@ -258,7 +240,6 @@ pub async fn check_consolidation_with_config_and_date(
     );
 
     if let Some(results_bucket_config) = results_bucket {
-        // Create result JSON
         let result_json = serde_json::json!({
             "date": result.date,
             "hour": result.hour,
@@ -268,13 +249,11 @@ pub async fn check_consolidation_with_config_and_date(
             "analysis_end_date": result.analysis_end_date
         });
 
-        // Generate S3 key for result
         let result_key = format!(
             "check-results/dt={}/h={}/check-result-{}-{}.json",
             date, hour, date, hour
         );
 
-        // Upload to S3
         s3_client
             .put_object()
             .bucket(&results_bucket_config.bucket)
@@ -289,7 +268,6 @@ pub async fn check_consolidation_with_config_and_date(
             test_dataset, results_bucket_config.bucket, result_key
         );
 
-        // Verify the result was uploaded
         let objects = s3_client
             .list_objects_v2()
             .bucket(&results_bucket_config.bucket)
@@ -310,7 +288,6 @@ pub async fn check_consolidation_with_config_and_date(
             }
         }
 
-        // Assert that the result was properly uploaded
         assert!(
             contents.len() >= 1,
             "Results bucket should contain at least 1 object"
@@ -324,7 +301,6 @@ pub async fn check_consolidation_with_config_and_date(
             result_key
         );
 
-        // Verify the uploaded result content
         let get_result = s3_client
             .get_object()
             .bucket(&results_bucket_config.bucket)
@@ -335,7 +311,6 @@ pub async fn check_consolidation_with_config_and_date(
         let body = get_result.body.collect().await?;
         let uploaded_json: serde_json::Value = serde_json::from_slice(&body.into_bytes())?;
 
-        // Display the complete result file content
         println!("[{}] Result file content:", test_dataset);
         println!(
             "[{}] File: s3://{}/{}",
@@ -347,7 +322,6 @@ pub async fn check_consolidation_with_config_and_date(
             serde_json::to_string_pretty(&uploaded_json)?
         );
 
-        // Assert uploaded JSON structure
         assert!(
             uploaded_json["ok"].as_bool().is_some(),
             "Uploaded result should have 'ok' boolean field"

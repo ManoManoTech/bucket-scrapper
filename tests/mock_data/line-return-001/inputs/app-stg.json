@@ -1,4 +1,1 @@
-{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Staging deployment with
-multiple
-line
-returns","service":"app","env":"stg","version":"v1.2.3"}
+{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Staging deployment with\nmultiple\nline\nreturns","service":"app","env":"stg","version":"v1.2.3"}
