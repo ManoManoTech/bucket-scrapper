@@ -1,15 +1,28 @@
 bucketsToConsolidate: # The source buckets
   # NOTE: works with docker-compose
-  - bucket: 'inputs-a'
+  - bucket: 'support-infra-datadog-logs-rehydrate-archives'
     path:
-      - datefmt: 'test-log-archives/dt=20060102/hour=15'
-    only_prefix_patterns:
-      - 'noenv.*'
-      - ".*-\\.json\\.zst"
-      - ".*-noservice\\.json\\.zst"
-    proceed_without_matching_objects: true
+      - static_path: 'nginx'
+      - datefmt: 'dt=20060102/hour=15'
+    force_env: support
+  - bucket: 'prd-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: production
+  - bucket: 'int-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: int
+  - bucket: 'stg-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: stg
+  - bucket: 'support-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: support
 bucketsConsolidated:
-  - bucket: output-a
+  - bucket: support-infra-log-consolidator-archives
     path:
       - static_path: log-archives
       - datefmt: 'dt=20060102/h=15'
