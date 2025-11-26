@@ -4,7 +4,7 @@
 use std::ops::AddAssign;
 
 /// Stores character count information for files
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DetailedCharacterCount {
     /// Counts of each ASCII character (0-255)
     pub bucket: String,
@@ -198,9 +198,9 @@ impl DetailedCharacterCount {
 }
 
 // Implement AddAssign to make it easier to combine counts
-impl AddAssign for DetailedCharacterCount {
-    fn add_assign(&mut self, other: Self) {
-        self.add(&other);
+impl AddAssign<&DetailedCharacterCount> for DetailedCharacterCount {
+    fn add_assign(&mut self, other: &Self) {
+        self.add(other);
     }
 }
 
@@ -336,7 +336,7 @@ mod tests {
         let mut counter2 = DetailedCharacterCount::new();
         counter2.increment(b'y');
 
-        counter1 += counter2;
+        counter1 += &counter2;
 
         assert_eq!(counter1.counts[b'x' as usize], 1);
         assert_eq!(counter1.counts[b'y' as usize], 1);
