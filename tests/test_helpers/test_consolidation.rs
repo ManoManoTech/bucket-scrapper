@@ -20,7 +20,6 @@ pub struct ConsolidationResult {
     pub uploaded_result_key: String,
 }
 
-
 pub async fn check_consolidation(test_dataset: String) -> Result<ConsolidationResult> {
     let test_env = TestEnvironment::create(test_dataset.clone()).await?;
     let config = load_config(TestConstants::MOCK_CONFIG_PATH)?;
@@ -42,7 +41,6 @@ pub async fn check_consolidation_with_config_and_date(
     date: &str,
     hour: &str,
 ) -> Result<ConsolidationResult> {
-
     let s3_client = Client::new(&test_env.client);
     let wrapped_s3_client =
         WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client.clone())).await?;

@@ -1,7 +1,7 @@
 mod test_helpers;
 
 use anyhow::Result;
-use test_helpers::{run_consolidation_test, assert_success, assert_failure};
+use test_helpers::{assert_failure, assert_success, run_consolidation_test};
 
 #[tokio::test]
 async fn test_check_consolidation() -> Result<()> {
@@ -16,7 +16,7 @@ async fn test_check_consolidation() -> Result<()> {
 async fn test_check_consolidation_with_line_return() -> Result<()> {
     let line_return_result = run_consolidation_test("line-return-001").await?;
     let without_line_return_result = run_consolidation_test("without-line-return-001").await?;
-    
+
     assert_success(&line_return_result);
     assert_success(&without_line_return_result);
     Ok(())

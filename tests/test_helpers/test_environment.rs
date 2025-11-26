@@ -12,9 +12,10 @@ use testcontainers::{
 use testcontainers_modules::minio::MinIO;
 
 use super::mock_data_generator::MockDataGenerator;
-use log_consolidator_checker_rust::config::{loader::{
-    get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config,
-}, types::ConfigSchema};
+use log_consolidator_checker_rust::config::{
+    loader::{get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config},
+    types::ConfigSchema,
+};
 
 pub struct TestConstants;
 
@@ -29,7 +30,6 @@ impl TestConstants {
     pub const DEFAULT_REGION: &'static str = "us-east-1";
     pub const MOCK_CONFIG_PATH: &'static str = "tests/mock_data/config.yaml";
 }
-
 
 pub struct TestEnvironment {
     pub inputs_buckets: Vec<String>,

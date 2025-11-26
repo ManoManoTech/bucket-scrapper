@@ -5,11 +5,11 @@ use std::path;
 use anyhow::Result;
 
 use aws_sdk_s3::Client;
+use serde::Deserialize;
 use test_helpers::{
     check_consolidation_with_config, check_output_bucket_not_empty, AwsS3Client,
     ConsolidatorRunner, ContainerConfig, S3FileDisplayer, TestEnvironment,
 };
-use serde::{Deserialize};
 
 #[derive(Debug, Deserialize)]
 struct BucketConfig {
@@ -58,7 +58,8 @@ async fn test_check_consolidation_with_consolidator() -> Result<()> {
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
     let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
-    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+    let input_bucket_names: Vec<&str> = config_buckets
+        .buckets_to_consolidate
         .iter()
         .map(|b| b.bucket.as_str())
         .collect();
@@ -118,7 +119,8 @@ async fn test_check_consolidation_with_consolidator_line_return() -> Result<()> 
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
     let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
-    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+    let input_bucket_names: Vec<&str> = config_buckets
+        .buckets_to_consolidate
         .iter()
         .map(|b| b.bucket.as_str())
         .collect();

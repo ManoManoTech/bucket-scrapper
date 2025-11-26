@@ -5,11 +5,11 @@ use std::path;
 use anyhow::Result;
 
 use aws_sdk_s3::Client;
+use serde::Deserialize;
 use test_helpers::{
     check_consolidation_with_config_and_date, check_output_bucket_not_empty, AwsS3Client,
     ConsolidatorRunner, ContainerConfig, DynamicMockGenerator, S3FileDisplayer, TestEnvironment,
 };
-use serde::{Deserialize};
 
 #[derive(Debug, Deserialize)]
 struct BucketConfig {
@@ -44,12 +44,15 @@ async fn test_check_consolidation_with_continuous_consolidator() -> Result<()> {
 
     let mock_generator = DynamicMockGenerator::new_for_continuous();
     let s3_client = Client::new(&test_env.client);
-    mock_generator.populate_s3_for_continuous_mode(&s3_client).await?;
+    mock_generator
+        .populate_s3_for_continuous_mode(&s3_client)
+        .await?;
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
     let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
-    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+    let input_bucket_names: Vec<&str> = config_buckets
+        .buckets_to_consolidate
         .iter()
         .map(|b| b.bucket.as_str())
         .collect();
@@ -86,7 +89,8 @@ async fn test_check_consolidation_with_continuous_consolidator() -> Result<()> {
     let (date, hour) = mock_generator.get_date_hour_strings();
     let config = test_env.config.clone();
     let consolidation_result =
-        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour).await?;
+        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour)
+            .await?;
 
     assert!(
         consolidation_result.ok,
@@ -103,12 +107,15 @@ async fn test_check_consolidation_with_continuous_consolidator_line_return() -> 
 
     let mock_generator = DynamicMockGenerator::new_for_continuous();
     let s3_client = Client::new(&test_env.client);
-    mock_generator.populate_s3_for_continuous_mode_line_returns(&s3_client).await?;
+    mock_generator
+        .populate_s3_for_continuous_mode_line_returns(&s3_client)
+        .await?;
     let aws_s3_client = AwsS3Client::new(s3_client.clone());
     let file_displayer = S3FileDisplayer::new(aws_s3_client);
 
     let config_buckets = load_config_buckets("tests/mock_data/config.yaml")?;
-    let input_bucket_names: Vec<&str> = config_buckets.buckets_to_consolidate
+    let input_bucket_names: Vec<&str> = config_buckets
+        .buckets_to_consolidate
         .iter()
         .map(|b| b.bucket.as_str())
         .collect();
@@ -144,7 +151,8 @@ async fn test_check_consolidation_with_continuous_consolidator_line_return() -> 
     let (date, hour) = mock_generator.get_date_hour_strings();
     let config = test_env.config.clone();
     let consolidation_result =
-        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour).await?;
+        check_consolidation_with_config_and_date(test_dataset, &config, &test_env, &date, &hour)
+            .await?;
 
     assert!(
         consolidation_result.ok,

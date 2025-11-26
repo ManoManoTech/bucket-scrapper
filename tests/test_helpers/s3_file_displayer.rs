@@ -20,20 +20,22 @@ impl AwsS3Client {
 impl S3Client for AwsS3Client {
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>> {
         let objects = self.client.list_objects().bucket(bucket).send().await?;
-        Ok(objects.contents()
+        Ok(objects
+            .contents()
             .iter()
             .filter_map(|obj| obj.key().map(|k| k.to_string()))
             .collect())
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        let response = self.client
+        let response = self
+            .client
             .get_object()
             .bucket(bucket)
             .key(key)
             .send()
             .await?;
-        
+
         let body = response.body.collect().await?;
         Ok(body.into_bytes().to_vec())
     }
@@ -54,15 +56,15 @@ impl<T: S3Client> S3FileDisplayer<T> {
 
         for key in keys {
             println!("Processing {} file: {}", file_type, key);
-            
+
             let data = self.s3_client.get_object(bucket, &key).await?;
             let content = self.decompress_and_display(&key, &data)?;
-            
+
             println!("{} content {} ({} bytes):", file_type, key, content.len());
             println!("{}", content);
             println!("--- End of {} file {} ---\n", file_type, key);
         }
-        
+
         Ok(())
     }
 
@@ -75,19 +77,19 @@ impl<T: S3Client> S3FileDisplayer<T> {
 
     fn decompress_and_display(&self, key: &str, data: &[u8]) -> Result<String> {
         if key.ends_with(".zst") {
-            let mut decompressor = zstd::Decoder::new(data)
-                .map_err(|e| anyhow::anyhow!("Erreur zstd: {}", e))?;
-            
+            let mut decompressor =
+                zstd::Decoder::new(data).map_err(|e| anyhow::anyhow!("Erreur zstd: {}", e))?;
+
             let mut decompressed = Vec::new();
             std::io::copy(&mut decompressor, &mut decompressed)?;
-            
+
             Ok(String::from_utf8_lossy(&decompressed).to_string())
         } else if key.ends_with(".gz") {
             use flate2::read::GzDecoder;
             let mut decoder = GzDecoder::new(data);
             let mut decompressed = Vec::new();
             std::io::copy(&mut decoder, &mut decompressed)?;
-            
+
             Ok(String::from_utf8_lossy(&decompressed).to_string())
         } else {
             Ok(String::from_utf8_lossy(data).to_string())
