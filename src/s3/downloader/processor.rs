@@ -115,9 +115,9 @@ impl Processor {
         match compression_type {
             CompressionType::Gzip => {
                 // Process gzip compressed data
-                use flate2::read::GzDecoder;
+                use flate2::read::MultiGzDecoder;
                 let data_vec = data.as_vec();
-                let mut decoder = GzDecoder::new(data_vec.as_slice());
+                let mut decoder = MultiGzDecoder::new(data_vec.as_slice());
                 Self::process_reader(&mut decoder, &mut counts)?;
             }
             CompressionType::Zstd => {
