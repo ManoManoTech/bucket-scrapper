@@ -10,11 +10,11 @@ use crate::utils::signal_handler::{MemoryMonitor, ProgressTracker};
 use anyhow::Result;
 use chrono::Utc;
 use crc32fast::Hasher;
-use log::{info, warn};
 use rand::prelude::SliceRandom;
 use rand::rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Analysis data for a bucket at a specific date/hour
 #[derive(Debug)]

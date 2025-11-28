@@ -3,8 +3,8 @@
 use crate::config::types::{BucketConfig, DateString, HourString, PathSchema};
 use crate::utils::date::{common_date_format, empty_date_format, raw_logs_date_format};
 use anyhow::Result;
-use log::warn;
 use regex::Regex;
+use tracing::warn;
 
 /// Extracts a formatter function for a date format string
 fn extract_single_format_date_and_prefix(

@@ -7,10 +7,10 @@ use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
-use log::{debug, info};
 use regex::Regex;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 pub struct WrappedS3Client {
     pub client: RwLock<(std::time::Instant, Client)>,

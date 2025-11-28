@@ -1,9 +1,9 @@
 // src/config/loader.rs
 use crate::config::types::{BucketConfig, ConfigSchema};
 use anyhow::{Context, Result};
-use log::info;
 use std::fs;
 use std::path::Path;
+use tracing::info;
 
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
     let config_str = fs::read_to_string(&path)

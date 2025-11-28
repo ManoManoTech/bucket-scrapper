@@ -11,8 +11,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use jemallocator::Jemalloc;
-use log::{info, warn, LevelFilter};
 use std::path::PathBuf;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 use utils::date::date_range_to_date_hour_list;
 
 #[global_allocator]
@@ -55,9 +56,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Log level
+    /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
-    log_level: LevelFilter,
+    log_level: String,
 }
 
 #[derive(Subcommand)]
@@ -89,10 +90,17 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    env_logger::builder()
-        .filter_level(cli.log_level)
-        .format_timestamp_millis()
+    // Initialize logging with JSON format
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+
+    fmt()
+        .json()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
         .init();
 
     // Load configuration

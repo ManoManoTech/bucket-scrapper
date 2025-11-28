@@ -5,10 +5,10 @@ use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::info;
 
 use super::downloader::Downloader;
 use super::processor::Processor;

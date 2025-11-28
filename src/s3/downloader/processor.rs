@@ -3,11 +3,11 @@ use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::signal_handler::ProgressTracker;
 use anyhow::Result;
 use futures::future::join_all;
-use log::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task;
+use tracing::{debug, warn};
 
 use super::types::{CompressionType, RawObjectData};
 

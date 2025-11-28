@@ -7,11 +7,11 @@ use aws_sdk_s3::Client;
 use backon::ExponentialBuilder;
 use backon::Retryable;
 use futures::future::join_all;
-use log::{debug, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
+use tracing::{debug, info, warn};
 
 use super::types::{CompressionType, RawObjectData};
 

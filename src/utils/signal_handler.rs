@@ -1,7 +1,6 @@
 // src/utils/signal_handler.rs
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use human_bytes::human_bytes;
-use log::{info, warn};
 use signal_hook::{consts::SIGUSR2, iterator::Signals};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,6 +8,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tracing::{info, warn};
 
 // Shared reference to indicate if the signal handler is already running
 static SIGNAL_HANDLER_RUNNING: AtomicBool = AtomicBool::new(false);
