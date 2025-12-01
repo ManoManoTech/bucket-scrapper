@@ -8,6 +8,7 @@ use log_consolidator_checker_rust::config::loader::{
 use log_consolidator_checker_rust::config::types::{BucketConfig, ConfigSchema};
 use log_consolidator_checker_rust::s3::checker::Checker;
 use log_consolidator_checker_rust::s3::client::WrappedS3Client;
+use log_consolidator_checker_rust::utils::structured_log::BucketRole;
 
 use super::{TestConstants, TestEnvironment};
 
@@ -80,7 +81,7 @@ pub async fn check_consolidation_with_config_and_date(
         );
 
         let file_list = checker
-            .list_bucket_files(bucket_config, &date, &hour)
+            .list_bucket_files(bucket_config, &date, &hour, BucketRole::Archived)
             .await?;
         println!(
             "[{}]   Found {} files in bucket {}",
@@ -111,7 +112,7 @@ pub async fn check_consolidation_with_config_and_date(
     println!("  Expected key prefix: {}", expected_key_prefix);
 
     let consolidated_file_list = checker
-        .list_bucket_files(consolidated_bucket, &date, &hour)
+        .list_bucket_files(consolidated_bucket, &date, &hour, BucketRole::Consolidated)
         .await?;
     println!(
         "[{}]   Found {} files in consolidated bucket {}",
@@ -126,12 +127,12 @@ pub async fn check_consolidation_with_config_and_date(
     let mut bucket_file_results = Vec::new();
     for (i, bucket_config) in archived_buckets.iter().enumerate() {
         let files = checker
-            .list_bucket_files(bucket_config, &date, &hour)
+            .list_bucket_files(bucket_config, &date, &hour, BucketRole::Archived)
             .await?;
         bucket_file_results.push((i, bucket_config, files));
     }
     let consolidated_files = checker
-        .list_bucket_files(consolidated_bucket, &date, &hour)
+        .list_bucket_files(consolidated_bucket, &date, &hour, BucketRole::Consolidated)
         .await?;
 
     let total_input_files: usize = bucket_file_results

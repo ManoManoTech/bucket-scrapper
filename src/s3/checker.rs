@@ -14,13 +14,9 @@ use crate::utils::structured_log::{
 use anyhow::Result;
 use chrono::Utc;
 use crc32fast::Hasher;
-use env_logger::Logger;
-use log::{error, info, warn};
-use rand::prelude::SliceRandom;
-use rand::rng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 /// Analysis data for a bucket at a specific date/hour
 #[derive(Debug)]
@@ -113,7 +109,7 @@ impl Checker {
         role: BucketRole,
     ) -> Result<S3FileList> {
         let client = self.s3_client.get_client().await?;
-        self.list_bucket_files_with_client(&client, bucket_config, date, hour)
+        self.list_bucket_files_with_client(&client, bucket_config, date, hour, role)
             .await
     }
 
@@ -125,6 +121,7 @@ impl Checker {
         bucket_config: &BucketConfig,
         date: &DateString,
         hour: &HourString,
+        role: BucketRole,
     ) -> Result<S3FileList> {
         let bucket = &bucket_config.bucket;
         let key_prefix = {
@@ -190,7 +187,7 @@ impl Checker {
         objects: &[S3ObjectInfo],
     ) -> Result<HashMap<String, DetailedCharacterCount>> {
         let downloader = DownloadOrchestrator::new(
-            self.s3_client.get_client().await?,
+            client,
             self.max_parallel,
             self.max_process_threads,
             Arc::clone(&self.memory_allocator),
@@ -234,6 +231,22 @@ impl Checker {
         hour: &HourString,
     ) -> Result<ComparisonResult> {
         let start_time = Utc::now();
+
+        // Check for duplicate bucket names (consolidated bucket in archived list would cause double-counting)
+        let consolidated_name = &consolidated_bucket_config.bucket;
+        for archived_config in archived_bucket_configs {
+            if &archived_config.bucket == consolidated_name {
+                error!(
+                    consolidated_bucket = %consolidated_name,
+                    "BUG DETECTED: Consolidated bucket is also in archived bucket list! This causes double-counting."
+                );
+                return Err(anyhow::anyhow!(
+                    "Configuration error: consolidated bucket '{}' is also listed in bucketsToConsolidate. \
+                     This would cause files to be counted twice, leading to incorrect results.",
+                    consolidated_name
+                ));
+            }
+        }
 
         // Log the buckets configuration at the start
         let archived_bucket_infos: Vec<BucketInfo> = archived_bucket_configs
@@ -290,10 +303,24 @@ impl Checker {
             let results = futures::future::join_all(file_lists_futures).await;
             for result in results {
                 match result {
-                    Ok(mut analysis) => file_lists.append(analysis.files.as_mut()),
+                    Ok(mut analysis) => {
+                        info!(
+                            bucket = %analysis.bucket,
+                            files_count = analysis.files.len(),
+                            total_size = analysis.total_archives_size,
+                            "Adding files from bucket to processing queue"
+                        );
+                        file_lists.append(analysis.files.as_mut());
+                    }
                     Err(e) => return Err(anyhow::anyhow!("Failed to list files in bucket: {}", e)),
                 }
             }
+
+            // Log total files to be processed
+            info!(
+                total_files = file_lists.len(),
+                "Total files to download and analyze"
+            );
 
             // let mut rng = rng();
             // file_lists.shuffle(&mut rng);
@@ -304,6 +331,16 @@ impl Checker {
         let character_counts_by_bucket = self
             .download_and_analyze_files_with_client(client, &file_lists[..])
             .await?;
+
+        // Log raw character counts per bucket for debugging
+        for (bucket_name, counts) in &character_counts_by_bucket {
+            info!(
+                bucket = %bucket_name,
+                total_chars = counts.total_excluding_newlines(),
+                total_chars_human = %human_bytes::human_bytes(counts.total_excluding_newlines() as f64),
+                "Raw character counts from processing"
+            );
+        }
 
         // Compute the sum of all archived character counts and collect per-bucket stats
         let mut total_archived_counts = DetailedCharacterCount::new();
