@@ -188,7 +188,9 @@ pub struct TimeStats {
 impl LogEntry {
     pub fn new(level: LogLevel, message: impl Into<String>) -> Self {
         Self {
-            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+            timestamp: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
             level,
             message: message.into(),
             ..Default::default()

@@ -129,7 +129,11 @@ pub struct MemoryMonitor {
 }
 
 impl MemoryMonitor {
-    pub fn new(memory_allocator: Arc<MemoryLimitedAllocator>, target_date: &str, target_hour: &str) -> Self {
+    pub fn new(
+        memory_allocator: Arc<MemoryLimitedAllocator>,
+        target_date: &str,
+        target_hour: &str,
+    ) -> Self {
         Self {
             memory_allocator,
             progress_tracker: None,
@@ -213,7 +217,8 @@ impl MemoryMonitor {
             };
 
             let elapsed = progress.start_time.elapsed();
-            let (time_stats, eta_str) = if let Some(remaining) = progress.estimated_time_remaining() {
+            let (time_stats, eta_str) = if let Some(remaining) = progress.estimated_time_remaining()
+            {
                 let completion_str = Self::calculate_completion_time(remaining);
                 let eta = Self::format_duration(remaining);
                 (
@@ -286,11 +291,9 @@ impl MemoryMonitor {
         if let Some(completion_time) = now.checked_add(remaining) {
             match completion_time.duration_since(SystemTime::UNIX_EPOCH) {
                 Ok(completion_datetime) => {
-                    let datetime = chrono::DateTime::from_timestamp(
-                        completion_datetime.as_secs() as i64,
-                        0,
-                    )
-                    .unwrap_or_else(|| chrono::Utc::now());
+                    let datetime =
+                        chrono::DateTime::from_timestamp(completion_datetime.as_secs() as i64, 0)
+                            .unwrap_or_else(|| chrono::Utc::now());
                     Some(datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                 }
                 Err(_) => None,
@@ -332,7 +335,11 @@ impl MemoryMonitor {
                                 &target_hour,
                             )
                         } else {
-                            MemoryMonitor::new(Arc::clone(&memory_allocator), &target_date, &target_hour)
+                            MemoryMonitor::new(
+                                Arc::clone(&memory_allocator),
+                                &target_date,
+                                &target_hour,
+                            )
                         };
                         monitor.log_memory_stats();
                     }

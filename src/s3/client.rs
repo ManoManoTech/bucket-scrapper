@@ -1,6 +1,7 @@
 // src/s3/client.rs
 // Location: src/s3/client.rs
 use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
+use crate::s3::dns_cache;
 use crate::utils::path_formatter::generate_path_formatter;
 use anyhow::Result;
 use aws_config::retry::RetryConfig;
@@ -33,6 +34,9 @@ impl WrappedS3Client {
     }
 
     async fn create_client(region: &str) -> Result<Client> {
+        // Pre-warm DNS cache if available to reduce DNS load
+        dns_cache::prewarm_global_dns_cache(region).await;
+
         let retry_config = RetryConfig::standard().with_max_attempts(3);
 
         let config = aws_config::defaults(BehaviorVersion::latest())
@@ -266,7 +270,17 @@ impl WrappedS3Client {
     /// Downloads an object from S3 and returns its contents as bytes
     pub async fn download_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let client = self.get_client().await?;
+        self.download_object_with_client(&client, bucket, key).await
+    }
 
+    /// Downloads an object using a provided client - use this when making multiple downloads
+    /// to avoid repeated get_client() overhead and reduce DNS lookups
+    pub async fn download_object_with_client(
+        &self,
+        client: &Client,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>> {
         debug!("Downloading object s3://{}/{}", bucket, key);
 
         let response = client

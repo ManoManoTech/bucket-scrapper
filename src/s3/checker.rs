@@ -92,7 +92,11 @@ impl Checker {
     }
 
     /// Get the memory monitor for signal handling
-    pub fn get_memory_monitor(&self, target_date: &str, target_hour: &str) -> Option<MemoryMonitor> {
+    pub fn get_memory_monitor(
+        &self,
+        target_date: &str,
+        target_hour: &str,
+    ) -> Option<MemoryMonitor> {
         Some(MemoryMonitor::with_progress(
             Arc::clone(&self.memory_allocator),
             self.progress_tracker.clone(),
@@ -281,19 +285,26 @@ impl Checker {
         .emit();
 
         // Get client once upfront for all listing operations to reduce DNS lookups
+        // This avoids repeated get_client() calls which acquire RwLock and may trigger DNS
         let client = self.s3_client.get_client().await?;
 
-        // Start listing files
+        // Start listing files - clone client for each concurrent future to avoid borrow issues
         let mut file_lists_futures = Vec::new();
-        file_lists_futures.push(self.list_bucket_files(
+        file_lists_futures.push(self.list_bucket_files_with_client(
+            &client,
             consolidated_bucket_config,
             date,
             hour,
             BucketRole::Consolidated,
         ));
         for &archived_bucket_config in archived_bucket_configs {
-            let future =
-                self.list_bucket_files(archived_bucket_config, date, hour, BucketRole::Archived);
+            let future = self.list_bucket_files_with_client(
+                &client,
+                archived_bucket_config,
+                date,
+                hour,
+                BucketRole::Archived,
+            );
             file_lists_futures.push(future);
         }
 

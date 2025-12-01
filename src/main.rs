@@ -9,6 +9,7 @@ use crate::config::loader::{
 };
 use crate::s3::checker::Checker;
 use crate::s3::client::WrappedS3Client;
+use crate::s3::dns_cache;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -126,7 +127,13 @@ async fn main() -> Result<()> {
     info!("Loading config from {}", cli.config.display());
     let config = load_config(&cli.config)?;
 
-    // Initialize S3 client
+    // Initialize DNS cache to reduce CoreDNS load when running many concurrent processes
+    // TTL of 300 seconds (5 minutes) - AWS endpoints are stable
+    if let Err(e) = dns_cache::init_global_dns_cache(300).await {
+        warn!(error = %e, "Failed to initialize DNS cache, continuing without caching");
+    }
+
+    // Initialize S3 client (will pre-warm DNS cache if available)
     let s3_client = WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?;
 
     match &cli.command {
@@ -151,8 +158,8 @@ async fn main() -> Result<()> {
                 date_hours.last().unwrap().hour,
             );
 
-            // Create a mutable reference to the client for use in this scope
-            let s3_client = s3_client;
+            // Get client once upfront to avoid repeated get_client() calls and DNS lookups
+            let client = s3_client.get_client().await?;
 
             // List files in archived buckets
             info!("Checking archived buckets");
@@ -162,7 +169,8 @@ async fn main() -> Result<()> {
 
                 for date_hour in &date_hours {
                     let result = s3_client
-                        .get_matching_filenames_from_s3(
+                        .get_matching_filenames_from_s3_with_client(
+                            &client,
                             bucket,
                             &date_hour.date,
                             &date_hour.hour,
@@ -197,7 +205,8 @@ async fn main() -> Result<()> {
 
                 for date_hour in &date_hours {
                     let result = s3_client
-                        .get_matching_filenames_from_s3(
+                        .get_matching_filenames_from_s3_with_client(
+                            &client,
                             bucket,
                             &date_hour.date,
                             &date_hour.hour,
@@ -373,6 +382,9 @@ async fn main() -> Result<()> {
                 "Reading check results from bucket"
             );
 
+            // Get client once upfront to avoid repeated get_client() calls and DNS lookups
+            let client = s3_client.get_client().await?;
+
             // Build results dictionary
             let mut results: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -381,7 +393,8 @@ async fn main() -> Result<()> {
 
                 // List files for this date/hour
                 let file_list = s3_client
-                    .get_matching_filenames_from_s3(
+                    .get_matching_filenames_from_s3_with_client(
+                        &client,
                         results_bucket,
                         &date_hour.date,
                         &date_hour.hour,
@@ -407,9 +420,11 @@ async fn main() -> Result<()> {
                     "Found check results"
                 );
 
-                // Download each result file
+                // Download each result file using the same client to avoid DNS lookups
                 for file in &file_list.files {
-                    let bytes = s3_client.download_object(&file.bucket, &file.key).await?;
+                    let bytes = s3_client
+                        .download_object_with_client(&client, &file.bucket, &file.key)
+                        .await?;
                     let json: serde_json::Value = serde_json::from_slice(&bytes)
                         .with_context(|| format!("Failed to parse JSON from {}", file.key))?;
                     results.insert(key.clone(), json);

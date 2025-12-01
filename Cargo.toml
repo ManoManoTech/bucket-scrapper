@@ -37,6 +37,10 @@ backon = "1.4.0"
 jemallocator = "0.3.2"
 testcontainers = { version = "0.23", features = ["blocking"] }
 
+# DNS caching to reduce CoreDNS load
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+moka = { version = "0.12", features = ["future"] }
+
 [dev-dependencies]
 testcontainers = { version = "0.23" }
 testcontainers-modules = { version = "0.11", features = ["minio"] }
