@@ -74,6 +74,27 @@ impl WrappedS3Client {
         hour: &HourString,
         will_filter: bool,
     ) -> Result<S3FileList> {
+        let client = self.get_client().await?;
+        self.get_matching_filenames_from_s3_with_client(
+            &client,
+            bucket_config,
+            date,
+            hour,
+            will_filter,
+        )
+        .await
+    }
+
+    /// Lists objects using a provided client - use this when making multiple calls
+    /// to avoid repeated get_client() overhead
+    pub async fn get_matching_filenames_from_s3_with_client(
+        &self,
+        client: &Client,
+        bucket_config: &BucketConfig,
+        date: &DateString,
+        hour: &HourString,
+        will_filter: bool,
+    ) -> Result<S3FileList> {
         let formatter = generate_path_formatter(bucket_config);
         let prefix = formatter(date, hour)?;
         let bucket = &bucket_config.bucket;
@@ -103,7 +124,6 @@ impl WrappedS3Client {
                 prefix, bucket, continuation_token
             );
 
-            let client = self.get_client().await?;
             let list_objects_req = client.list_objects_v2().bucket(bucket).prefix(&prefix);
 
             let list_objects_req = if let Some(token) = &continuation_token {
@@ -112,7 +132,18 @@ impl WrappedS3Client {
                 list_objects_req
             };
 
-            let response = list_objects_req.send().await?;
+            let response = list_objects_req.send().await.map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("dispatch failure") {
+                    anyhow::anyhow!(
+                        "S3 request failed: {}. This often indicates expired AWS credentials. \
+                         Try running 'aws sso login' or check your AWS_* environment variables.",
+                        err_msg
+                    )
+                } else {
+                    anyhow::anyhow!("S3 request to bucket '{}' failed: {}", bucket, err_msg)
+                }
+            })?;
             debug!(
                 "Got {} objects for {} in {}",
                 response.contents().len(),

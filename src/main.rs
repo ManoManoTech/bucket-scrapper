@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use jemallocator::Jemalloc;
+use log::{info, warn, LevelFilter};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -56,9 +57,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Log level (trace, debug, info, warn, error)
+    /// Log level
     #[arg(short, long, default_value = "info")]
-    log_level: String,
+    log_level: LevelFilter,
 }
 
 #[derive(Subcommand)]
@@ -90,18 +91,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging with JSON format
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
-
-    fmt()
-        .json()
-        .flatten_event(true)
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
+    // Initialize logging
+    env_logger::builder()
+        .filter_level(cli.log_level)
+        .format_timestamp_millis()
         .init();
 
     // Load configuration
@@ -208,10 +201,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Check { date, hour } => {
-            info!(target_date = %date, target_hour = %hour, "Starting consolidation check");
 
             // Log memory buffer settings
-            info!(target_date = %date, target_hour = %hour, memory_pool_mb = cli.memory_pool_mb, "Memory pool configured");
 
             // Create a checker with memory limits
             let checker = Checker::new(
@@ -223,18 +214,19 @@ async fn main() -> Result<()> {
 
             // Set up signal handler for memory monitoring if enabled
             if cli.enable_signals {
+                info!("Setting up signal handler for memory monitoring (SIGUSR2)");
+
                 // Get references to memory allocators from the checker
-                if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
                     if let Err(e) = memory_monitor.setup_signal_handler() {
-                        warn!(target_date = %date, target_hour = %hour, error = %e, "Failed to set up signal handler");
                     } else {
-                        info!(target_date = %date, target_hour = %hour, pid = std::process::id(), "Signal handler ready (SIGUSR2)");
                     }
+
+                    // Log initial memory stats
+                    // memory_monitor.log_memory_stats();
                 }
             }
 
             // Spawn a background task for periodic updates
-            if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
                 tokio::spawn(async move {
                     loop {
                         // Display stats
@@ -258,9 +250,59 @@ async fn main() -> Result<()> {
                 .get_comparison_results(&archived_buckets, consolidated_bucket, date, hour)
                 .await?;
 
+	    // Generate PGM visualizations
+            {
+                use crate::utils::pgm_visualizer::PgmVisualizer;
+
+                let visualizer = PgmVisualizer::with_default();
+                match visualizer.generate_visualization(
+                    &result.archived_counts,
+                    &result.consolidated_counts,
+                    &result.differences,
+                ) {
+                    Ok(_) => {
+                        info!("Generated PGM visualizations:");
+                        info!("  - /tmp/lhs.pgm (archived counts)");
+                        info!("  - /tmp/rhs.pgm (consolidated counts)");
+                        info!("  - /tmp/diff.pgm (differences)");
+                    }
+                    Err(e) => {
+                        warn!("Failed to generate PGM visualizations: {}", e);
+                    }
+                }
+            }
+
+            // Output result
+            if result.ok {
+                info!("✅ Check passed for {}/{}", date, hour);
+                info!("Message: {}", result.message);
+
+                // info!("Archived buckets:");
+                // for (i, archived) in result.archived_data.iter().enumerate() {
+                //     info!(
+                //         "  {}: {} files in {} (total size: {} bytes)",
+                //         i + 1,
+                //         archived.files.len(),
+                //         archived.bucket,
+                //         archived.total_archives_size
+                //     );
+                // }
+                //
+                // info!(
+                //     "Consolidated bucket: {} files in {} (total size: {} bytes)",
+                //     result.consolidated_data.files.len(),
+                //     result.consolidated_data.bucket,
+                //     result.consolidated_data.total_archives_size
+                // );
+            } else {
+                warn!("❌ Check failed for {}/{}", date, hour);
+                warn!("Message: {}", result.message);
+
+                // In a real implementation, we would output detailed failure information
+            }
+
             // Log final memory stats if signal handling is enabled
             if cli.enable_signals {
-                if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
                     memory_monitor.log_memory_stats();
                 }
             }

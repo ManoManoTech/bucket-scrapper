@@ -14,6 +14,10 @@ use crate::utils::structured_log::{
 use anyhow::Result;
 use chrono::Utc;
 use crc32fast::Hasher;
+use env_logger::Logger;
+use log::{error, info, warn};
+use rand::prelude::SliceRandom;
+use rand::rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -52,6 +56,12 @@ pub struct ComparisonResult {
     pub analysis_start_date: String,
     /// When the analysis ended
     pub analysis_end_date: String,
+    /// Detailed character counts from archived buckets
+    pub archived_counts: DetailedCharacterCount,
+    /// Detailed character counts from consolidated bucket
+    pub consolidated_counts: DetailedCharacterCount,
+    /// Differences between archived and consolidated (byte index -> difference)
+    pub differences: HashMap<usize, i64>,
 }
 
 pub struct Checker {
@@ -102,6 +112,20 @@ impl Checker {
         hour: &HourString,
         role: BucketRole,
     ) -> Result<S3FileList> {
+        let client = self.s3_client.get_client().await?;
+        self.list_bucket_files_with_client(&client, bucket_config, date, hour)
+            .await
+    }
+
+    /// List bucket files using a provided client - reduces DNS lookups when
+    /// listing multiple buckets
+    pub async fn list_bucket_files_with_client(
+        &self,
+        client: &aws_sdk_s3::Client,
+        bucket_config: &BucketConfig,
+        date: &DateString,
+        hour: &HourString,
+    ) -> Result<S3FileList> {
         let bucket = &bucket_config.bucket;
         let key_prefix = {
             let formatter = crate::utils::path_formatter::generate_path_formatter(bucket_config);
@@ -124,7 +148,7 @@ impl Checker {
 
         let file_list = self
             .s3_client
-            .get_matching_filenames_from_s3(bucket_config, date, hour, true)
+            .get_matching_filenames_from_s3_with_client(client, bucket_config, date, hour, true)
             .await?;
 
         LogEntry::info(format!(
@@ -152,6 +176,17 @@ impl Checker {
     /// Analyze a bucket for a specific date and hour
     pub async fn download_and_analyze_files(
         &self,
+        objects: &[S3ObjectInfo],
+    ) -> Result<HashMap<String, DetailedCharacterCount>> {
+        let client = self.s3_client.get_client().await?;
+        self.download_and_analyze_files_with_client(client, objects)
+            .await
+    }
+
+    /// Analyze files using a provided client - reduces DNS lookups when reusing client
+    pub async fn download_and_analyze_files_with_client(
+        &self,
+        client: aws_sdk_s3::Client,
         objects: &[S3ObjectInfo],
     ) -> Result<HashMap<String, DetailedCharacterCount>> {
         let downloader = DownloadOrchestrator::new(
@@ -232,6 +267,9 @@ impl Checker {
         })
         .emit();
 
+        // Get client once upfront for all listing operations to reduce DNS lookups
+        let client = self.s3_client.get_client().await?;
+
         // Start listing files
         let mut file_lists_futures = Vec::new();
         file_lists_futures.push(self.list_bucket_files(
@@ -262,7 +300,10 @@ impl Checker {
             file_lists.sort_by(|a, b| b.size.cmp(&a.size));
         }
 
-        let character_counts_by_bucket = self.download_and_analyze_files(&file_lists[..]).await?;
+        // Reuse the same client for downloads to avoid additional DNS lookups
+        let character_counts_by_bucket = self
+            .download_and_analyze_files_with_client(client, &file_lists[..])
+            .await?;
 
         // Compute the sum of all archived character counts and collect per-bucket stats
         let mut total_archived_counts = DetailedCharacterCount::new();
@@ -281,9 +322,17 @@ impl Checker {
         }
 
         // Find the consolidated character count
-        let consolidated_character_count = character_counts_by_bucket
-            .get(&consolidated_bucket_config.bucket)
-            .unwrap();
+        let consolidated_character_count =
+            match character_counts_by_bucket.get(&consolidated_bucket_config.bucket) {
+                Some(ccc) => ccc,
+                None => {
+                    error!(
+                        "missing character count for consolidated bucket: {}",
+                        consolidated_bucket_config.bucket
+                    );
+                    &DetailedCharacterCount::new()
+                }
+            };
 
         let consolidated_total = consolidated_character_count.total_excluding_newlines();
         per_bucket_stats.push(BucketCharacterStats::consolidated(
@@ -328,6 +377,9 @@ impl Checker {
                 message: "Consolidated size matches original size".to_string(),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
+                archived_counts: total_archived_counts.clone(),
+                consolidated_counts: consolidated_character_count.clone(),
+                differences,
             }
         } else {
             // Format differences for logging
@@ -384,6 +436,9 @@ impl Checker {
                 ),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
+                archived_counts: total_archived_counts.clone(),
+                consolidated_counts: consolidated_character_count.clone(),
+                differences,
             }
         };
 

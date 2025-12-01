@@ -2,7 +2,7 @@
 use crate::config::types::S3ObjectInfo;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use aws_sdk_s3::Client;
 use backon::ExponentialBuilder;
 use backon::Retryable;
@@ -69,20 +69,30 @@ impl Downloader {
 
             let handle = tokio::spawn(async move {
                 let inner_result = async || {
+                    // Pass references - avoid cloning inside the retry closure to reduce overhead
                     Self::download_object(
-                        &client_clone.clone(),
-                        &bucket_str.clone(),
-                        &obj_clone.clone(),
+                        &client_clone,
+                        &bucket_str,
+                        &obj_clone,
                         tx_clone.clone(),
-                        allocator.clone(),
+                        Arc::clone(&allocator),
                         progress_tracker.clone(),
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::Error::msg(format!(
-                            "download error {}/{}: '{}'",
-                            bucket_str, obj_clone.key, e
-                        ))
+                        let err_msg = e.to_string();
+                        if err_msg.contains("dispatch failure") {
+                            anyhow::anyhow!(
+                                "S3 download failed for {}/{}: {}. \
+                                 This often indicates expired AWS credentials - try 'aws sso login'",
+                                bucket_str, obj_clone.key, err_msg
+                            )
+                        } else {
+                            anyhow::anyhow!(
+                                "download error {}/{}: '{}'",
+                                bucket_str, obj_clone.key, err_msg
+                            )
+                        }
                     })
                 };
 
@@ -164,7 +174,19 @@ impl Downloader {
             .key(&obj.key)
             .send()
             .await
-            .with_context(|| format!("Failed to download S3 object: {}", obj.key))?;
+            .map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("dispatch failure") {
+                    anyhow::anyhow!(
+                        "S3 request failed for {}: {}. \
+                         This often indicates expired AWS credentials - try 'aws sso login'",
+                        obj.key,
+                        err_msg
+                    )
+                } else {
+                    anyhow::anyhow!("Failed to download S3 object {}: {}", obj.key, err_msg)
+                }
+            })?;
 
         // Read the stream into our memory-limited buffer
         let byte_stream = resp.body;

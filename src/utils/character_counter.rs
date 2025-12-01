@@ -4,7 +4,7 @@
 use std::ops::AddAssign;
 
 /// Stores character count information for files
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DetailedCharacterCount {
     /// Counts of each ASCII character (0-255)
     pub bucket: String,

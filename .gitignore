@@ -1,3 +1,4 @@
 /target
 generated
 tests/minio_data/
+log-consolidator-checker-rust
