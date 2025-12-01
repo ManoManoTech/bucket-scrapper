@@ -4,13 +4,16 @@ mod config;
 mod s3;
 mod utils;
 
-use crate::config::loader::{get_archived_buckets, get_consolidated_buckets, load_config};
+use crate::config::loader::{
+    get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config,
+};
 use crate::s3::checker::Checker;
 use crate::s3::client::WrappedS3Client;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use jemallocator::Jemalloc;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -83,6 +86,21 @@ enum Commands {
         /// Hour in HH format (00-23)
         #[arg(short = 'H', long)]
         hour: String,
+    },
+
+    /// Generate a recap/summary of consolidation checks over a date range
+    Recap {
+        /// Start date in ISO 8601 format (e.g. 2023-01-01T00:00:00Z)
+        #[arg(short, long)]
+        start: String,
+
+        /// End date in ISO 8601 format (e.g. 2023-01-01T01:00:00Z)
+        #[arg(short, long)]
+        end: String,
+
+        /// Output format (json, text, csv)
+        #[arg(short, long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -258,7 +276,7 @@ async fn main() -> Result<()> {
                 .get_comparison_results(&archived_buckets, consolidated_bucket, date, hour)
                 .await?;
 
-	    // Generate PGM visualizations
+            // Generate PGM visualizations
             {
                 use crate::utils::pgm_visualizer::PgmVisualizer;
 
@@ -322,6 +340,98 @@ async fn main() -> Result<()> {
             } else {
                 error!(target_date = %date, target_hour = %hour, message = %result.message, "Check failed");
                 std::process::exit(1);
+            }
+        }
+
+        Commands::Recap { start, end, format } => {
+            // Parse dates
+            let start_date = DateTime::parse_from_rfc3339(start)
+                .with_context(|| format!("Invalid start date: {}", start))?
+                .with_timezone(&Utc);
+
+            let end_date = DateTime::parse_from_rfc3339(end)
+                .with_context(|| format!("Invalid end date: {}", end))?
+                .with_timezone(&Utc);
+
+            // Get date range
+            let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
+            info!(
+                "Generating recap for {} hours (from {}/{} to {}/{})",
+                date_hours.len(),
+                date_hours.first().unwrap().date,
+                date_hours.first().unwrap().hour,
+                date_hours.last().unwrap().date,
+                date_hours.last().unwrap().hour,
+            );
+
+            // Get results bucket config
+            let results_bucket = get_results_bucket(&config)
+                .ok_or_else(|| anyhow::anyhow!("No results bucket configured"))?;
+
+            info!(
+                bucket = %results_bucket.bucket,
+                "Reading check results from bucket"
+            );
+
+            // Build results dictionary
+            let mut results: HashMap<String, serde_json::Value> = HashMap::new();
+
+            for date_hour in &date_hours {
+                let key = format!("{}/{}", date_hour.date, date_hour.hour);
+
+                // List files for this date/hour
+                let file_list = s3_client
+                    .get_matching_filenames_from_s3(
+                        results_bucket,
+                        &date_hour.date,
+                        &date_hour.hour,
+                        false,
+                    )
+                    .await?;
+
+                if file_list.files.is_empty() {
+                    warn!(
+                        date = %date_hour.date,
+                        hour = %date_hour.hour,
+                        prefix = %file_list.key_prefix,
+                        "No check results found"
+                    );
+                    continue;
+                }
+
+                info!(
+                    date = %date_hour.date,
+                    hour = %date_hour.hour,
+                    prefix = %file_list.key_prefix,
+                    file_count = file_list.files.len(),
+                    "Found check results"
+                );
+
+                // Download each result file
+                for file in &file_list.files {
+                    let bytes = s3_client.download_object(&file.bucket, &file.key).await?;
+                    let json: serde_json::Value = serde_json::from_slice(&bytes)
+                        .with_context(|| format!("Failed to parse JSON from {}", file.key))?;
+                    results.insert(key.clone(), json);
+                }
+            }
+
+            info!(count = results.len(), "Collected check results");
+
+            // Output based on format
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&results)?),
+                "text" => {
+                    // TODO: Implement human-readable text summary
+                    info!("Text format not yet implemented, falling back to JSON");
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                }
+                "csv" => {
+                    // TODO: Implement CSV output format
+                    info!("CSV format not yet implemented, falling back to JSON");
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                }
+                _ => return Err(anyhow::anyhow!("Unknown format: {}", format)),
             }
         }
     }

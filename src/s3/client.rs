@@ -262,4 +262,46 @@ impl WrappedS3Client {
             total_archives_size: filtered.1,
         })
     }
+
+    /// Downloads an object from S3 and returns its contents as bytes
+    pub async fn download_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        let client = self.get_client().await?;
+
+        debug!("Downloading object s3://{}/{}", bucket, key);
+
+        let response = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("dispatch failure") {
+                    anyhow::anyhow!(
+                        "S3 download failed: {}. This often indicates expired AWS credentials. \
+                         Try running 'aws sso login' or check your AWS_* environment variables.",
+                        err_msg
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "S3 download from bucket '{}' key '{}' failed: {}",
+                        bucket,
+                        key,
+                        err_msg
+                    )
+                }
+            })?;
+
+        let bytes = response.body.collect().await?.into_bytes().to_vec();
+
+        debug!(
+            "Downloaded {} bytes from s3://{}/{}",
+            bytes.len(),
+            bucket,
+            key
+        );
+
+        Ok(bytes)
+    }
 }
