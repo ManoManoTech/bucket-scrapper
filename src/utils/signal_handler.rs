@@ -1,5 +1,6 @@
 // src/utils/signal_handler.rs
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
+use crate::utils::structured_log::{LogEntry, MemoryStats, ProgressStats, TimeStats};
 use human_bytes::human_bytes;
 use signal_hook::{consts::SIGUSR2, iterator::Signals};
 use std::sync::{
@@ -8,7 +9,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{info, warn};
+use tracing::info;
 
 // Shared reference to indicate if the signal handler is already running
 static SIGNAL_HANDLER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -123,35 +124,32 @@ impl Default for ProgressTracker {
 pub struct MemoryMonitor {
     memory_allocator: Arc<MemoryLimitedAllocator>,
     progress_tracker: Option<Arc<ProgressTracker>>,
+    target_date: String,
+    target_hour: String,
 }
 
 impl MemoryMonitor {
-    pub fn new(memory_allocator: Arc<MemoryLimitedAllocator>) -> Self {
+    pub fn new(memory_allocator: Arc<MemoryLimitedAllocator>, target_date: &str, target_hour: &str) -> Self {
         Self {
             memory_allocator,
             progress_tracker: None,
+            target_date: target_date.to_string(),
+            target_hour: target_hour.to_string(),
         }
     }
 
     pub fn with_progress(
         memory_allocator: Arc<MemoryLimitedAllocator>,
         progress_tracker: Arc<ProgressTracker>,
+        target_date: &str,
+        target_hour: &str,
     ) -> Self {
         Self {
             memory_allocator,
             progress_tracker: Some(progress_tracker),
+            target_date: target_date.to_string(),
+            target_hour: target_hour.to_string(),
         }
-    }
-
-    // Format memory usage as human-readable strings
-    fn format_memory_stats(&self) -> (String, String) {
-        let (memory_used, memory_total) = self.memory_allocator.stats();
-
-        // Format with human-readable values
-        (
-            human_bytes(memory_used as f64),
-            human_bytes(memory_total as f64),
-        )
     }
 
     // Format duration to a human-readable string
@@ -170,94 +168,136 @@ impl MemoryMonitor {
         }
     }
 
-    // Log memory usage statistics in human-readable format
+    // Log memory usage statistics as a single structured JSON object
     pub fn log_memory_stats(&self) {
-        let (memory_used, memory_total) = self.format_memory_stats();
-
-        // Calculate percentages
         let (memory_used_raw, memory_total_raw) = self.memory_allocator.stats();
+        let (memory_waiters, memory_waiters_size, loan_count) =
+            self.memory_allocator.waiters_count_and_size();
 
         let memory_percent = if memory_total_raw > 0 {
-            (memory_used_raw as f64 / memory_total_raw as f64) * 100.0
+            ((memory_used_raw as f64 / memory_total_raw as f64) * 1000.0).round() / 10.0
         } else {
             0.0
         };
 
-        // Get waiters count
-        let (memory_waiters, memory_waiters_size, loan_count) =
-            self.memory_allocator.waiters_count_and_size();
-        let waiters_size_human = human_bytes(memory_waiters_size as f64);
-
-        info!("======= MEMORY USAGE STATS =======");
-        info!(
-            "Memory pool: {} loans, {}/{} ({:.1}%) with {} waiters (waiting for {} of memory)",
+        let memory_stats = MemoryStats {
             loan_count,
-            memory_used,
-            memory_total,
-            memory_percent,
-            memory_waiters,
-            waiters_size_human
-        );
+            used: human_bytes(memory_used_raw as f64),
+            used_bytes: memory_used_raw,
+            total: human_bytes(memory_total_raw as f64),
+            total_bytes: memory_total_raw,
+            percent: memory_percent,
+            waiters: memory_waiters,
+            waiters_size: human_bytes(memory_waiters_size as f64),
+        };
 
-        // Add progress information if available
-        if let Some(progress) = &self.progress_tracker {
-            let percent_files = progress.percent_complete_files();
-            let percent_bytes = progress.percent_complete_bytes();
-            let speed = progress.processing_speed_mb_per_sec();
+        let (progress_stats, time_stats, message) = if let Some(progress) = &self.progress_tracker {
+            let completed_files = progress.completed_files.load(Ordering::SeqCst);
+            let total_files = progress.total_files.load(Ordering::SeqCst);
+            let processed_bytes_raw = progress.processed_bytes.load(Ordering::SeqCst);
+            let total_bytes_raw = progress.total_bytes.load(Ordering::SeqCst);
+            let percent_files = (progress.percent_complete_files() * 10.0).round() / 10.0;
+            let percent_bytes = (progress.percent_complete_bytes() * 10.0).round() / 10.0;
+            let speed = (progress.processing_speed_mb_per_sec() * 100.0).round() / 100.0;
 
-            info!("======= PROGRESS STATS =======");
-            info!(
-                "Files processed: {}/{} ({:.1}%)",
-                progress.completed_files.load(Ordering::SeqCst),
-                progress.total_files.load(Ordering::SeqCst),
-                percent_files
-            );
-            info!(
-                "Bytes processed: {}/{} ({:.1}%)",
-                human_bytes(progress.processed_bytes.load(Ordering::SeqCst) as f64),
-                human_bytes(progress.total_bytes.load(Ordering::SeqCst) as f64),
-                percent_bytes
-            );
-            info!("Processing speed: {:.2} MB/s", speed);
+            let progress_stats = ProgressStats {
+                completed_files,
+                total_files,
+                percent_files,
+                processed_bytes: human_bytes(processed_bytes_raw as f64),
+                processed_bytes_raw,
+                total_bytes: human_bytes(total_bytes_raw as f64),
+                total_bytes_raw,
+                percent_bytes,
+                speed_mb_per_sec: speed,
+            };
 
-            // Show elapsed time
             let elapsed = progress.start_time.elapsed();
-            info!("Elapsed time: {}", Self::format_duration(elapsed));
+            let (time_stats, eta_str) = if let Some(remaining) = progress.estimated_time_remaining() {
+                let completion_str = Self::calculate_completion_time(remaining);
+                let eta = Self::format_duration(remaining);
+                (
+                    TimeStats {
+                        elapsed: Self::format_duration(elapsed),
+                        elapsed_secs: elapsed.as_secs(),
+                        remaining: Some(eta.clone()),
+                        remaining_secs: Some(remaining.as_secs()),
+                        estimated_completion: completion_str,
+                    },
+                    eta,
+                )
+            } else {
+                (
+                    TimeStats {
+                        elapsed: Self::format_duration(elapsed),
+                        elapsed_secs: elapsed.as_secs(),
+                        remaining: None,
+                        remaining_secs: None,
+                        estimated_completion: None,
+                    },
+                    "calculating...".to_string(),
+                )
+            };
 
-            // Show estimated time remaining if available
-            if let Some(remaining) = progress.estimated_time_remaining() {
-                info!(
-                    "Estimated time remaining: {}",
-                    Self::format_duration(remaining)
-                );
+            let message = format!(
+                "Checking {}/{}: {}/{} files ({:.1}%), {}/{} processed, {:.2} MB/s, elapsed {}, ETA {}",
+                self.target_date,
+                self.target_hour,
+                completed_files,
+                total_files,
+                percent_files,
+                human_bytes(processed_bytes_raw as f64),
+                human_bytes(total_bytes_raw as f64),
+                speed,
+                Self::format_duration(elapsed),
+                eta_str
+            );
 
-                // Calculate estimated completion time
-                let now = SystemTime::now();
-                // Fixed: checked_add returns Option not Result
-                if let Some(completion_time) = now.checked_add(remaining) {
-                    match completion_time.duration_since(SystemTime::UNIX_EPOCH) {
-                        Ok(completion_datetime) => {
-                            let datetime = chrono::DateTime::from_timestamp(
-                                completion_datetime.as_secs() as i64,
-                                0,
-                            )
-                            .unwrap_or_else(|| chrono::Utc::now());
+            (Some(progress_stats), Some(time_stats), message)
+        } else {
+            let message = format!(
+                "Checking {}/{}: memory {}/{} ({:.1}%)",
+                self.target_date,
+                self.target_hour,
+                memory_stats.used,
+                memory_stats.total,
+                memory_stats.percent
+            );
+            (None, None, message)
+        };
 
-                            info!(
-                                "Estimated completion time: {}",
-                                datetime.format("%Y-%m-%d %H:%M:%S %Z")
-                            );
-                        }
-                        Err(_) => {
-                            // This shouldn't happen with reasonable timestamps
-                            warn!("Could not calculate completion time");
-                        }
-                    }
-                }
-            }
+        let mut entry = LogEntry::info(message)
+            .with_target("log_consolidator_checker_rust::utils::signal_handler")
+            .with_date_hour(&self.target_date, &self.target_hour)
+            .with_memory(memory_stats);
+
+        if let Some(progress) = progress_stats {
+            entry = entry.with_progress(progress);
+        }
+        if let Some(time) = time_stats {
+            entry = entry.with_time(time);
         }
 
-        info!("=================================");
+        entry.emit();
+    }
+
+    fn calculate_completion_time(remaining: Duration) -> Option<String> {
+        let now = SystemTime::now();
+        if let Some(completion_time) = now.checked_add(remaining) {
+            match completion_time.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(completion_datetime) => {
+                    let datetime = chrono::DateTime::from_timestamp(
+                        completion_datetime.as_secs() as i64,
+                        0,
+                    )
+                    .unwrap_or_else(|| chrono::Utc::now());
+                    Some(datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
     }
 
     // Setup signal handler for SIGUSR2
@@ -273,6 +313,8 @@ impl MemoryMonitor {
 
         let memory_allocator = Arc::clone(&self.memory_allocator);
         let progress_tracker = self.progress_tracker.clone();
+        let target_date = self.target_date.clone();
+        let target_hour = self.target_hour.clone();
 
         // Set up signals
         let mut signals = Signals::new(&[SIGUSR2])?;
@@ -286,9 +328,11 @@ impl MemoryMonitor {
                             MemoryMonitor::with_progress(
                                 Arc::clone(&memory_allocator),
                                 Arc::clone(tracker),
+                                &target_date,
+                                &target_hour,
                             )
                         } else {
-                            MemoryMonitor::new(Arc::clone(&memory_allocator))
+                            MemoryMonitor::new(Arc::clone(&memory_allocator), &target_date, &target_hour)
                         };
                         monitor.log_memory_stats();
                     }
@@ -297,7 +341,7 @@ impl MemoryMonitor {
             }
         });
 
-        info!("Signal handler set up for SIGUSR2 to report memory allocator status and progress");
+        info!(target_date = %self.target_date, target_hour = %self.target_hour, "Signal handler set up for SIGUSR2");
         Ok(())
     }
 }

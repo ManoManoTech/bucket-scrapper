@@ -7,14 +7,16 @@ use crate::s3::downloader::DownloadOrchestrator;
 use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::{MemoryMonitor, ProgressTracker};
+use crate::utils::structured_log::{
+    BucketCharacterStats, BucketInfo, BucketRole, BucketsConfig, CharacterStats, CheckResult,
+    FileStats, LogEntry,
+};
 use anyhow::Result;
 use chrono::Utc;
 use crc32fast::Hasher;
-use rand::prelude::SliceRandom;
-use rand::rng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Analysis data for a bucket at a specific date/hour
 #[derive(Debug)]
@@ -84,10 +86,12 @@ impl Checker {
     }
 
     /// Get the memory monitor for signal handling
-    pub fn get_memory_monitor(&self) -> Option<MemoryMonitor> {
+    pub fn get_memory_monitor(&self, target_date: &str, target_hour: &str) -> Option<MemoryMonitor> {
         Some(MemoryMonitor::with_progress(
             Arc::clone(&self.memory_allocator),
             self.progress_tracker.clone(),
+            target_date,
+            target_hour,
         ))
     }
 
@@ -96,6 +100,7 @@ impl Checker {
         bucket_config: &BucketConfig,
         date: &DateString,
         hour: &HourString,
+        role: BucketRole,
     ) -> Result<S3FileList> {
         let bucket = &bucket_config.bucket;
         let key_prefix = {
@@ -103,19 +108,44 @@ impl Checker {
             formatter(date, hour)?
         };
 
-        info!("Enumerating files for {} {}", bucket, key_prefix);
+        let role_str = match role {
+            BucketRole::Archived => "archived",
+            BucketRole::Consolidated => "consolidated",
+        };
+
+        info!(
+            target_date = %date,
+            target_hour = %hour,
+            bucket = %bucket,
+            key_prefix = %key_prefix,
+            role = %role_str,
+            "Listing files in bucket"
+        );
+
         let file_list = self
             .s3_client
             .get_matching_filenames_from_s3(bucket_config, date, hour, true)
             .await?;
 
-        info!(
-            "Bucket {}: {} files, totaling {} bytes, file list checksum {}",
+        LogEntry::info(format!(
+            "Bucket {} ({}): {} files, {} total, checksum {}",
             bucket,
+            role_str,
             file_list.files.len(),
-            file_list.total_archives_size,
-            file_list.checksum
-        );
+            human_bytes::human_bytes(file_list.total_archives_size as f64),
+            &file_list.checksum[..8]
+        ))
+        .with_target("log_consolidator_checker_rust::s3::checker")
+        .with_date_hour(date, hour)
+        .with_bucket(
+            BucketInfo::new(bucket, role).with_patterns(bucket_config.only_prefix_patterns.clone()),
+        )
+        .with_file_stats(
+            FileStats::new(file_list.files.len(), file_list.total_archives_size)
+                .with_checksum(file_list.checksum.clone()),
+        )
+        .emit();
+
         Ok(file_list)
     }
 
@@ -170,14 +200,49 @@ impl Checker {
     ) -> Result<ComparisonResult> {
         let start_time = Utc::now();
 
-        info!("Getting comparison results for {}/{}", date, hour);
+        // Log the buckets configuration at the start
+        let archived_bucket_infos: Vec<BucketInfo> = archived_bucket_configs
+            .iter()
+            .map(|b| BucketInfo::archived(&b.bucket).with_patterns(b.only_prefix_patterns.clone()))
+            .collect();
+
+        let consolidated_bucket_info = BucketInfo::consolidated(&consolidated_bucket_config.bucket)
+            .with_patterns(consolidated_bucket_config.only_prefix_patterns.clone());
+
+        let archived_names: Vec<&str> = archived_bucket_configs
+            .iter()
+            .map(|b| b.bucket.as_str())
+            .collect();
+
+        LogEntry::info(format!(
+            "Starting check for {}/{}: {} archived buckets [{}] vs consolidated [{}]",
+            date,
+            hour,
+            archived_bucket_configs.len(),
+            archived_names.join(", "),
+            consolidated_bucket_config.bucket
+        ))
+        .with_target("log_consolidator_checker_rust::s3::checker")
+        .with_date_hour(date, hour)
+        .with_buckets(BucketsConfig {
+            archived: archived_bucket_infos,
+            consolidated: consolidated_bucket_info,
+            archived_count: archived_bucket_configs.len(),
+            total_count: archived_bucket_configs.len() + 1,
+        })
+        .emit();
 
         // Start listing files
-        info!("Listing files accross buckets");
         let mut file_lists_futures = Vec::new();
-        file_lists_futures.push(self.list_bucket_files(consolidated_bucket_config, date, hour));
+        file_lists_futures.push(self.list_bucket_files(
+            consolidated_bucket_config,
+            date,
+            hour,
+            BucketRole::Consolidated,
+        ));
         for &archived_bucket_config in archived_bucket_configs {
-            let future = self.list_bucket_files(archived_bucket_config, date, hour);
+            let future =
+                self.list_bucket_files(archived_bucket_config, date, hour, BucketRole::Archived);
             file_lists_futures.push(future);
         }
 
@@ -199,16 +264,20 @@ impl Checker {
 
         let character_counts_by_bucket = self.download_and_analyze_files(&file_lists[..]).await?;
 
-        // Analyze the archived buckets in parallel
-        info!("Analyzing archived buckets");
-
-        // Compute the sum of all archived character counts
+        // Compute the sum of all archived character counts and collect per-bucket stats
         let mut total_archived_counts = DetailedCharacterCount::new();
+        let mut per_bucket_stats: Vec<BucketCharacterStats> = Vec::new();
+
         for archived_info in archived_bucket_configs {
             let bucket_character_count = character_counts_by_bucket
                 .get(&archived_info.bucket)
                 .unwrap();
-            total_archived_counts.add(&bucket_character_count);
+            let total_chars = bucket_character_count.total_excluding_newlines();
+            per_bucket_stats.push(BucketCharacterStats::archived(
+                &archived_info.bucket,
+                total_chars,
+            ));
+            total_archived_counts.add(bucket_character_count);
         }
 
         // Find the consolidated character count
@@ -216,22 +285,47 @@ impl Checker {
             .get(&consolidated_bucket_config.bucket)
             .unwrap();
 
+        let consolidated_total = consolidated_character_count.total_excluding_newlines();
+        per_bucket_stats.push(BucketCharacterStats::consolidated(
+            &consolidated_bucket_config.bucket,
+            consolidated_total,
+        ));
+
+        let archived_total = total_archived_counts.total_excluding_newlines();
+
         // Compare character counts
         let (detailed_ok, differences) =
-            total_archived_counts.compare(&consolidated_character_count);
+            total_archived_counts.compare(consolidated_character_count);
 
         // Generate result
         let end_time = Utc::now();
+        let duration = end_time - start_time;
 
         let result = if detailed_ok {
-            info!("No size difference for {}/{}", date, hour);
+            // Log successful character stats
+            LogEntry::info(format!(
+                "✅ Check {}/{} PASSED: {} archived chars == {} consolidated chars (took {}s)",
+                date,
+                hour,
+                human_bytes::human_bytes(archived_total as f64),
+                human_bytes::human_bytes(consolidated_total as f64),
+                duration.num_seconds()
+            ))
+            .with_target("log_consolidator_checker_rust::s3::checker")
+            .with_date_hour(date, hour)
+            .with_check_result(CheckResult::Passed)
+            .with_character_stats(
+                CharacterStats::matched(archived_total, consolidated_total)
+                    .with_per_bucket(per_bucket_stats)
+                    .with_duration(duration.num_seconds()),
+            )
+            .emit();
+
             ComparisonResult {
                 date: date.clone(),
                 hour: hour.clone(),
                 ok: true,
                 message: "Consolidated size matches original size".to_string(),
-                // consolidated_data: consolidated_info,
-                // archived_data: archived_infos,
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
             }
@@ -252,20 +346,42 @@ impl Checker {
             let difference_hash = format!("{:x}", hasher.finalize());
             let difference_total: i64 = differences.values().sum();
 
-            warn!(
-                "Differences {} on {} characters in detailedCharacterCount (dH={})",
-                difference_total,
+            // Log failed character stats
+            LogEntry::error(format!(
+                "❌ Check {}/{} FAILED: {} archived vs {} consolidated, {} char types differ by {} total (hash: {})",
+                date,
+                hour,
+                human_bytes::human_bytes(archived_total as f64),
+                human_bytes::human_bytes(consolidated_total as f64),
                 differences.len(),
-                difference_hash
-            );
+                difference_total,
+                &difference_hash[..8]
+            ))
+            .with_target("log_consolidator_checker_rust::s3::checker")
+            .with_date_hour(date, hour)
+            .with_check_result(CheckResult::Failed)
+            .with_character_stats(
+                CharacterStats::mismatched(
+                    archived_total,
+                    consolidated_total,
+                    differences.len(),
+                    difference_total,
+                    difference_hash,
+                )
+                .with_per_bucket(per_bucket_stats)
+                .with_duration(duration.num_seconds()),
+            )
+            .emit();
 
             ComparisonResult {
                 date: date.clone(),
                 hour: hour.clone(),
                 ok: false,
-                message: "Difference in detailedCharacterCount".to_string(),
-                // consolidated_data: consolidated_info,
-                // archived_data: archived_infos,
+                message: format!(
+                    "Difference in character count: {} types differ by {} chars",
+                    differences.len(),
+                    difference_total
+                ),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
             }

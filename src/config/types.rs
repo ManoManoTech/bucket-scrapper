@@ -11,15 +11,16 @@ pub enum PathSchema {
     DateFormat { datefmt: String },
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BucketConfig {
     pub bucket: String,
+    #[serde(skip_serializing)]
     pub path: Vec<PathSchema>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_prefix_patterns: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub proceed_without_matching_objects: bool,
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
