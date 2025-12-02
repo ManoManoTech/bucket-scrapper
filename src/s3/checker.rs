@@ -492,4 +492,43 @@ impl Checker {
 
         Ok(result)
     }
+
+    /// Upload check result to S3 results bucket
+    pub async fn upload_check_result(
+        &self,
+        results_bucket: &BucketConfig,
+        date: &DateString,
+        hour: &HourString,
+        result: &ComparisonResult,
+    ) -> Result<()> {
+        use crate::utils::path_formatter::generate_path_formatter;
+
+        // Generate the path using the bucket's path configuration
+        let formatter = generate_path_formatter(results_bucket);
+        let path_prefix = formatter(date, hour)?;
+
+        // Create a JSON structure for the check result
+        let check_result_json = serde_json::json!({
+            "date": date,
+            "hour": hour,
+            "ok": result.ok,
+            "message": result.message,
+            "analysis_start_date": result.analysis_start_date,
+            "analysis_end_date": result.analysis_end_date,
+            "archived_total_chars": result.archived_counts.total_excluding_newlines(),
+            "consolidated_total_chars": result.consolidated_counts.total_excluding_newlines(),
+            "differences_count": result.differences.len(),
+        });
+
+        let json_bytes = serde_json::to_vec_pretty(&check_result_json)?;
+
+        // Upload to S3 with filename check_result.json
+        let key = format!("{}/check_result.json", path_prefix);
+
+        self.s3_client
+            .upload_object(&results_bucket.bucket, &key, json_bytes)
+            .await?;
+
+        Ok(())
+    }
 }

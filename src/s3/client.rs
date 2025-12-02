@@ -344,4 +344,45 @@ impl WrappedS3Client {
 
         Ok(bytes)
     }
+
+    /// Uploads an object to S3
+    pub async fn upload_object(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
+        let client = self.get_client().await?;
+        self.upload_object_with_client(&client, bucket, key, data)
+            .await
+    }
+
+    /// Uploads an object using a provided client
+    pub async fn upload_object_with_client(
+        &self,
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        debug!("Uploading object to s3://{}/{}", bucket, key);
+
+        let body = aws_sdk_s3::primitives::ByteStream::from(data);
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "S3 upload to bucket '{}' key '{}' failed: {}",
+                    bucket,
+                    key,
+                    e
+                )
+            })?;
+
+        info!("Uploaded check result to s3://{}/{}", bucket, key);
+
+        Ok(())
+    }
 }

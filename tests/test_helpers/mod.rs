@@ -1,5 +1,6 @@
 pub mod consolidator_runner;
 pub mod dynamic_mock_generator;
+pub mod fake_consolidation_setup;
 pub mod mock_data_generator;
 pub mod s3_file_displayer;
 pub mod simple_test;

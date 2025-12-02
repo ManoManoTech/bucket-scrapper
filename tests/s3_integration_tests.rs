@@ -4,6 +4,7 @@ use anyhow::Result;
 use test_helpers::{assert_failure, assert_success, run_consolidation_test};
 
 #[tokio::test]
+#[ignore = "ezci-impure"]
 async fn test_check_consolidation() -> Result<()> {
     let result = run_consolidation_test("simple-001").await?;
     assert_success(&result);
@@ -13,6 +14,7 @@ async fn test_check_consolidation() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "ezci-impure"]
 async fn test_check_consolidation_with_line_return() -> Result<()> {
     let line_return_result = run_consolidation_test("line-return-001").await?;
     let without_line_return_result = run_consolidation_test("without-line-return-001").await?;
@@ -23,6 +25,7 @@ async fn test_check_consolidation_with_line_return() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "ezci-impure"]
 async fn test_check_consolidation_with_broken_inputs() -> Result<()> {
     let result = run_consolidation_test("broken-input-001").await?;
     assert_failure(&result);
@@ -30,6 +33,7 @@ async fn test_check_consolidation_with_broken_inputs() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "ezci-impure"]
 async fn test_check_consolidation_with_broken_outputs() -> Result<()> {
     let result = run_consolidation_test("broken-output-001").await?;
     assert_failure(&result);

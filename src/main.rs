@@ -106,7 +106,26 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        // Output error as JSON to maintain consistent log format
+        let error_json = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "level": "ERROR",
+            "message": format!("{:#}", e),
+            "error": true,
+            "target": "log_consolidator_checker_rust",
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&error_json)
+                .unwrap_or_else(|_| format!("{{\"error\": \"{}\"}}", e))
+        );
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging with JSON format
@@ -284,6 +303,15 @@ async fn main() -> Result<()> {
             let result = checker
                 .get_comparison_results(&archived_buckets, consolidated_bucket, date, hour)
                 .await?;
+
+            // Upload check result to S3
+            if let Some(results_bucket) = get_results_bucket(&config) {
+                checker
+                    .upload_check_result(results_bucket, date, hour, &result)
+                    .await?;
+            } else {
+                warn!("No results bucket configured, skipping upload");
+            }
 
             // Generate PGM visualizations
             {
