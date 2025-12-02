@@ -1,17 +1,20 @@
 // src/s3/client.rs
 // Location: src/s3/client.rs
 use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
-use crate::s3::dns_cache;
+use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use crate::utils::path_formatter::generate_path_formatter;
 use anyhow::Result;
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
+use aws_smithy_http_client::Builder as HttpClientBuilder;
+use aws_smithy_types::timeout::TimeoutConfig;
 use aws_types::region::Region;
 use regex::Regex;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct WrappedS3Client {
     pub client: RwLock<(std::time::Instant, Client)>,
@@ -39,9 +42,32 @@ impl WrappedS3Client {
 
         let retry_config = RetryConfig::standard().with_max_attempts(3);
 
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30))
+            .build();
+
+        // Build custom HTTP client with our cached DNS resolver if available
+        // This is the KEY integration - it ensures all S3 requests use our
+        // hickory-resolver + moka cache instead of hyper's default system resolver
+        let http_client = if let Some(dns_cache) = dns_cache::get_global_dns_cache() {
+            info!("Creating S3 client with cached DNS resolver");
+            let resolver = AwsDnsResolverAdapter::new(dns_cache.clone());
+            HttpClientBuilder::new()
+                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                .build_with_resolver(resolver)
+        } else {
+            warn!("DNS cache not available, using default resolver (will cause more DNS queries)");
+            HttpClientBuilder::new()
+                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                .build_https()
+        };
+
         let config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(region.to_owned()))
             .retry_config(retry_config)
+            .timeout_config(timeout_config)
+            .http_client(http_client)
             .load()
             .await;
 

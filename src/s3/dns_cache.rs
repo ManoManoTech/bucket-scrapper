@@ -3,9 +3,14 @@
 //!
 //! Uses hickory-resolver with moka cache for application-level DNS caching.
 //! This significantly reduces DNS queries when running hundreds of CHECK commands in parallel.
+//!
+//! The key integration is the `AwsDnsResolverAdapter` which implements the AWS SDK's
+//! `ResolveDns` trait, allowing our cached resolver to be used by the S3 client.
 
 use anyhow::Result;
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
 use moka::future::Cache;
+use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,7 +74,9 @@ impl CachingDnsResolver {
         }
 
         // Cache the result
-        self.cache.insert(hostname.to_string(), addresses.clone()).await;
+        self.cache
+            .insert(hostname.to_string(), addresses.clone())
+            .await;
 
         debug!(
             hostname = hostname,
@@ -124,6 +131,68 @@ impl CachingDnsResolver {
     /// Get cache statistics for monitoring.
     pub fn cache_stats(&self) -> (u64, u64) {
         (self.cache.entry_count(), self.cache.weighted_size())
+    }
+
+    /// Log cache statistics for observability.
+    pub fn log_stats(&self) {
+        let (entries, size) = self.cache_stats();
+        info!(
+            cache_entries = entries,
+            cache_size = size,
+            "DNS cache statistics"
+        );
+    }
+}
+
+/// Adapter that implements AWS SDK's `ResolveDns` trait using our `CachingDnsResolver`.
+///
+/// This bridges our hickory-resolver + moka cache to the AWS SDK's HTTP client,
+/// ensuring all S3 requests use our cached DNS resolver instead of creating
+/// new DNS queries for each connection.
+#[derive(Clone)]
+pub struct AwsDnsResolverAdapter {
+    inner: CachingDnsResolver,
+}
+
+impl Debug for AwsDnsResolverAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsDnsResolverAdapter")
+            .field("cache_entries", &self.inner.cache.entry_count())
+            .field("ttl_seconds", &self.inner.ttl_seconds)
+            .finish()
+    }
+}
+
+impl AwsDnsResolverAdapter {
+    /// Create a new adapter wrapping the given caching resolver.
+    pub fn new(resolver: CachingDnsResolver) -> Self {
+        Self { inner: resolver }
+    }
+}
+
+impl ResolveDns for AwsDnsResolverAdapter {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        let resolver = self.inner.clone();
+        let name = name.to_string();
+
+        DnsFuture::new(async move {
+            debug!(hostname = %name, "AWS SDK DNS resolution request");
+
+            match resolver.resolve(&name).await {
+                Ok(addresses) => {
+                    debug!(
+                        hostname = %name,
+                        address_count = addresses.len(),
+                        "DNS resolution successful"
+                    );
+                    Ok(addresses)
+                }
+                Err(e) => {
+                    warn!(hostname = %name, error = %e, "DNS resolution failed");
+                    Err(ResolveDnsError::new(e))
+                }
+            }
+        })
     }
 }
 
@@ -195,6 +264,9 @@ mod tests {
 
         // Check cache stats
         let (entries, _) = cache.cache_stats();
-        assert!(entries >= 1, "Cache should have at least 1 entry after resolution");
+        assert!(
+            entries >= 1,
+            "Cache should have at least 1 entry after resolution"
+        );
     }
 }

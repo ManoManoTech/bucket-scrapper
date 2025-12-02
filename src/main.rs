@@ -36,8 +36,8 @@ struct Cli {
     #[arg(short, long, default_value = "eu-west-3")]
     region: String,
 
-    /// Maximum age of the S3 client in minutes
-    #[arg(long, default_value = "15")]
+    /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
+    #[arg(long, default_value = "60")]
     client_max_age: u64,
 
     /// Maximum parallel downloads
