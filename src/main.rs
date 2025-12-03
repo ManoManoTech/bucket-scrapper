@@ -16,9 +16,10 @@ use clap::{Parser, Subcommand};
 use jemallocator::Jemalloc;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 use utils::date::date_range_to_date_hour_list;
+use utils::recap_html::{aggregate_by_day, generate_recap_html};
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -99,9 +100,13 @@ enum Commands {
         #[arg(short, long)]
         end: String,
 
-        /// Output format (json, text, csv)
+        /// Output format (json, text, csv, html)
         #[arg(short, long, default_value = "text")]
         format: String,
+
+        /// Output file path (required for html format)
+        #[arg(short = 'o', long)]
+        output: Option<String>,
     },
 }
 
@@ -380,7 +385,12 @@ async fn run() -> Result<()> {
             }
         }
 
-        Commands::Recap { start, end, format } => {
+        Commands::Recap {
+            start,
+            end,
+            format,
+            output,
+        } => {
             // Parse dates
             let start_date = DateTime::parse_from_rfc3339(start)
                 .with_context(|| format!("Invalid start date: {}", start))?
@@ -431,7 +441,7 @@ async fn run() -> Result<()> {
                     .await?;
 
                 if file_list.files.is_empty() {
-                    warn!(
+                    debug!(
                         date = %date_hour.date,
                         hour = %date_hour.hour,
                         prefix = %file_list.key_prefix,
@@ -440,7 +450,7 @@ async fn run() -> Result<()> {
                     continue;
                 }
 
-                info!(
+                debug!(
                     date = %date_hour.date,
                     hour = %date_hour.hour,
                     prefix = %file_list.key_prefix,
@@ -473,6 +483,17 @@ async fn run() -> Result<()> {
                     // TODO: Implement CSV output format
                     info!("CSV format not yet implemented, falling back to JSON");
                     println!("{}", serde_json::to_string_pretty(&results)?);
+                }
+                "html" => {
+                    let output_path = output
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("--output is required for html format"))?;
+
+                    let summaries = aggregate_by_day(&results);
+                    let html = generate_recap_html(&summaries);
+
+                    std::fs::write(output_path, &html)?;
+                    info!(path = %output_path, days = summaries.len(), "HTML recap written");
                 }
                 _ => return Err(anyhow::anyhow!("Unknown format: {}", format)),
             }
