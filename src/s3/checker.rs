@@ -16,7 +16,7 @@ use chrono::Utc;
 use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Analysis data for a bucket at a specific date/hour
 #[derive(Debug)]
@@ -180,7 +180,7 @@ impl Checker {
         objects: &[S3ObjectInfo],
     ) -> Result<HashMap<String, DetailedCharacterCount>> {
         let client = self.s3_client.get_client().await?;
-        self.download_and_analyze_files_with_client(client, objects)
+        self.download_and_analyze_files_with_client(client, objects, None, None)
             .await
     }
 
@@ -189,14 +189,27 @@ impl Checker {
         &self,
         client: aws_sdk_s3::Client,
         objects: &[S3ObjectInfo],
+        date: Option<&str>,
+        hour: Option<&str>,
     ) -> Result<HashMap<String, DetailedCharacterCount>> {
-        let downloader = DownloadOrchestrator::new(
-            client,
-            self.max_parallel,
-            self.max_process_threads,
-            Arc::clone(&self.memory_allocator),
-            Arc::clone(&self.progress_tracker),
-        );
+        let downloader = match (date, hour) {
+            (Some(d), Some(h)) => DownloadOrchestrator::with_context(
+                client,
+                self.max_parallel,
+                self.max_process_threads,
+                Arc::clone(&self.memory_allocator),
+                Arc::clone(&self.progress_tracker),
+                d,
+                h,
+            ),
+            _ => DownloadOrchestrator::new(
+                client,
+                self.max_parallel,
+                self.max_process_threads,
+                Arc::clone(&self.memory_allocator),
+                Arc::clone(&self.progress_tracker),
+            ),
+        };
 
         // Process all files in parallel in a single batch for maximum efficiency
         info!(
@@ -340,7 +353,12 @@ impl Checker {
 
         // Reuse the same client for downloads to avoid additional DNS lookups
         let character_counts_by_bucket = self
-            .download_and_analyze_files_with_client(client, &file_lists[..])
+            .download_and_analyze_files_with_client(
+                client,
+                &file_lists[..],
+                Some(date.as_str()),
+                Some(hour.as_str()),
+            )
             .await?;
 
         // Log raw character counts per bucket for debugging
@@ -356,17 +374,37 @@ impl Checker {
         // Compute the sum of all archived character counts and collect per-bucket stats
         let mut total_archived_counts = DetailedCharacterCount::new();
         let mut per_bucket_stats: Vec<BucketCharacterStats> = Vec::new();
+        let mut missing_buckets: Vec<String> = Vec::new();
 
         for archived_info in archived_bucket_configs {
-            let bucket_character_count = character_counts_by_bucket
-                .get(&archived_info.bucket)
-                .unwrap();
-            let total_chars = bucket_character_count.total_excluding_newlines();
-            per_bucket_stats.push(BucketCharacterStats::archived(
-                &archived_info.bucket,
-                total_chars,
-            ));
-            total_archived_counts.add(bucket_character_count);
+            match character_counts_by_bucket.get(&archived_info.bucket) {
+                Some(bucket_character_count) => {
+                    let total_chars = bucket_character_count.total_excluding_newlines();
+                    per_bucket_stats.push(BucketCharacterStats::archived(
+                        &archived_info.bucket,
+                        total_chars,
+                    ));
+                    total_archived_counts.add(bucket_character_count);
+                }
+                None => {
+                    // Bucket had no successfully processed files (all downloads failed)
+                    warn!(
+                        bucket = %archived_info.bucket,
+                        "No character counts for archived bucket - all downloads may have failed"
+                    );
+                    missing_buckets.push(archived_info.bucket.clone());
+                    // Add with zero count so it appears in stats
+                    per_bucket_stats.push(BucketCharacterStats::archived(&archived_info.bucket, 0));
+                }
+            }
+        }
+
+        // If any buckets are completely missing, this is a serious error
+        if !missing_buckets.is_empty() {
+            error!(
+                missing_buckets = ?missing_buckets,
+                "Some archived buckets have no data - check for download failures"
+            );
         }
 
         // Find the consolidated character count
@@ -443,7 +481,7 @@ impl Checker {
 
             let mut hasher = Hasher::new();
             hasher.update(recap_str.as_bytes());
-            let difference_hash = format!("{:x}", hasher.finalize());
+            let difference_hash = format!("{:08x}", hasher.finalize());
             let difference_total: i64 = differences.values().sum();
 
             // Log failed character stats

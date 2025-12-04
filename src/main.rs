@@ -376,12 +376,12 @@ async fn run() -> Result<()> {
                 }
             }
 
-            // Output result and exit with appropriate code
+            // Output result - exit 0 regardless of check result
+            // The check result (pass/fail) is reported in logs and S3, not via exit code
             if result.ok {
                 info!(target_date = %date, target_hour = %hour, "Check passed");
             } else {
                 error!(target_date = %date, target_hour = %hour, message = %result.message, "Check failed");
-                std::process::exit(1);
             }
         }
 

@@ -86,6 +86,14 @@ pub struct LogEntry {
     // Time stats (for progress logs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<TimeStats>,
+
+    // S3 operation info (for download/upload logs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_operation: Option<S3OperationInfo>,
+
+    // Retry info (for retry scenarios)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
 }
 
 /// Bucket information - consistent across all logs
@@ -185,6 +193,42 @@ pub struct TimeStats {
     pub estimated_completion: Option<String>,
 }
 
+/// S3 operation information for download/upload logs
+#[derive(Serialize)]
+pub struct S3OperationInfo {
+    pub bucket: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_human: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<S3Operation>,
+}
+
+/// S3 operation type
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum S3Operation {
+    Download,
+    Upload,
+    List,
+}
+
+/// Retry information for retry scenarios
+#[derive(Serialize)]
+pub struct RetryInfo {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_retriable: Option<bool>,
+}
+
 impl LogEntry {
     pub fn new(level: LogLevel, message: impl Into<String>) -> Self {
         Self {
@@ -257,6 +301,16 @@ impl LogEntry {
 
     pub fn with_time(mut self, time: TimeStats) -> Self {
         self.time = Some(time);
+        self
+    }
+
+    pub fn with_s3_operation(mut self, s3_operation: S3OperationInfo) -> Self {
+        self.s3_operation = Some(s3_operation);
+        self
+    }
+
+    pub fn with_retry(mut self, retry: RetryInfo) -> Self {
+        self.retry = Some(retry);
         self
     }
 
@@ -371,5 +425,64 @@ impl BucketCharacterStats {
 
     pub fn consolidated(name: &str, total_chars: u64) -> Self {
         Self::new(name, BucketRole::Consolidated, total_chars)
+    }
+}
+
+impl S3OperationInfo {
+    pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+            size_bytes: None,
+            size_human: None,
+            operation: None,
+        }
+    }
+
+    pub fn download(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::new(bucket, key).with_operation(S3Operation::Download)
+    }
+
+    pub fn upload(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::new(bucket, key).with_operation(S3Operation::Upload)
+    }
+
+    pub fn with_size(mut self, size_bytes: usize) -> Self {
+        self.size_bytes = Some(size_bytes);
+        self.size_human = Some(human_bytes(size_bytes as f64));
+        self
+    }
+
+    pub fn with_operation(mut self, operation: S3Operation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+}
+
+impl RetryInfo {
+    pub fn new(attempt: u32, max_attempts: u32, delay_secs: f64) -> Self {
+        Self {
+            attempt,
+            max_attempts,
+            delay_secs,
+            error_type: None,
+            error_message: None,
+            is_retriable: None,
+        }
+    }
+
+    pub fn with_error(
+        mut self,
+        error_type: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        self.error_type = Some(error_type.into());
+        self.error_message = Some(error_message.into());
+        self
+    }
+
+    pub fn with_retriable(mut self, is_retriable: bool) -> Self {
+        self.is_retriable = Some(is_retriable);
+        self
     }
 }

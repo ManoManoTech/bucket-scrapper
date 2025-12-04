@@ -38,6 +38,34 @@ impl DownloadOrchestrator {
         }
     }
 
+    /// Create an orchestrator with date/hour context for retry logging
+    pub fn with_context(
+        client: Client,
+        max_concurrent_downloads: usize,
+        max_processor_threads: usize,
+        memory_allocator: Arc<MemoryLimitedAllocator>,
+        progress_tracker: Arc<ProgressTracker>,
+        date: &str,
+        hour: &str,
+    ) -> Self {
+        info!(
+            "Initializing S3Downloader with {} concurrent downloads, {} process threads for {}/{}",
+            max_concurrent_downloads, max_processor_threads, date, hour
+        );
+
+        Self {
+            s3_fetcher: Downloader::with_context(
+                client,
+                max_concurrent_downloads,
+                memory_allocator,
+                date,
+                hour,
+            ),
+            processor: Processor::new(max_processor_threads),
+            progress_tracker,
+        }
+    }
+
     /// Process a batch of S3 objects with controlled concurrency
     /// Returns a DetailedCharacterCount per bucket.
     pub async fn download_decompress_count(

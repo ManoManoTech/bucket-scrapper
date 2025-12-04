@@ -2,6 +2,7 @@
 use crate::config::types::S3ObjectInfo;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
+use crate::utils::structured_log::{LogEntry, RetryInfo, S3OperationInfo};
 use anyhow::{anyhow, Result};
 use aws_sdk_s3::Client;
 use backon::ExponentialBuilder;
@@ -15,10 +16,15 @@ use tracing::{debug, info, warn};
 
 use super::types::{CompressionType, RawObjectData};
 
+/// Max retry attempts per download
+const MAX_RETRY_ATTEMPTS: u32 = 10;
+
 pub struct Downloader {
     client: Client,
     memory_allocator: Arc<MemoryLimitedAllocator>,
     download_semaphore: Arc<Semaphore>,
+    target_date: Option<String>,
+    target_hour: Option<String>,
 }
 
 impl Downloader {
@@ -33,6 +39,27 @@ impl Downloader {
             client,
             memory_allocator,
             download_semaphore,
+            target_date: None,
+            target_hour: None,
+        }
+    }
+
+    /// Create a downloader with date/hour context for retry logging
+    pub fn with_context(
+        client: Client,
+        max_concurrent_downloads: usize,
+        memory_allocator: Arc<MemoryLimitedAllocator>,
+        date: &str,
+        hour: &str,
+    ) -> Self {
+        let download_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+
+        Self {
+            client,
+            memory_allocator,
+            download_semaphore,
+            target_date: Some(date.to_string()),
+            target_hour: Some(hour.to_string()),
         }
     }
 
@@ -66,10 +93,11 @@ impl Downloader {
             let tx_clone = tx.clone();
             let allocator = Arc::clone(&self.memory_allocator);
             let progress_tracker = progress_tracker.clone();
+            let target_date = self.target_date.clone();
+            let target_hour = self.target_hour.clone();
 
             let handle = tokio::spawn(async move {
                 let inner_result = async || {
-                    // Pass references - avoid cloning inside the retry closure to reduce overhead
                     Self::download_object(
                         &client_clone,
                         &bucket_str,
@@ -97,24 +125,44 @@ impl Downloader {
                 };
 
                 let retry_params = ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_secs(2))
+                    .with_max_delay(Duration::from_secs(60))
+                    .with_factor(2.0)
                     .with_jitter()
-                    .with_max_delay(Duration::from_secs(15))
-                    .with_max_times(10);
+                    .with_max_times(MAX_RETRY_ATTEMPTS as usize);
 
-                let mut attempt = 1;
+                let mut attempt: u32 = 1;
+                let bucket_for_log = bucket_str.clone();
+                let key_for_log = obj_clone.key.clone();
+                let size_for_log = obj_clone.size;
+
                 let result = inner_result
                     .retry(retry_params)
                     .sleep(tokio::time::sleep)
-                    .notify(|err: &anyhow::Error, dur: Duration| {
+                    .notify(move |err: &anyhow::Error, dur: Duration| {
                         attempt += 1;
-                        warn!(
-                            "will retry attempt {} caused by {} after {:?}",
-                            attempt, err, dur
-                        );
+                        let delay_secs = dur.as_secs_f64();
+
+                        let mut log_entry = LogEntry::warn("S3 download retry scheduled")
+                            .with_target("s3::downloader")
+                            .with_s3_operation(
+                                S3OperationInfo::download(&bucket_for_log, &key_for_log)
+                                    .with_size(size_for_log),
+                            )
+                            .with_retry(
+                                RetryInfo::new(attempt, MAX_RETRY_ATTEMPTS, delay_secs)
+                                    .with_error("download_error", err.to_string())
+                                    .with_retriable(true),
+                            );
+
+                        // Add date/hour context if available
+                        if let (Some(date), Some(hour)) = (&target_date, &target_hour) {
+                            log_entry = log_entry.with_date_hour(date, hour);
+                        }
+
+                        log_entry.emit();
                     })
                     .await;
-
-                // XXX on error shouldn't we terminate the whole program?
 
                 // Release permit when done, regardless of error status
                 drop(permit);
@@ -127,15 +175,34 @@ impl Downloader {
 
         // Wait for all downloads to complete
         let results = join_all(download_handles).await;
+        let mut failed_downloads: Vec<String> = Vec::new();
+
         for result in results {
-            if let Err(e) = result {
-                warn!("Download task failed: {}", e);
+            match result {
+                Ok(Ok(())) => {} // Task succeeded
+                Ok(Err(e)) => {
+                    // Download failed after max retries
+                    failed_downloads.push(e.to_string());
+                }
+                Err(e) => {
+                    // Task panicked
+                    failed_downloads.push(format!("task panic: {}", e));
+                }
             }
         }
 
         // Close the channel to signal end of downloads
         // Explicitly drop tx here to close the channel
         drop(tx);
+
+        // Fail if any downloads failed after max retries
+        if !failed_downloads.is_empty() {
+            return Err(anyhow!(
+                "{} download(s) failed after max retries: {}",
+                failed_downloads.len(),
+                failed_downloads.first().unwrap_or(&"unknown".to_string())
+            ));
+        }
 
         debug!("All downloads completed.");
         Ok(())

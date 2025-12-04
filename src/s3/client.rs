@@ -40,7 +40,9 @@ impl WrappedS3Client {
         // Pre-warm DNS cache if available to reduce DNS load
         dns_cache::prewarm_global_dns_cache(region).await;
 
-        let retry_config = RetryConfig::standard().with_max_attempts(3);
+        // Disable AWS SDK internal retries - we handle retries ourselves in downloader.rs
+        // with backon for full visibility via structured logging (date, hour, bucket, key, error)
+        let retry_config = RetryConfig::standard().with_max_attempts(1);
 
         let timeout_config = TimeoutConfig::builder()
             .connect_timeout(Duration::from_secs(5))
