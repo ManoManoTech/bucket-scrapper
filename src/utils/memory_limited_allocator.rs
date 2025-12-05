@@ -28,7 +28,10 @@ impl MemoryLimiter {
     // Try to allocate memory
     fn try_allocate(&mut self, size: usize) -> bool {
         if size > (self.total_capacity as f64 * 0.85) as usize {
-            panic!("Allocation of {} is unlikely to ever complete in a pool of {}, you must increase pool size", size, self.total_capacity);
+            panic!(
+                "Allocation of {} is unlikely to ever complete in a pool of {}, you must increase pool size",
+                size, self.total_capacity
+            );
         }
 
         if self.current_usage + size <= self.total_capacity {

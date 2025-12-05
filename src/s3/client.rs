@@ -4,11 +4,11 @@ use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3O
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use crate::utils::path_formatter::generate_path_formatter;
 use anyhow::Result;
-use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
+use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
-use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
 use aws_smithy_http_client::Builder as HttpClientBuilder;
+use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use aws_smithy_types::timeout::TimeoutConfig;
 use aws_types::region::Region;
 use regex::Regex;

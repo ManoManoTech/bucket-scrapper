@@ -3,7 +3,7 @@ use crate::config::types::S3ObjectInfo;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
 use crate::utils::signal_handler::ProgressTracker;
 use crate::utils::structured_log::{LogEntry, RetryInfo, S3OperationInfo};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aws_sdk_s3::Client;
 use backon::ExponentialBuilder;
 use backon::Retryable;
@@ -11,7 +11,7 @@ use futures::future::join_all;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use super::types::{CompressionType, RawObjectData};

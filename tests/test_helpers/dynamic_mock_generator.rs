@@ -1,8 +1,8 @@
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use chrono::{DateTime, Duration, Utc};
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde_json::json;
 use std::io::Write;
 

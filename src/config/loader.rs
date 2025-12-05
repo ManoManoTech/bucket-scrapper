@@ -14,7 +14,9 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
 
     // Validate config
     if config.bucketsConsolidated.len() > 1 {
-        return Err(anyhow::anyhow!("More than one consolidated bucket found. We only support one destination bucket for now."));
+        return Err(anyhow::anyhow!(
+            "More than one consolidated bucket found. We only support one destination bucket for now."
+        ));
     }
 
     if config.bucketsToConsolidate.is_empty() {
@@ -84,10 +86,12 @@ bucketsCheckerResults:
     fn test_load_config_file_not_found() {
         let result = load_config("non_existent_file.yaml");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to read config file"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to read config file")
+        );
     }
 
     #[test]
@@ -99,10 +103,12 @@ bucketsCheckerResults:
 
         let result = load_config(temp_file.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to parse YAML config"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse YAML config")
+        );
     }
 
     #[test]
@@ -132,10 +138,12 @@ bucketsCheckerResults:
 
         let result = load_config(temp_file.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("More than one consolidated bucket found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("More than one consolidated bucket found")
+        );
     }
 
     #[test]
@@ -159,10 +167,12 @@ bucketsCheckerResults:
 
         let result = load_config(temp_file.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No archived bucket found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No archived bucket found")
+        );
     }
 
     #[test]
@@ -186,10 +196,12 @@ bucketsCheckerResults: []
 
         let result = load_config(temp_file.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No results bucket found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No results bucket found")
+        );
     }
 
     #[test]

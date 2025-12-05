@@ -5,7 +5,7 @@ use anyhow::Result;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task;
 use tracing::{debug, warn};
 

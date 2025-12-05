@@ -28,8 +28,10 @@ impl DownloadOrchestrator {
         memory_allocator: Arc<MemoryLimitedAllocator>,
         progress_tracker: Arc<ProgressTracker>,
     ) -> Self {
-        info!("Initializing S3Downloader with {} concurrent downloads, {} process threads and existing memory allocator",
-              max_concurrent_downloads, max_processor_threads);
+        info!(
+            "Initializing S3Downloader with {} concurrent downloads, {} process threads and existing memory allocator",
+            max_concurrent_downloads, max_processor_threads
+        );
 
         Self {
             s3_fetcher: Downloader::new(client, max_concurrent_downloads, memory_allocator),

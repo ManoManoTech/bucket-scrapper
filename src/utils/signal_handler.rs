@@ -4,8 +4,8 @@ use crate::utils::structured_log::{LogEntry, MemoryStats, ProgressStats, TimeSta
 use human_bytes::human_bytes;
 use signal_hook::{consts::SIGUSR2, iterator::Signals};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};

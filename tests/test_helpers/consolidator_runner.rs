@@ -1,8 +1,8 @@
 use anyhow::Result;
 use testcontainers::{
-    core::{logs::LogFrame, Mount},
-    runners::AsyncRunner,
     ContainerRequest, GenericImage, ImageExt,
+    core::{Mount, logs::LogFrame},
+    runners::AsyncRunner,
 };
 
 pub struct ContainerConfig {
@@ -90,12 +90,15 @@ impl<'a> ConsolidatorRunner<'a> {
         match self.container.take() {
             Some(container) => {
                 let _running_container = container.start().await?;
-                tokio::time::sleep(tokio::time::Duration::from_secs(self.config.sleep_duration_secs)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    self.config.sleep_duration_secs,
+                ))
+                .await;
                 Ok(())
             }
-            None => {
-                Err(anyhow::anyhow!("Container configuration is not set. Please call with_default() or with_continuous() before running."))
-            }
+            None => Err(anyhow::anyhow!(
+                "Container configuration is not set. Please call with_default() or with_continuous() before running."
+            )),
         }
     }
 }

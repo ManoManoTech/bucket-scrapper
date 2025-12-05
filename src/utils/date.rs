@@ -243,10 +243,12 @@ mod tests {
         let result = date_range_to_date_hour_list(&start, &end);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Start date is after end date"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Start date is after end date")
+        );
     }
 
     #[test]

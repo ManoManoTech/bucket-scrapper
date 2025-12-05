@@ -1,13 +1,13 @@
 use anyhow::Result;
-use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
+use aws_config::retry::RetryConfig;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use aws_types::SdkConfig;
 use testcontainers::{
-    core::{logs::LogFrame, Mount},
-    runners::AsyncRunner,
     ImageExt,
+    core::{Mount, logs::LogFrame},
+    runners::AsyncRunner,
 };
 use testcontainers_modules::minio::MinIO;
 
