@@ -13,16 +13,12 @@ use crate::s3::dns_cache;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use jemallocator::Jemalloc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 use utils::date::date_range_to_date_hour_list;
 use utils::recap_html::{aggregate_by_day, generate_recap_html};
-
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
 
 /// S3 Log Consolidator Checker
 #[derive(Parser)]
