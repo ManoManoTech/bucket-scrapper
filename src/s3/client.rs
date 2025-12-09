@@ -4,11 +4,12 @@ use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3O
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use crate::utils::path_formatter::generate_path_formatter;
 use anyhow::Result;
-use aws_config::BehaviorVersion;
 use aws_config::retry::RetryConfig;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::ResponseChecksumValidation;
 use aws_sdk_s3::Client;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
 use aws_smithy_http_client::Builder as HttpClientBuilder;
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use aws_smithy_types::timeout::TimeoutConfig;
 use aws_types::region::Region;
 use regex::Regex;
@@ -65,7 +66,7 @@ impl WrappedS3Client {
                 .build_https()
         };
 
-        let config = aws_config::defaults(BehaviorVersion::latest())
+        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(region.to_owned()))
             .retry_config(retry_config)
             .timeout_config(timeout_config)
@@ -73,7 +74,14 @@ impl WrappedS3Client {
             .load()
             .await;
 
-        Ok(Client::new(&config))
+        // Build S3 client with disabled response checksum validation
+        // This avoids warnings about part-level checksums from multipart uploads
+        // which the SDK cannot validate
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .build();
+
+        Ok(Client::from_conf(s3_config))
     }
 
     pub async fn get_client(&self) -> Result<Client> {

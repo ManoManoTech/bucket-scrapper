@@ -323,15 +323,28 @@ impl Checker {
 
         // Sort it all in one big filelist
         let mut file_lists = Vec::new();
+        let mut archived_files_count = 0usize;
+        let mut consolidated_files_count = 0usize;
         {
             let results = futures::future::join_all(file_lists_futures).await;
-            for result in results {
+            // First result is consolidated, rest are archived
+            for (idx, result) in results.into_iter().enumerate() {
                 match result {
                     Ok(mut analysis) => {
+                        let is_consolidated = idx == 0;
+                        let files_count = analysis.files.len();
+
+                        if is_consolidated {
+                            consolidated_files_count = files_count;
+                        } else {
+                            archived_files_count += files_count;
+                        }
+
                         info!(
                             bucket = %analysis.bucket,
-                            files_count = analysis.files.len(),
+                            files_count = files_count,
                             total_size = analysis.total_archives_size,
+                            bucket_type = if is_consolidated { "consolidated" } else { "archived" },
                             "Adding files from bucket to processing queue"
                         );
                         file_lists.append(analysis.files.as_mut());
@@ -343,8 +356,40 @@ impl Checker {
             // Log total files to be processed
             info!(
                 total_files = file_lists.len(),
+                archived_files = archived_files_count,
+                consolidated_files = consolidated_files_count,
                 "Total files to download and analyze"
             );
+
+            // Fail if there are no archived files (inputs)
+            if archived_files_count == 0 {
+                error!(
+                    target_date = %date,
+                    target_hour = %hour,
+                    "No files found in archived buckets (inputs) - this is unexpected"
+                );
+                return Err(anyhow::anyhow!(
+                    "No files found for {}/{} in archived buckets (inputs). \
+                     This is unexpected and may indicate missing input data or incorrect bucket configuration.",
+                    date,
+                    hour
+                ));
+            }
+
+            // Fail if there are no consolidated files (outputs)
+            if consolidated_files_count == 0 {
+                error!(
+                    target_date = %date,
+                    target_hour = %hour,
+                    "No files found in consolidated bucket (outputs) - consolidation may not have run"
+                );
+                return Err(anyhow::anyhow!(
+                    "No files found for {}/{} in consolidated bucket (outputs). \
+                     This indicates consolidation has not been performed for this time slot.",
+                    date,
+                    hour
+                ));
+            }
 
             // let mut rng = rng();
             // file_lists.shuffle(&mut rng);
@@ -360,16 +405,6 @@ impl Checker {
                 Some(hour.as_str()),
             )
             .await?;
-
-        // Log raw character counts per bucket for debugging
-        for (bucket_name, counts) in &character_counts_by_bucket {
-            info!(
-                bucket = %bucket_name,
-                total_chars = counts.total_excluding_newlines(),
-                total_chars_human = %human_bytes::human_bytes(counts.total_excluding_newlines() as f64),
-                "Raw character counts from processing"
-            );
-        }
 
         // Compute the sum of all archived character counts and collect per-bucket stats
         let mut total_archived_counts = DetailedCharacterCount::new();
