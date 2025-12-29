@@ -1,10 +1,10 @@
 use anyhow::Result;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use aws_types::SdkConfig;
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use log_consolidator_checker_rust::config::types::{BucketConfig, ConfigSchema, PathSchema};
 use std::collections::HashMap;
 use std::io::Write;

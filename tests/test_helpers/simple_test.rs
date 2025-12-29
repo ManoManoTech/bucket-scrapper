@@ -1,4 +1,4 @@
-use super::test_consolidation::{ConsolidationResult, check_consolidation_with_config};
+use super::test_consolidation::{check_consolidation_with_config, ConsolidationResult};
 use super::{TestConstants, TestEnvironment};
 use anyhow::Result;
 use log_consolidator_checker_rust::config::loader::load_config;

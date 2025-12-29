@@ -1,8 +1,8 @@
 use anyhow::Result;
 use testcontainers::{
-    ContainerRequest, GenericImage, ImageExt,
-    core::{Mount, logs::LogFrame},
+    core::{logs::LogFrame, Mount},
     runners::AsyncRunner,
+    ContainerRequest, GenericImage, ImageExt,
 };
 
 pub struct ContainerConfig {

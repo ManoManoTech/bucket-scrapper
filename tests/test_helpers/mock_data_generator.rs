@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::io::Write;
 use std::path::Path;
 use tokio::fs;
