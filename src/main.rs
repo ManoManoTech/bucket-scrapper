@@ -13,6 +13,7 @@ use crate::s3::dns_cache;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use futures::{stream, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -280,15 +281,21 @@ async fn run() -> Result<()> {
                 }
             }
 
-            // Spawn a background task for periodic updates
+            // Spawn a background task for periodic updates with cancellation
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            let cancel_token_clone = cancel_token.clone();
             if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
                 tokio::spawn(async move {
                     loop {
-                        // Display stats
-                        memory_monitor.log_memory_stats();
-
-                        // Wait 30 seconds
-                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                        tokio::select! {
+                            _ = cancel_token_clone.cancelled() => {
+                                break;
+                            }
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+                                // Display stats
+                                memory_monitor.log_memory_stats();
+                            }
+                        }
                     }
                 });
             }
@@ -325,10 +332,12 @@ async fn run() -> Result<()> {
                     &result.differences,
                 ) {
                     Ok(_) => {
-                        info!("Generated PGM visualizations:");
-                        info!("  - /tmp/lhs.pgm (archived counts)");
-                        info!("  - /tmp/rhs.pgm (consolidated counts)");
-                        info!("  - /tmp/diff.pgm (differences)");
+                        info!(
+                            lhs = "/tmp/lhs.pgm",
+                            rhs = "/tmp/rhs.pgm",
+                            diff = "/tmp/diff.pgm",
+                            "Generated PGM visualizations"
+                        );
                     }
                     Err(e) => {
                         warn!("Failed to generate PGM visualizations: {}", e);
@@ -365,7 +374,8 @@ async fn run() -> Result<()> {
                 // In a real implementation, we would output detailed failure information
             }
 
-            // Log final memory stats if signal handling is enabled
+            // Cancel periodic logging task and log final memory stats
+            cancel_token.cancel();
             if cli.enable_signals {
                 if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
                     memory_monitor.log_memory_stats();
@@ -419,53 +429,212 @@ async fn run() -> Result<()> {
             // Get client once upfront to avoid repeated get_client() calls and DNS lookups
             let client = s3_client.get_client().await?;
 
-            // Build results dictionary
-            let mut results: HashMap<String, serde_json::Value> = HashMap::new();
+            // Fast path for missing-txt: parallel existence checks only, no downloads
+            if format == "missing-txt" {
+                const CONCURRENT_CHECKS: usize = 64;
 
-            for date_hour in &date_hours {
-                let key = format!("{}/{}", date_hour.date, date_hour.hour);
-
-                // List files for this date/hour
-                let file_list = s3_client
-                    .get_matching_filenames_from_s3_with_client(
-                        &client,
-                        results_bucket,
-                        &date_hour.date,
-                        &date_hour.hour,
-                        false,
-                    )
-                    .await?;
-
-                if file_list.files.is_empty() {
-                    debug!(
-                        date = %date_hour.date,
-                        hour = %date_hour.hour,
-                        prefix = %file_list.key_prefix,
-                        "No check results found"
-                    );
-                    continue;
-                }
-
-                debug!(
-                    date = %date_hour.date,
-                    hour = %date_hour.hour,
-                    prefix = %file_list.key_prefix,
-                    file_count = file_list.files.len(),
-                    "Found check results"
+                info!(
+                    total_hours = date_hours.len(),
+                    concurrency = CONCURRENT_CHECKS,
+                    "Starting parallel existence checks"
                 );
 
-                // Download each result file using the same client to avoid DNS lookups
-                for file in &file_list.files {
-                    let bytes = s3_client
-                        .download_object_with_client(&client, &file.bucket, &file.key)
-                        .await?;
-                    let json: serde_json::Value = serde_json::from_slice(&bytes)
-                        .with_context(|| format!("Failed to parse JSON from {}", file.key))?;
-                    results.insert(key.clone(), json);
+                let missing_checks: Vec<(String, String)> = stream::iter(date_hours.iter())
+                    .map(|date_hour| {
+                        let client = &client;
+                        let s3_client = &s3_client;
+                        let results_bucket = results_bucket;
+                        async move {
+                            let file_list = s3_client
+                                .get_matching_filenames_from_s3_with_client(
+                                    client,
+                                    results_bucket,
+                                    &date_hour.date,
+                                    &date_hour.hour,
+                                    false,
+                                )
+                                .await;
+
+                            match file_list {
+                                Ok(fl) if fl.files.is_empty() => {
+                                    Some((date_hour.date.clone(), date_hour.hour.clone()))
+                                }
+                                Ok(_) => None,
+                                Err(e) => {
+                                    warn!(
+                                        date = %date_hour.date,
+                                        hour = %date_hour.hour,
+                                        error = %e,
+                                        "Error checking existence, treating as missing"
+                                    );
+                                    Some((date_hour.date.clone(), date_hour.hour.clone()))
+                                }
+                            }
+                        }
+                    })
+                    .buffer_unordered(CONCURRENT_CHECKS)
+                    .filter_map(|x| async { x })
+                    .collect()
+                    .await;
+
+                let mut sorted_missing = missing_checks;
+                sorted_missing.sort();
+
+                info!(
+                    total_hours = date_hours.len(),
+                    total_missing = sorted_missing.len(),
+                    "Parallel existence check complete"
+                );
+
+                // Generate tab-separated output
+                let txt_output: String = sorted_missing
+                    .iter()
+                    .map(|(date, hour)| format!("{}\t{}", date, hour))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                if let Some(output_path) = output {
+                    std::fs::write(output_path, &txt_output)?;
+                    info!(
+                        path = %output_path,
+                        total_hours = date_hours.len(),
+                        total_missing = sorted_missing.len(),
+                        "Missing checks txt list written"
+                    );
+                } else {
+                    println!("{}", txt_output);
+                }
+
+                return Ok(());
+            }
+
+            // Fast parallel path for formats that need results (html, retry-txt, retry-json)
+            const CONCURRENT_CHECKS: usize = 64;
+
+            info!(
+                total_hours = date_hours.len(),
+                concurrency = CONCURRENT_CHECKS,
+                "Starting parallel check result fetching"
+            );
+
+            // Phase 1: Parallel list + download
+            // Tuple: (date, hour, json_result, check_count)
+            let fetch_results: Vec<(String, String, Option<serde_json::Value>, usize)> =
+                stream::iter(date_hours.iter())
+                    .map(|date_hour| {
+                        let client = &client;
+                        let s3_client = &s3_client;
+                        let results_bucket = results_bucket;
+                        async move {
+                            // List files for this date/hour
+                            let file_list = match s3_client
+                                .get_matching_filenames_from_s3_with_client(
+                                    client,
+                                    results_bucket,
+                                    &date_hour.date,
+                                    &date_hour.hour,
+                                    false,
+                                )
+                                .await
+                            {
+                                Ok(fl) => fl,
+                                Err(e) => {
+                                    warn!(
+                                        date = %date_hour.date,
+                                        hour = %date_hour.hour,
+                                        error = %e,
+                                        "Error listing files"
+                                    );
+                                    return (
+                                        date_hour.date.clone(),
+                                        date_hour.hour.clone(),
+                                        None,
+                                        0,
+                                    );
+                                }
+                            };
+
+                            let check_count = file_list.files.len();
+
+                            if file_list.files.is_empty() {
+                                return (date_hour.date.clone(), date_hour.hour.clone(), None, 0);
+                            }
+
+                            // Download the last result file (check_result.json comes last lexicographically)
+                            if let Some(file) = file_list.files.last() {
+                                match s3_client
+                                    .download_object_with_client(client, &file.bucket, &file.key)
+                                    .await
+                                {
+                                    Ok(bytes) => {
+                                        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                            Ok(json) => {
+                                                return (
+                                                    date_hour.date.clone(),
+                                                    date_hour.hour.clone(),
+                                                    Some(json),
+                                                    check_count,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    date = %date_hour.date,
+                                                    hour = %date_hour.hour,
+                                                    error = %e,
+                                                    "Error parsing JSON"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            date = %date_hour.date,
+                                            hour = %date_hour.hour,
+                                            error = %e,
+                                            "Error downloading file"
+                                        );
+                                    }
+                                }
+                            }
+
+                            (
+                                date_hour.date.clone(),
+                                date_hour.hour.clone(),
+                                None,
+                                check_count,
+                            )
+                        }
+                    })
+                    .buffer_unordered(CONCURRENT_CHECKS)
+                    .collect()
+                    .await;
+
+            // Phase 2: Build results and missing lists
+            let mut results: HashMap<String, serde_json::Value> = HashMap::new();
+            let mut missing_checks: Vec<(String, String)> = Vec::new();
+
+            for (date, hour, json_opt, check_count) in fetch_results {
+                let key = format!("{}/{}", date, hour);
+                match json_opt {
+                    Some(mut json) => {
+                        // Inject check_count into the JSON result
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("check_count".to_string(), serde_json::json!(check_count));
+                        }
+                        results.insert(key, json);
+                    }
+                    None => {
+                        missing_checks.push((date, hour));
+                    }
                 }
             }
 
-            info!(count = results.len(), "Collected check results");
+            info!(
+                total_hours = date_hours.len(),
+                found = results.len(),
+                missing = missing_checks.len(),
+                "Parallel check result fetching complete"
+            );
 
             // Output based on format
             match format.as_str() {
@@ -485,12 +654,177 @@ async fn run() -> Result<()> {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("--output is required for html format"))?;
 
-                    let summaries = aggregate_by_day(&results);
+                    let summaries = aggregate_by_day(&results, &missing_checks);
                     let html = generate_recap_html(&summaries);
 
                     std::fs::write(output_path, &html)?;
                     info!(path = %output_path, days = summaries.len(), "HTML recap written");
                 }
+                "retry-json" => {
+                    // Filter for failed checks and generate retry list (exclude cleaned entries)
+                    let mut failed_checks: Vec<serde_json::Value> = Vec::new();
+
+                    for (key, value) in &results {
+                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Skip cleaned entries (check both old and new message patterns)
+                        let is_cleaned = message.contains("No input files found")
+                            && message.contains("consolidated files exist")
+                            || message.starts_with("Cleaned:");
+
+                        if !ok && !is_cleaned {
+                            // Key format: "YYYYMMDD/HH"
+                            let parts: Vec<&str> = key.split('/').collect();
+                            if parts.len() == 2 {
+                                failed_checks.push(serde_json::json!({
+                                    "date": parts[0],
+                                    "hour": parts[1]
+                                }));
+                            }
+                        }
+                    }
+
+                    // Sort by date then hour
+                    failed_checks.sort_by(|a, b| {
+                        let a_date = a.get("date").and_then(|v| v.as_str()).unwrap_or("");
+                        let b_date = b.get("date").and_then(|v| v.as_str()).unwrap_or("");
+                        let a_hour = a.get("hour").and_then(|v| v.as_str()).unwrap_or("");
+                        let b_hour = b.get("hour").and_then(|v| v.as_str()).unwrap_or("");
+                        (a_date, a_hour).cmp(&(b_date, b_hour))
+                    });
+
+                    let retry_report = serde_json::json!({
+                        "generated_at": chrono::Utc::now().to_rfc3339(),
+                        "date_range": {
+                            "start": start,
+                            "end": end
+                        },
+                        "total_checked": results.len(),
+                        "total_failed": failed_checks.len(),
+                        "failed_checks": failed_checks
+                    });
+
+                    let json_output = serde_json::to_string_pretty(&retry_report)?;
+
+                    if let Some(output_path) = output {
+                        std::fs::write(output_path, &json_output)?;
+                        info!(
+                            path = %output_path,
+                            total_checked = results.len(),
+                            total_failed = failed_checks.len(),
+                            "Retry list written"
+                        );
+                    } else {
+                        println!("{}", json_output);
+                    }
+                }
+                "retry-txt" => {
+                    // Filter for failed checks and generate tab-separated retry list
+                    // Format: YYYYMMDD\tHH (compatible with retry-from-textfile.sh)
+                    let mut failed_checks: Vec<(String, String)> = Vec::new();
+
+                    for (key, value) in &results {
+                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Skip cleaned entries (check both old and new message patterns)
+                        let is_cleaned = message.contains("No input files found")
+                            && message.contains("consolidated files exist")
+                            || message.starts_with("Cleaned:");
+
+                        if !ok && !is_cleaned {
+                            // Key format: "YYYYMMDD/HH"
+                            let parts: Vec<&str> = key.split('/').collect();
+                            if parts.len() == 2 {
+                                failed_checks.push((parts[0].to_string(), parts[1].to_string()));
+                            }
+                        }
+                    }
+
+                    // Sort by date then hour
+                    failed_checks.sort();
+
+                    // Generate tab-separated output
+                    let txt_output: String = failed_checks
+                        .iter()
+                        .map(|(date, hour)| format!("{}\t{}", date, hour))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    if let Some(output_path) = output {
+                        std::fs::write(output_path, &txt_output)?;
+                        info!(
+                            path = %output_path,
+                            total_checked = results.len(),
+                            total_failed = failed_checks.len(),
+                            "Retry txt list written"
+                        );
+                    } else {
+                        println!("{}", txt_output);
+                    }
+                }
+                "to-fix-txt" => {
+                    // Filter for pending and KO checks only (exclude cleaned entries)
+                    // Format: YYYYMMDD\tHH\tTYPE (PEND or KO)
+                    let mut to_fix: Vec<(String, String, String)> = Vec::new();
+
+                    for (key, value) in &results {
+                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Skip cleaned entries (check both old and new message patterns)
+                        let is_cleaned = message.contains("No input files found")
+                            && message.contains("consolidated files exist")
+                            || message.starts_with("Cleaned:");
+
+                        if !ok && !is_cleaned {
+                            // Key format: "YYYYMMDD/HH"
+                            let parts: Vec<&str> = key.split('/').collect();
+                            if parts.len() == 2 {
+                                let status_type = if message.contains("Consolidation pending") {
+                                    "PEND"
+                                } else {
+                                    "KO"
+                                };
+                                to_fix.push((
+                                    parts[0].to_string(),
+                                    parts[1].to_string(),
+                                    status_type.to_string(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Sort by date then hour
+                    to_fix.sort();
+
+                    // Count by type
+                    let pend_count = to_fix.iter().filter(|(_, _, t)| t == "PEND").count();
+                    let ko_count = to_fix.iter().filter(|(_, _, t)| t == "KO").count();
+
+                    // Generate tab-separated output
+                    let txt_output: String = to_fix
+                        .iter()
+                        .map(|(date, hour, status)| format!("{}\t{}\t{}", date, hour, status))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    if let Some(output_path) = output {
+                        std::fs::write(output_path, &txt_output)?;
+                        info!(
+                            path = %output_path,
+                            total_checked = results.len(),
+                            total_to_fix = to_fix.len(),
+                            pending = pend_count,
+                            ko = ko_count,
+                            "To-fix txt list written"
+                        );
+                    } else {
+                        println!("{}", txt_output);
+                    }
+                }
+                // Note: "missing-txt" is handled above with fast parallel path
                 _ => return Err(anyhow::anyhow!("Unknown format: {}", format)),
             }
         }

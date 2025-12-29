@@ -52,6 +52,10 @@ pub struct ComparisonResult {
     pub analysis_start_date: String,
     /// When the analysis ended
     pub analysis_end_date: String,
+    /// Number of archived files checked
+    pub archived_files_count: usize,
+    /// Number of consolidated files checked
+    pub consolidated_files_count: usize,
     /// Detailed character counts from archived buckets
     pub archived_counts: DetailedCharacterCount,
     /// Detailed character counts from consolidated bucket
@@ -361,34 +365,86 @@ impl Checker {
                 "Total files to download and analyze"
             );
 
-            // Fail if there are no archived files (inputs)
+            // Handle case where there are no archived files (inputs)
             if archived_files_count == 0 {
-                error!(
-                    target_date = %date,
-                    target_hour = %hour,
-                    "No files found in archived buckets (inputs) - this is unexpected"
-                );
-                return Err(anyhow::anyhow!(
-                    "No files found for {}/{} in archived buckets (inputs). \
-                     This is unexpected and may indicate missing input data or incorrect bucket configuration.",
-                    date,
-                    hour
-                ));
+                let end_time = Utc::now();
+
+                // If there are no input files, there's nothing to consolidate - this is a valid state
+                if consolidated_files_count == 0 {
+                    info!(
+                        target_date = %date,
+                        target_hour = %hour,
+                        "No files in archived buckets and no consolidated files - nothing to check"
+                    );
+                    return Ok(ComparisonResult {
+                        ok: true,
+                        date: date.clone(),
+                        hour: hour.clone(),
+                        message: format!(
+                            "No files to consolidate for {}/{}. Both archived and consolidated buckets are empty.",
+                            date, hour
+                        ),
+                        analysis_start_date: start_time.to_rfc3339(),
+                        analysis_end_date: end_time.to_rfc3339(),
+                        archived_files_count: 0,
+                        consolidated_files_count: 0,
+                        archived_counts: DetailedCharacterCount::new(),
+                        consolidated_counts: DetailedCharacterCount::new(),
+                        differences: HashMap::new(),
+                    });
+                } else {
+                    // Consolidated files exist but no input files - input files were cleaned up after consolidation
+                    info!(
+                        target_date = %date,
+                        target_hour = %hour,
+                        consolidated_files = consolidated_files_count,
+                        "No archived files but consolidated files exist - input files cleaned up after consolidation"
+                    );
+                    return Ok(ComparisonResult {
+                        ok: true,
+                        date: date.clone(),
+                        hour: hour.clone(),
+                        message: format!(
+                            "Cleaned: No input files for {}/{} but {} consolidated files exist. \
+                             Input files were cleaned up after successful consolidation.",
+                            date, hour, consolidated_files_count
+                        ),
+                        analysis_start_date: start_time.to_rfc3339(),
+                        analysis_end_date: end_time.to_rfc3339(),
+                        archived_files_count: 0,
+                        consolidated_files_count,
+                        archived_counts: DetailedCharacterCount::new(),
+                        consolidated_counts: DetailedCharacterCount::new(),
+                        differences: HashMap::new(),
+                    });
+                }
             }
 
-            // Fail if there are no consolidated files (outputs)
+            // Handle case where there are no consolidated files (outputs) - needs consolidation
             if consolidated_files_count == 0 {
-                error!(
+                let end_time = Utc::now();
+                warn!(
                     target_date = %date,
                     target_hour = %hour,
-                    "No files found in consolidated bucket (outputs) - consolidation may not have run"
+                    archived_files = archived_files_count,
+                    "No consolidated files found - consolidation has not been performed yet"
                 );
-                return Err(anyhow::anyhow!(
-                    "No files found for {}/{} in consolidated bucket (outputs). \
-                     This indicates consolidation has not been performed for this time slot.",
-                    date,
-                    hour
-                ));
+                return Ok(ComparisonResult {
+                    ok: false,
+                    date: date.clone(),
+                    hour: hour.clone(),
+                    message: format!(
+                        "Consolidation pending for {}/{}. Found {} archived files but no consolidated output yet.",
+                        date, hour, archived_files_count
+                    ),
+                    analysis_start_date: start_time.to_rfc3339(),
+                    analysis_end_date: end_time.to_rfc3339(),
+                    archived_files_count,
+                    consolidated_files_count: 0,
+                    archived_counts: DetailedCharacterCount::new(),
+                    consolidated_counts: DetailedCharacterCount::new(),
+                    differences: HashMap::new(),
+                });
             }
 
             // let mut rng = rng();
@@ -498,6 +554,8 @@ impl Checker {
                 message: "Consolidated size matches original size".to_string(),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
+                archived_files_count,
+                consolidated_files_count,
                 archived_counts: total_archived_counts.clone(),
                 consolidated_counts: consolidated_character_count.clone(),
                 differences,
@@ -557,6 +615,8 @@ impl Checker {
                 ),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
+                archived_files_count,
+                consolidated_files_count,
                 archived_counts: total_archived_counts.clone(),
                 consolidated_counts: consolidated_character_count.clone(),
                 differences,
@@ -567,6 +627,9 @@ impl Checker {
     }
 
     /// Upload check result to S3 results bucket
+    /// Creates two files in `{path_prefix}/`:
+    /// 1. `{timestamp_ms}.json` - historical record with timestamp
+    /// 2. `check_result.json` - latest result (for easy access)
     pub async fn upload_check_result(
         &self,
         results_bucket: &BucketConfig,
@@ -577,6 +640,7 @@ impl Checker {
         use crate::utils::path_formatter::generate_path_formatter;
 
         // Generate the path using the bucket's path configuration
+        // e.g., "dt=20250102/hour=15"
         let formatter = generate_path_formatter(results_bucket);
         let path_prefix = formatter(date, hour)?;
 
@@ -588,6 +652,8 @@ impl Checker {
             "message": result.message,
             "analysis_start_date": result.analysis_start_date,
             "analysis_end_date": result.analysis_end_date,
+            "archived_files_count": result.archived_files_count,
+            "consolidated_files_count": result.consolidated_files_count,
             "archived_total_chars": result.archived_counts.total_excluding_newlines(),
             "consolidated_total_chars": result.consolidated_counts.total_excluding_newlines(),
             "differences_count": result.differences.len(),
@@ -595,12 +661,29 @@ impl Checker {
 
         let json_bytes = serde_json::to_vec_pretty(&check_result_json)?;
 
-        // Upload to S3 with filename check_result.json
-        let key = format!("{}/check_result.json", path_prefix);
+        // Get current timestamp in milliseconds
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
 
+        // Upload with timestamp for historical record
+        let timestamped_key = format!("{}/{}.json", path_prefix, timestamp_ms);
         self.s3_client
-            .upload_object(&results_bucket.bucket, &key, json_bytes)
+            .upload_object(&results_bucket.bucket, &timestamped_key, json_bytes.clone())
             .await?;
+
+        // Upload as check_result.json for easy access to latest
+        let latest_key = format!("{}/check_result.json", path_prefix);
+        self.s3_client
+            .upload_object(&results_bucket.bucket, &latest_key, json_bytes)
+            .await?;
+
+        info!(
+            timestamped_key = %timestamped_key,
+            latest_key = %latest_key,
+            "Uploaded check results to S3"
+        );
 
         Ok(())
     }

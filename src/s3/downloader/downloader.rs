@@ -136,11 +136,23 @@ impl Downloader {
                 let key_for_log = obj_clone.key.clone();
                 let size_for_log = obj_clone.size;
 
+                // Only log retries after N failures and every N failures to reduce spam
+                const LOG_RETRY_AFTER: u32 = 3;
+                const LOG_RETRY_EVERY: u32 = 3;
+
                 let result = inner_result
                     .retry(retry_params)
                     .sleep(tokio::time::sleep)
                     .notify(move |err: &anyhow::Error, dur: Duration| {
                         attempt += 1;
+
+                        // Only log after LOG_RETRY_AFTER attempts and every LOG_RETRY_EVERY attempts
+                        if attempt < LOG_RETRY_AFTER
+                            || (attempt - LOG_RETRY_AFTER) % LOG_RETRY_EVERY != 0
+                        {
+                            return;
+                        }
+
                         let delay_secs = dur.as_secs_f64();
 
                         let mut log_entry = LogEntry::warn("S3 download retry scheduled")
