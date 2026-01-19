@@ -1,8 +1,0 @@
-[tools]
-"cargo:flamegraph" = "latest"
-rust = "latest"
-
-[env]
-AWS_DEFAULT_REGION = "eu-west-3"
-AWS_PROFILE = "manomano-support"
-AWS_REGION = "eu-west-3"

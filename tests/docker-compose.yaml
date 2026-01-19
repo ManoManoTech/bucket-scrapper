@@ -1,0 +1,61 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio-s3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - consolidator-network
+  minio-setup:
+    image: minio/mc:latest
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_HOST_minio: "http://minioadmin:minioadmin@minio:9000"
+    entrypoint: >
+      /bin/sh -c " mc alias set minio http://minio:9000 minioadmin minioadmin; mc mb minio/support-infra-datadog-logs-rehydrate-archives --ignore-existing; mc mb minio/support-infra-log-consolidator-archives --ignore-existing; mc mb minio/prd-infra-raw-logs-archives --ignore-existing; mc mb minio/int-infra-raw-logs-archives --ignore-existing; mc mb minio/stg-infra-raw-logs-archives --ignore-existing; mc mb minio/support-infra-raw-logs-archives --ignore-existing; mc mb minio/output-b --ignore-existing; echo 'done'; "
+
+    networks:
+      - consolidator-network
+  log-consolidator:
+    image: log-consolidator:dev
+    container_name: log-consolidator
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      LOG_CONSOLIDATOR_S3_ENDPOINT: "http://minio:9000"
+      LOG_CONSOLIDATOR_S3_ACCESS_KEY_ID: "minioadmin"
+      LOG_CONSOLIDATOR_S3_SECRET_ACCESS_KEY: "minioadmin"
+      LOG_CONSOLIDATOR_S3_REGION: "us-east-1"
+      LOG_CONSOLIDATOR_S3_FORCE_PATH_STYLE: "true"
+      LOG_CONSOLIDATOR_S3_NO_RETRY_INCREMENT: "10"
+      LOG_CONSOLIDATOR_S3_RETRY_COST: "1"
+      LOG_CONSOLIDATOR_S3_RETRY_TIMEOUT_COST: "2"
+      LOG_CONSOLIDATOR_TARGET_SPEC_PATH: /config.yaml
+      # LOG_CONSOLIDATOR_TARGET_TIME: "2025-06-08T08:00:00+00:00"
+    volumes:
+      # - ./mock_data/config.yaml:/app/config.yaml:ro
+      - ./mock_data/config-compose.yaml:/config.yaml:ro
+    command: ["--config", "/app/config.yaml"]
+    networks:
+      - consolidator-network
+volumes:
+  minio_data:
+networks:
+  consolidator-network:
+    driver: bridge

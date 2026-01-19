@@ -1,0 +1,33 @@
+bucketsToConsolidate:
+  - bucket: 'input-a'
+    path:
+      # - static_path: 'logs'
+      - datefmt: '2006/01/02/15'
+    # only_prefix_patterns:
+    #   - .*
+    force_env: support
+  - bucket: 'input-b'
+    path:
+      # - static_path: 'datadog'
+      - datefmt: 'dt=20060102/h=15'
+    force_env: int
+    proceed_without_matching_objects: true
+  - bucket: 'input-c'
+    path:
+      # - static_path: 'logs'
+      - datefmt: '2006/01/02/15'
+    force_env: stg
+bucketsConsolidated:
+  - bucket: output-a
+    path:
+      # - static_path: log-archives
+      # - static: log-archives
+      - datefmt: 'dt=20060102/h=15'
+bucketsCheckerResults:
+  - bucket: 'output-b'
+    path:
+      - datefmt: 'results-continuous/dt=20060102/hour=15'
+continuousConsolidation:
+  maxAge: 528h # 30 days
+  minAge: 70m
+  step: 1h

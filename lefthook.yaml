@@ -1,0 +1,10 @@
+skip_output: [meta, success]
+pre-commit:
+  commands:
+    test:
+      tags: test
+      run: cargo test
+    fmt:
+      tags: fmt
+      stage_fixed: true
+      run: cargo fmt

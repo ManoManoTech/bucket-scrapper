@@ -2,6 +2,86 @@
 
 A Rust-based CLI tool for verifying log consolidation in S3 buckets. This tool parses YAML configuration files and can check S3 files between specified dates.
 
+## Architecture
+
+The Log Consolidator Checker operates within the following log processing architecture:
+
+```mermaid
+flowchart TD
+    %% Sources de logs
+    Vector["Log Aggregators<br/>(EC2)<br/>Vector"]
+    Datadog["Datadog"]
+
+    %% Long Term Storage
+    subgraph LTS["Long Term Storage"]
+        VectorArchives["Vector Log Archives"]
+        DatadogArchives["Datadog Log Archives"]
+
+        %% Log Consolidator
+        LogConsolidator["Log Consolidator<br/>cronjob<br/>compress & sort"]
+
+        %% Consolidated Archives
+        ConsolidatedArchives["Consolidated Log Archives"]
+    end
+
+    %% Services de consommation
+    ArchiveAccess["Archive Access"]
+    CheapLogDigger["Cheap Log Digger"]
+
+    %% Monitoring et vérification
+    LogConsolidatorChecker["Log Consolidator Checker<br/>verification tool"]
+
+    %% Connexions principales
+    Vector --> VectorArchives
+    Datadog --> DatadogArchives
+
+    %% Consolidation
+    VectorArchives --> LogConsolidator
+    DatadogArchives --> LogConsolidator
+    LogConsolidator --> ConsolidatedArchives
+
+    %% Consommation
+    ConsolidatedArchives --> ArchiveAccess
+    ConsolidatedArchives --> CheapLogDigger
+
+    %% Vérification (lecture seule)
+    VectorArchives -.-> LogConsolidatorChecker
+    DatadogArchives -.-> LogConsolidatorChecker
+    ConsolidatedArchives -.-> LogConsolidatorChecker
+```
+
+The Log Consolidator Checker reads from input buckets (Vector and Datadog archives) and output buckets (Consolidated archives) to verify that all logs have been properly consolidated.
+
+## Log Format Specifications
+
+### Input Buckets
+
+#### Vector Log Archives Bucket
+- **AWS Console**: `support-infra-raw-logs-archives`
+- **Format**: JSONLines+GZip
+- **File naming**: `YYYY/MM/DD/HH/xxxx.zip`
+- **Characteristics**: Files have no trailing newlines
+- **Content**: Logs from aggregators not sent to Datadog
+
+#### Datadog Log Archives Bucket
+- **AWS Console**: `support-infra-datadog-logs-rehydrate-archives`
+- **Format**: JSONLines+GZip
+- **File naming**: `datadog/dt=YYYYMMDD/h=HH/xxxx.zip`
+- **Characteristics**: Files have trailing newlines
+- **Content**: All logs sent to Datadog, regardless of indexing or retention
+
+### Output Buckets
+
+#### Consolidated Log Archives Bucket
+- **AWS Console**: `support-infra-log-consolidator-archives`
+- **Format**: JSONLines+Zstd
+- **File naming**: `log-archives/dt=YYYYMMDD/h=HH/env-service.json.zst`
+- **Errata files**: `log-archives-errata/<erratum-id>/dt=YYYYMMDD/h=HH/env-service.json.zst`
+- **Characteristics**:
+  - ~60% smaller than input files due to zstd compression
+  - Organized by environment and service for efficient access
+  - Enables per-environment/per-service retention policies
+
 ## Features
 
 - Parse YAML configuration files for bucket information
@@ -65,7 +145,6 @@ bucketsCheckerResults:
 ## Authentication
 
 This tool uses the AWS SDK for Rust, which automatically loads credentials from:
-
 - Environment variables
 - AWS credentials file (~/.aws/credentials)
 - IAM instance profiles (when running on EC2)

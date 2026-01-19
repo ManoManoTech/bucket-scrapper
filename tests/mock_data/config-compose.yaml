@@ -1,0 +1,36 @@
+bucketsToConsolidate: # The source buckets
+  # NOTE: works with docker-compose
+  - bucket: 'support-infra-datadog-logs-rehydrate-archives'
+    path:
+      - static_path: 'nginx'
+      - datefmt: 'dt=20060102/hour=15'
+    force_env: support
+  - bucket: 'prd-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: production
+  - bucket: 'int-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: int
+  - bucket: 'stg-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: stg
+  - bucket: 'support-infra-raw-logs-archives'
+    path:
+      - datefmt: '2006/01/02/15'
+    force_env: support
+bucketsConsolidated:
+  - bucket: support-infra-log-consolidator-archives
+    path:
+      - static_path: log-archives
+      - datefmt: 'dt=20060102/h=15'
+bucketsCheckerResults:
+  - bucket: 'output-b'
+    path:
+      - datefmt: 'results-continuous/dt=20060102/hour=15'
+continuousConsolidation:
+  maxAge: 528h # 30 days
+  minAge: 70m
+  step: 1h

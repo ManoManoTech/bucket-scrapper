@@ -1,0 +1,2 @@
+{"timestamp":"2023-12-25T14:00:00Z","level":"info","message":"Support app started","service":"app","env":"support"}
+{"timestamp":"2023-12-25T14:00:05Z","level":"info","message":"EXTRA DATA: Support app additional log","service":"app","env":"support"}

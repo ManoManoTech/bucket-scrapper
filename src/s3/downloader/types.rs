@@ -1,5 +1,5 @@
 // src/s3/downloader/types.rs
-use crate::utils::memory_limited_allocator::{LimitedVec};
+use crate::utils::memory_limited_allocator::LimitedVec;
 
 /// Enum representing different compression types
 #[derive(Debug, Clone)]

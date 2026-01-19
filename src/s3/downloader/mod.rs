@@ -1,6 +1,6 @@
 // src/s3/downloader/mod.rs
-mod downloader;
 mod download_orchestrator;
+mod downloader;
 mod processor;
 mod types;
 

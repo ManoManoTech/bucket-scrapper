@@ -1,11 +1,11 @@
 // src/utils/memory_limited_allocator.rs
+use dashmap::DashMap;
+use rand::prelude::*;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use rand::prelude::*;
-use dashmap::DashMap;
 
 // The core structure that tracks memory allocation
 struct MemoryLimiter {
@@ -28,7 +28,10 @@ impl MemoryLimiter {
     // Try to allocate memory
     fn try_allocate(&mut self, size: usize) -> bool {
         if size > (self.total_capacity as f64 * 0.85) as usize {
-            panic!("Allocation of {} is unlikely to ever complete in a pool of {}, you must increase pool size", size, self.total_capacity);
+            panic!(
+                "Allocation of {} is unlikely to ever complete in a pool of {}, you must increase pool size",
+                size, self.total_capacity
+            );
         }
 
         if self.current_usage + size <= self.total_capacity {
@@ -57,7 +60,7 @@ impl MemoryLimiter {
                 waker.wake_by_ref();
             }
         }
-        
+
         waiters_to_pop.iter().for_each(|waiter_id| {
             self.waiters.remove(&waiter_id);
         })
@@ -100,7 +103,9 @@ impl Future for AllocFuture {
         }
 
         // Couldn't allocate, register waker
-        limiter.waiters.insert(self.id, (self.size, cx.waker().clone()));
+        limiter
+            .waiters
+            .insert(self.id, (self.size, cx.waker().clone()));
         Poll::Pending
     }
 }
@@ -188,6 +193,10 @@ impl MemoryLimitedAllocator {
     // Get the number of waiters (tasks waiting for memory)
     pub fn waiters_count_and_size(&self) -> (usize, usize, usize) {
         let limiter = self.limiter.lock().unwrap();
-        (limiter.get_waiters_count(), limiter.get_waiters_total_size(), limiter.get_loan_count())
+        (
+            limiter.get_waiters_count(),
+            limiter.get_waiters_total_size(),
+            limiter.get_loan_count(),
+        )
     }
 }
