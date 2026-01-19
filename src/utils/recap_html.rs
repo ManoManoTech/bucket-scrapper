@@ -177,13 +177,13 @@ pub fn aggregate_by_day(
                 date
             };
 
-            // Only show missing hours if the day has NO check results at all
-            // If we have some results, we prioritize showing OK/failed status
-            let effective_missing = if hours.is_empty() {
-                missing
-            } else {
-                Vec::new()
-            };
+            // Show missing hours regardless of whether other hours have results
+            // This handles the case where some hours have check results but others are missing
+            let checked_hours: HashSet<String> = hours.iter().map(|(h, _, _, _, _, _)| h.clone()).collect();
+            let effective_missing: Vec<String> = missing
+                .into_iter()
+                .filter(|h| !checked_hours.contains(h))
+                .collect();
 
             DaySummary {
                 date: formatted_date,
@@ -238,14 +238,18 @@ pub fn generate_recap_html(summaries: &[DaySummary]) -> String {
             // Both missing and failed
             ("mixed", format!("{}KO+{}?", failed_count, missing_count))
         } else if missing_count > 0 {
-            // Only missing (unchecked)
+            // Missing checks - distinguish between fully unchecked and partial missing
             match missing_count {
                 24 => ("unchecked", "unchecked".to_string()),
                 1 => {
                     let hour = &summary.missing_hours[0];
-                    ("unchecked", format!("?,H={}", hour))
+                    // Use "partial" class when some hours are OK but one is missing
+                    ("partial", format!("MISS,H={}", hour))
                 }
-                n => ("unchecked", format!("{}/24 ?", n)),
+                n => {
+                    // Use "partial" class when some hours are OK but others missing
+                    ("partial", format!("{}/24 MISS", n))
+                }
             }
         } else if failed_count > 0 {
             // Only failed
@@ -353,6 +357,7 @@ pub fn generate_recap_html(summaries: &[DaySummary]) -> String {
     .warn {{ background-color: #FFC107; color: black; }}
     .fail {{ background-color: #F44336; color: white; }}
     .unchecked {{ background-color: #9E9E9E; color: white; }}
+    .partial {{ background-color: #E91E63; color: white; }}
     .mixed {{ background-color: #FF9800; color: white; }}
     .cleaned {{ background-color: #9C27B0; color: white; }}
     .toconsolidate {{ background-color: #607D8B; color: white; }}
@@ -378,7 +383,11 @@ pub fn generate_recap_html(summaries: &[DaySummary]) -> String {
       </div>
       <div class="legend-item">
         <div class="legend-color unchecked"></div>
-        <span>Unchecked &mdash; shows "N/24 ?" (N = unchecked count) or "unchecked" if all 24</span>
+        <span>Unchecked &mdash; all 24 hours have no check result file</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color partial"></div>
+        <span>Partial missing &mdash; shows "N/24 MISS" (some hours OK, N hours have no check file)</span>
       </div>
       <div class="legend-item">
         <div class="legend-color mixed"></div>
@@ -400,7 +409,7 @@ pub fn generate_recap_html(summaries: &[DaySummary]) -> String {
     <div style="margin-top: 8px; color: #666;">
       <strong>OK</strong> = consolidation check passed &nbsp;|&nbsp;
       <strong>KO</strong> = consolidation check failed &nbsp;|&nbsp;
-      <strong>?</strong> = not yet checked &nbsp;|&nbsp;
+      <strong>MISS</strong> = check result file missing &nbsp;|&nbsp;
       <strong>CLN</strong> = cleaned (input files removed) &nbsp;|&nbsp;
       <strong>TODO</strong> = to consolidate &nbsp;|&nbsp;
       <strong>PEND</strong> = pending consolidation
