@@ -6,8 +6,8 @@ RUN useradd --create-home --user-group log-consolidator-checker-rs
 
 WORKDIR /app
 
-ADD --chown log-consolidator-checker-rs:log-consolidator-checker-rs \
-    --chmod 755 target/release/log-consolidator-checker-rust .
+ADD --chown=log-consolidator-checker-rs:log-consolidator-checker-rs \
+    --chmod=755 target/release/log-consolidator-checker-rust .
 
 USER log-consolidator-checker-rs
 
