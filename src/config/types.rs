@@ -24,12 +24,38 @@ pub struct BucketConfig {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
+/// Configuration for continuous consolidation mode.
+/// Allows the checker to automatically select a target hour to check.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuousConsolidationConfig {
+    /// Minimum age before checking (e.g., "70m" for 70 minutes).
+    /// Hours newer than (now - min_age) are not eligible.
+    pub min_age: String,
+
+    /// Maximum age to consider (e.g., "528h" for 22 days).
+    /// Hours older than (now - max_age) are not considered.
+    pub max_age: String,
+
+    /// Step interval (always "1h" for hourly granularity).
+    /// Currently unused but preserved for config compatibility.
+    #[serde(default = "default_step")]
+    pub step: String,
+}
+
+fn default_step() -> String {
+    "1h".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(non_snake_case)]
 pub struct ConfigSchema {
     pub bucketsToConsolidate: Vec<BucketConfig>,
     pub bucketsConsolidated: Vec<BucketConfig>,
     pub bucketsCheckerResults: Vec<BucketConfig>,
+    /// Optional continuous consolidation config for auto-selecting target hours
+    #[serde(default)]
+    pub continuousConsolidation: Option<ContinuousConsolidationConfig>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }

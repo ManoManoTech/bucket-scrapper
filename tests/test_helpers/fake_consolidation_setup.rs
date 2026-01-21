@@ -174,6 +174,7 @@ impl FakeConsolidationEnvironment {
                 extra: HashMap::new(),
             }],
             bucketsCheckerResults: vec![],
+            continuousConsolidation: None,
             extra: HashMap::new(),
         };
 

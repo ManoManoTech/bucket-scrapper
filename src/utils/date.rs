@@ -3,7 +3,7 @@ use crate::config::types::{DateString, HourString};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DateHour {
     pub date: DateString,
     pub hour: HourString,

@@ -1,6 +1,7 @@
 // src/main.rs
 // Location: src/main.rs
 mod config;
+mod continuous;
 mod s3;
 mod utils;
 
@@ -76,15 +77,19 @@ enum Commands {
         end: String,
     },
 
-    /// Check a specific date and hour
+    /// Check a specific date and hour, or auto-select in continuous mode
     Check {
-        /// Date in YYYYMMDD format
+        /// Date in YYYYMMDD format (optional in continuous mode)
         #[arg(short, long)]
-        date: String,
+        date: Option<String>,
 
-        /// Hour in HH format (00-23)
+        /// Hour in HH format 00-23 (optional in continuous mode)
         #[arg(short = 'H', long)]
-        hour: String,
+        hour: Option<String>,
+
+        /// Dry run: show which hour would be selected without running check
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
     },
 
     /// Generate a recap/summary of consolidation checks over a date range
@@ -255,11 +260,92 @@ async fn run() -> Result<()> {
             }
         }
 
-        Commands::Check { date, hour } => {
-            info!(target_date = %date, target_hour = %hour, "Starting consolidation check");
+        Commands::Check { date, hour, dry_run } => {
+            // Determine target date/hour - either explicit or via continuous mode
+            let (target_date, target_hour) = match (date, hour) {
+                // Explicit date/hour provided - use them
+                (Some(d), Some(h)) => (d.clone(), h.clone()),
+
+                // Partial arguments - error
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(anyhow::anyhow!(
+                        "Both --date and --hour must be provided together, or neither (for continuous mode)"
+                    ));
+                }
+
+                // Neither provided - use continuous mode
+                (None, None) => {
+                    // Check if continuousConsolidation config exists
+                    let continuous_config = config.continuousConsolidation.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No --date/--hour provided and no continuousConsolidation config found. \
+                             Either provide explicit date/hour or add continuousConsolidation to config."
+                        )
+                    })?;
+
+                    info!("Continuous mode: auto-selecting target hour");
+
+                    // Generate candidate hours
+                    let now = Utc::now();
+                    let candidates = continuous::generate_candidate_hours(continuous_config, now)?;
+
+                    if candidates.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "No candidate hours in range (minAge: {}, maxAge: {})",
+                            continuous_config.min_age,
+                            continuous_config.max_age
+                        ));
+                    }
+
+                    info!(
+                        min_age = %continuous_config.min_age,
+                        max_age = %continuous_config.max_age,
+                        total_candidates = candidates.len(),
+                        oldest = format!("{}/{}", candidates.first().map(|c| &c.date).unwrap_or(&String::new()),
+                                                  candidates.first().map(|c| &c.hour).unwrap_or(&String::new())),
+                        newest = format!("{}/{}", candidates.last().map(|c| &c.date).unwrap_or(&String::new()),
+                                                  candidates.last().map(|c| &c.hour).unwrap_or(&String::new())),
+                        "Generated candidate hours for continuous mode"
+                    );
+
+                    // Select target hour (batch size 16 for parallel checks)
+                    let selection =
+                        continuous::select_target_hour(&config, &s3_client, candidates, 16).await?;
+
+                    match selection.selected {
+                        Some(target) => {
+                            info!(
+                                date = %target.date,
+                                hour = %target.hour,
+                                reason = %selection.reason,
+                                candidates_scanned = selection.candidates_scanned,
+                                "Target hour selected"
+                            );
+
+                            if *dry_run {
+                                info!("Dry run mode - exiting without performing check");
+                                println!("{}\t{}", target.date, target.hour);
+                                return Ok(());
+                            }
+
+                            (target.date, target.hour)
+                        }
+                        None => {
+                            info!(
+                                reason = %selection.reason,
+                                candidates_scanned = selection.candidates_scanned,
+                                "No target hour needs checking - all candidates passed or ineligible"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+
+            info!(target_date = %target_date, target_hour = %target_hour, "Starting consolidation check");
 
             // Log memory buffer settings
-            info!(target_date = %date, target_hour = %hour, memory_pool_mb = cli.memory_pool_mb, "Memory pool configured");
+            info!(target_date = %target_date, target_hour = %target_hour, memory_pool_mb = cli.memory_pool_mb, "Memory pool configured");
 
             // Create a checker with memory limits
             let checker = Checker::new(
@@ -272,11 +358,11 @@ async fn run() -> Result<()> {
             // Set up signal handler for memory monitoring if enabled
             if cli.enable_signals {
                 // Get references to memory allocators from the checker
-                if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
+                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
                     if let Err(e) = memory_monitor.setup_signal_handler() {
-                        warn!(target_date = %date, target_hour = %hour, error = %e, "Failed to set up signal handler");
+                        warn!(target_date = %target_date, target_hour = %target_hour, error = %e, "Failed to set up signal handler");
                     } else {
-                        info!(target_date = %date, target_hour = %hour, pid = std::process::id(), "Signal handler ready (SIGUSR2)");
+                        info!(target_date = %target_date, target_hour = %target_hour, pid = std::process::id(), "Signal handler ready (SIGUSR2)");
                     }
                 }
             }
@@ -284,7 +370,7 @@ async fn run() -> Result<()> {
             // Spawn a background task for periodic updates with cancellation
             let cancel_token = tokio_util::sync::CancellationToken::new();
             let cancel_token_clone = cancel_token.clone();
-            if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
+            if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -309,13 +395,13 @@ async fn run() -> Result<()> {
 
             // Perform comparison
             let result = checker
-                .get_comparison_results(&archived_buckets, consolidated_bucket, date, hour)
+                .get_comparison_results(&archived_buckets, consolidated_bucket, &target_date, &target_hour)
                 .await?;
 
             // Upload check result to S3
             if let Some(results_bucket) = get_results_bucket(&config) {
                 checker
-                    .upload_check_result(results_bucket, date, hour, &result)
+                    .upload_check_result(results_bucket, &target_date, &target_hour, &result)
                     .await?;
             } else {
                 warn!("No results bucket configured, skipping upload");
@@ -347,7 +433,7 @@ async fn run() -> Result<()> {
 
             // Output result
             if result.ok {
-                info!("✅ Check passed for {}/{}", date, hour);
+                info!("✅ Check passed for {}/{}", target_date, target_hour);
                 info!("Message: {}", result.message);
 
                 // info!("Archived buckets:");
@@ -368,7 +454,7 @@ async fn run() -> Result<()> {
                 //     result.consolidated_data.total_archives_size
                 // );
             } else {
-                warn!("❌ Check failed for {}/{}", date, hour);
+                warn!("❌ Check failed for {}/{}", target_date, target_hour);
                 warn!("Message: {}", result.message);
 
                 // In a real implementation, we would output detailed failure information
@@ -377,7 +463,7 @@ async fn run() -> Result<()> {
             // Cancel periodic logging task and log final memory stats
             cancel_token.cancel();
             if cli.enable_signals {
-                if let Some(memory_monitor) = checker.get_memory_monitor(date, hour) {
+                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
                     memory_monitor.log_memory_stats();
                 }
             }
@@ -385,9 +471,9 @@ async fn run() -> Result<()> {
             // Output result - exit 0 regardless of check result
             // The check result (pass/fail) is reported in logs and S3, not via exit code
             if result.ok {
-                info!(target_date = %date, target_hour = %hour, "Check passed");
+                info!(target_date = %target_date, target_hour = %target_hour, "Check passed");
             } else {
-                error!(target_date = %date, target_hour = %hour, message = %result.message, "Check failed");
+                error!(target_date = %target_date, target_hour = %target_hour, message = %result.message, "Check failed");
             }
         }
 
