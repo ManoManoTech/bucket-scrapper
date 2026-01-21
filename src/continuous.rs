@@ -14,7 +14,7 @@ use anyhow::Result;
 use aws_sdk_s3::Client;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use futures::{stream, StreamExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Status of a candidate hour for checking
 #[derive(Debug, Clone)]
@@ -212,12 +212,18 @@ pub async fn select_target_hour(
                     );
                 }
                 CandidateStatus::Error(e) => {
-                    warn!(
+                    error!(
                         date = %candidate.date,
                         hour = %candidate.hour,
                         error = %e,
-                        "Error checking candidate status"
+                        "Error checking candidate status - aborting"
                     );
+                    return Err(anyhow::anyhow!(
+                        "Failed to check candidate {}/{}: {}",
+                        candidate.date,
+                        candidate.hour,
+                        e
+                    ));
                 }
             }
         }

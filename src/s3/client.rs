@@ -178,11 +178,19 @@ impl WrappedS3Client {
             };
 
             let response = list_objects_req.send().await.map_err(|e| {
-                let err_msg = e.to_string();
+                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
                 if err_msg.contains("dispatch failure") {
                     anyhow::anyhow!(
                         "S3 request failed: {}. This often indicates expired AWS credentials. \
                          Try running 'aws sso login' or check your AWS_* environment variables.",
+                        err_msg
+                    )
+                } else if err_msg.contains("service error") {
+                    // Extract more detail from service errors
+                    anyhow::anyhow!(
+                        "S3 request to bucket '{}' prefix '{}' failed: {}",
+                        bucket,
+                        prefix,
                         err_msg
                     )
                 } else {
