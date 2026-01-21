@@ -2,6 +2,10 @@
 
 FROM 304971447450.dkr.ecr.eu-west-3.amazonaws.com/public/library/debian:trixie-slim
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --user-group log-consolidator-checker-rs
 
 WORKDIR /app
