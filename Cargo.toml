@@ -49,9 +49,9 @@ aws-credential-types = "1.1.3"
 
 [package]
 name = "log-consolidator-checker-rust"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-authors = ["Elie Bleton <elie.bleton@manomano.com>"]
+authors = ["Elie Bleton <elie.bleton@manomano.com>", "Julien Dauliac <julien.dauliac@manomano.com>"]
 description = "A tool to check that log consolidation in S3 has been done correctly"
 
 [profile.release]
