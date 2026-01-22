@@ -333,9 +333,9 @@ impl Checker {
             let results = futures::future::join_all(file_lists_futures).await;
             // First result is consolidated, rest are archived
             for (idx, result) in results.into_iter().enumerate() {
+                let is_consolidated = idx == 0;
                 match result {
                     Ok(mut analysis) => {
-                        let is_consolidated = idx == 0;
                         let files_count = analysis.files.len();
 
                         if is_consolidated {
@@ -353,7 +353,25 @@ impl Checker {
                         );
                         file_lists.append(analysis.files.as_mut());
                     }
-                    Err(e) => return Err(anyhow::anyhow!("Failed to list files in bucket: {}", e)),
+                    Err(e) => {
+                        if is_consolidated {
+                            // Consolidated bucket failure is critical
+                            return Err(anyhow::anyhow!("Failed to list consolidated bucket: {}", e));
+                        } else {
+                            // Archived bucket failure - skip with warning
+                            // Some buckets may not exist or be inaccessible in certain environments
+                            let bucket_name = archived_bucket_configs
+                                .get(idx - 1)
+                                .map(|b| b.bucket.as_str())
+                                .unwrap_or("unknown");
+                            warn!(
+                                bucket = %bucket_name,
+                                error_message = %e,
+                                error_debug = ?e,
+                                "Failed to list archived bucket, skipping"
+                            );
+                        }
+                    }
                 }
             }
 
