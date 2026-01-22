@@ -256,22 +256,36 @@ async fn check_candidate_status(
         return CandidateStatus::NoArchivedData;
     }
 
-    // Step 2: Check if consolidated bucket has files
-    let has_consolidated = match check_bucket_has_files(client, s3_client, consolidated_bucket, date, hour).await {
-        Ok(has) => has,
+    // Step 2: Check if consolidated bucket has files and get latest timestamp
+    let consolidated_latest = match get_bucket_latest_timestamp(client, s3_client, consolidated_bucket, date, hour).await {
+        Ok(Some(ts)) => ts,
+        Ok(None) => return CandidateStatus::NoConsolidatedData,
         Err(e) => return CandidateStatus::Error(format!("Error checking consolidated bucket: {}", e)),
     };
 
-    if !has_consolidated {
-        return CandidateStatus::NoConsolidatedData;
-    }
-
-    // Step 3: Both have data - check results bucket
-    match check_result_status(client, s3_client, results_bucket, date, hour).await {
+    // Step 3: Both have data - check results bucket and compare timestamps
+    match check_result_status_with_timestamp(client, s3_client, results_bucket, date, hour).await {
         Ok(None) => CandidateStatus::NeedsCheck,
-        Ok(Some((true, _))) => CandidateStatus::AlreadyPassed,
-        Ok(Some((false, msg))) => CandidateStatus::NeedsRetry {
-            previous_message: msg,
+        Ok(Some((ok, msg, check_timestamp))) => {
+            // If consolidated output is newer than the check, re-check
+            if consolidated_latest > check_timestamp {
+                debug!(
+                    date = %date,
+                    hour = %hour,
+                    consolidated_latest = %consolidated_latest,
+                    check_timestamp = %check_timestamp,
+                    "Consolidated output is newer than last check - needs recheck"
+                );
+                CandidateStatus::NeedsRetry {
+                    previous_message: format!("Output updated after last check (output: {}, check: {})",
+                        consolidated_latest.format("%Y-%m-%dT%H:%M:%SZ"),
+                        check_timestamp.format("%Y-%m-%dT%H:%M:%SZ")),
+                }
+            } else if ok {
+                CandidateStatus::AlreadyPassed
+            } else {
+                CandidateStatus::NeedsRetry { previous_message: msg }
+            }
         },
         Err(e) => CandidateStatus::Error(format!("Error checking result: {}", e)),
     }
@@ -313,30 +327,43 @@ async fn check_any_bucket_has_files(
     Ok(false)
 }
 
-/// Check if a single bucket has files for the given date/hour
-async fn check_bucket_has_files(
+/// Get the latest file timestamp from a bucket for the given date/hour
+/// Returns: Ok(Some(timestamp)) if files exist, Ok(None) if empty
+async fn get_bucket_latest_timestamp(
     client: &Client,
     s3_client: &WrappedS3Client,
     bucket: &BucketConfig,
     date: &String,
     hour: &String,
-) -> Result<bool> {
+) -> Result<Option<DateTime<Utc>>> {
     let file_list = s3_client
         .get_matching_filenames_from_s3_with_client(client, bucket, date, hour, false)
         .await?;
 
-    Ok(!file_list.files.is_empty())
+    if file_list.files.is_empty() {
+        return Ok(None);
+    }
+
+    // Get the latest last_modified timestamp from all files
+    let latest = file_list
+        .files
+        .iter()
+        .map(|f| f.last_modified)
+        .max()
+        .unwrap_or_else(Utc::now);
+
+    Ok(Some(latest))
 }
 
-/// Check the result status for a given date/hour.
-/// Returns: Ok(None) if no result, Ok(Some((ok, message))) if result exists
-async fn check_result_status(
+/// Check the result status for a given date/hour, including timestamp.
+/// Returns: Ok(None) if no result, Ok(Some((ok, message, timestamp))) if result exists
+async fn check_result_status_with_timestamp(
     client: &Client,
     s3_client: &WrappedS3Client,
     results_bucket: &BucketConfig,
     date: &String,
     hour: &String,
-) -> Result<Option<(bool, String)>> {
+) -> Result<Option<(bool, String, DateTime<Utc>)>> {
     let file_list = s3_client
         .get_matching_filenames_from_s3_with_client(client, results_bucket, date, hour, false)
         .await?;
@@ -345,8 +372,10 @@ async fn check_result_status(
         return Ok(None);
     }
 
-    // Download the last result file (check_result.json comes last lexicographically)
+    // Get the last result file (check_result.json comes last lexicographically)
     if let Some(file) = file_list.files.last() {
+        let check_timestamp = file.last_modified;
+
         let bytes = s3_client
             .download_object_with_client(client, &file.bucket, &file.key)
             .await?;
@@ -361,7 +390,7 @@ async fn check_result_status(
             .unwrap_or("")
             .to_string();
 
-        return Ok(Some((ok, message)));
+        return Ok(Some((ok, message, check_timestamp)));
     }
 
     Ok(None)
