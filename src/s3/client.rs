@@ -179,6 +179,17 @@ impl WrappedS3Client {
 
             let response = list_objects_req.send().await.map_err(|e| {
                 let err_msg = format!("{:#}", e); // Use alternate format for full error chain
+                let err_debug = format!("{:?}", e); // Debug format for maximum details
+
+                // Log detailed error information for debugging
+                warn!(
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    error_message = %err_msg,
+                    error_debug = %err_debug,
+                    "S3 list_objects_v2 failed"
+                );
+
                 if err_msg.contains("dispatch failure") {
                     anyhow::anyhow!(
                         "S3 request failed: {}. This often indicates expired AWS credentials. \
@@ -188,13 +199,13 @@ impl WrappedS3Client {
                 } else if err_msg.contains("service error") {
                     // Extract more detail from service errors
                     anyhow::anyhow!(
-                        "S3 request to bucket '{}' prefix '{}' failed: {}",
+                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
                         bucket,
                         prefix,
                         err_msg
                     )
                 } else {
-                    anyhow::anyhow!("S3 request to bucket '{}' failed: {}", bucket, err_msg)
+                    anyhow::anyhow!("S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}", bucket, prefix, err_msg)
                 }
             })?;
             debug!(
@@ -339,7 +350,18 @@ impl WrappedS3Client {
             .send()
             .await
             .map_err(|e| {
-                let err_msg = e.to_string();
+                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
+                let err_debug = format!("{:?}", e); // Debug format for maximum details
+
+                // Log detailed error information for debugging
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    error_message = %err_msg,
+                    error_debug = %err_debug,
+                    "S3 get_object failed"
+                );
+
                 if err_msg.contains("dispatch failure") {
                     anyhow::anyhow!(
                         "S3 download failed: {}. This often indicates expired AWS credentials. \
@@ -348,7 +370,7 @@ impl WrappedS3Client {
                     )
                 } else {
                     anyhow::anyhow!(
-                        "S3 download from bucket '{}' key '{}' failed: {}",
+                        "S3 get_object from bucket '{}' key '{}' failed: {}",
                         bucket,
                         key,
                         err_msg
@@ -396,11 +418,23 @@ impl WrappedS3Client {
             .send()
             .await
             .map_err(|e| {
+                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
+                let err_debug = format!("{:?}", e); // Debug format for maximum details
+
+                // Log detailed error information for debugging
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    error_message = %err_msg,
+                    error_debug = %err_debug,
+                    "S3 put_object failed"
+                );
+
                 anyhow::anyhow!(
-                    "S3 upload to bucket '{}' key '{}' failed: {}",
+                    "S3 put_object to bucket '{}' key '{}' failed: {}",
                     bucket,
                     key,
-                    e
+                    err_msg
                 )
             })?;
 

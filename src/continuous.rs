@@ -286,9 +286,25 @@ async fn check_any_bucket_has_files(
     hour: &String,
 ) -> Result<bool> {
     for bucket in buckets {
-        let file_list = s3_client
+        let file_list = match s3_client
             .get_matching_filenames_from_s3_with_client(client, bucket, date, hour, false)
-            .await?;
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                // Log warning but continue checking other buckets
+                // Some buckets may not exist or be inaccessible in certain environments
+                warn!(
+                    bucket = %bucket.bucket,
+                    date = %date,
+                    hour = %hour,
+                    error_message = %e,
+                    error_debug = ?e,
+                    "Failed to list archived bucket, skipping"
+                );
+                continue;
+            }
+        };
 
         if !file_list.files.is_empty() {
             return Ok(true);
