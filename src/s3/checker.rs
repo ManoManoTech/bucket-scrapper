@@ -329,6 +329,8 @@ impl Checker {
         let mut file_lists = Vec::new();
         let mut archived_files_count = 0usize;
         let mut consolidated_files_count = 0usize;
+        let mut archived_buckets_failed: Vec<String> = Vec::new();
+        let mut archived_buckets_with_data = 0usize;
         {
             let results = futures::future::join_all(file_lists_futures).await;
             // First result is consolidated, rest are archived
@@ -342,6 +344,9 @@ impl Checker {
                             consolidated_files_count = files_count;
                         } else {
                             archived_files_count += files_count;
+                            if files_count > 0 {
+                                archived_buckets_with_data += 1;
+                            }
                         }
 
                         info!(
@@ -355,21 +360,43 @@ impl Checker {
                     }
                     Err(e) => {
                         if is_consolidated {
-                            // Consolidated bucket failure is critical
-                            return Err(anyhow::anyhow!("Failed to list consolidated bucket: {}", e));
+                            // Consolidated bucket failure is critical - return error result
+                            let end_time = Utc::now();
+                            error!(
+                                bucket = %consolidated_bucket_config.bucket,
+                                error_message = %e,
+                                error_debug = ?e,
+                                "Failed to list consolidated bucket"
+                            );
+                            return Ok(ComparisonResult {
+                                ok: false,
+                                date: date.clone(),
+                                hour: hour.clone(),
+                                message: format!(
+                                    "Failed to list consolidated bucket '{}': {}",
+                                    consolidated_bucket_config.bucket, e
+                                ),
+                                analysis_start_date: start_time.to_rfc3339(),
+                                analysis_end_date: end_time.to_rfc3339(),
+                                archived_files_count: 0,
+                                consolidated_files_count: 0,
+                                archived_counts: DetailedCharacterCount::new(),
+                                consolidated_counts: DetailedCharacterCount::new(),
+                                differences: HashMap::new(),
+                            });
                         } else {
-                            // Archived bucket failure - skip with warning
-                            // Some buckets may not exist or be inaccessible in certain environments
+                            // Archived bucket failure - track it for reporting
                             let bucket_name = archived_bucket_configs
                                 .get(idx - 1)
-                                .map(|b| b.bucket.as_str())
-                                .unwrap_or("unknown");
+                                .map(|b| b.bucket.clone())
+                                .unwrap_or_else(|| "unknown".to_string());
                             warn!(
                                 bucket = %bucket_name,
                                 error_message = %e,
                                 error_debug = ?e,
-                                "Failed to list archived bucket, skipping"
+                                "Failed to list archived bucket"
                             );
+                            archived_buckets_failed.push(bucket_name);
                         }
                     }
                 }
@@ -380,27 +407,65 @@ impl Checker {
                 total_files = file_lists.len(),
                 archived_files = archived_files_count,
                 consolidated_files = consolidated_files_count,
+                archived_buckets_failed = ?archived_buckets_failed,
                 "Total files to download and analyze"
             );
+
+            // Handle case where ALL archived buckets failed
+            if archived_buckets_failed.len() == archived_bucket_configs.len() && !archived_bucket_configs.is_empty() {
+                let end_time = Utc::now();
+                error!(
+                    target_date = %date,
+                    target_hour = %hour,
+                    failed_buckets = ?archived_buckets_failed,
+                    "All archived buckets failed to list - cannot determine data state"
+                );
+                return Ok(ComparisonResult {
+                    ok: false,
+                    date: date.clone(),
+                    hour: hour.clone(),
+                    message: format!(
+                        "All archived buckets failed for {}/{}. Failed buckets: {}. Cannot determine data state.",
+                        date, hour, archived_buckets_failed.join(", ")
+                    ),
+                    analysis_start_date: start_time.to_rfc3339(),
+                    analysis_end_date: end_time.to_rfc3339(),
+                    archived_files_count: 0,
+                    consolidated_files_count,
+                    archived_counts: DetailedCharacterCount::new(),
+                    consolidated_counts: DetailedCharacterCount::new(),
+                    differences: HashMap::new(),
+                });
+            }
 
             // Handle case where there are no archived files (inputs)
             if archived_files_count == 0 {
                 let end_time = Utc::now();
+
+                // Check if some buckets failed while others were empty
+                let partial_failure_note = if !archived_buckets_failed.is_empty() {
+                    format!(" Note: {} bucket(s) failed to list: {}.",
+                        archived_buckets_failed.len(),
+                        archived_buckets_failed.join(", "))
+                } else {
+                    String::new()
+                };
 
                 // If there are no input files, there's nothing to consolidate - this is a valid state
                 if consolidated_files_count == 0 {
                     info!(
                         target_date = %date,
                         target_hour = %hour,
-                        "No files in archived buckets and no consolidated files - nothing to check"
+                        failed_buckets = ?archived_buckets_failed,
+                        "No files in archived buckets and no consolidated files - data deleted/cleaned"
                     );
                     return Ok(ComparisonResult {
                         ok: true,
                         date: date.clone(),
                         hour: hour.clone(),
                         message: format!(
-                            "No files to consolidate for {}/{}. Both archived and consolidated buckets are empty.",
-                            date, hour
+                            "Deleted: No files for {}/{}. Both archived and consolidated buckets are empty.{}",
+                            date, hour, partial_failure_note
                         ),
                         analysis_start_date: start_time.to_rfc3339(),
                         analysis_end_date: end_time.to_rfc3339(),
@@ -416,6 +481,7 @@ impl Checker {
                         target_date = %date,
                         target_hour = %hour,
                         consolidated_files = consolidated_files_count,
+                        failed_buckets = ?archived_buckets_failed,
                         "No archived files but consolidated files exist - input files cleaned up after consolidation"
                     );
                     return Ok(ComparisonResult {
@@ -424,8 +490,8 @@ impl Checker {
                         hour: hour.clone(),
                         message: format!(
                             "Cleaned: No input files for {}/{} but {} consolidated files exist. \
-                             Input files were cleaned up after successful consolidation.",
-                            date, hour, consolidated_files_count
+                             Input files were cleaned up after successful consolidation.{}",
+                            date, hour, consolidated_files_count, partial_failure_note
                         ),
                         analysis_start_date: start_time.to_rfc3339(),
                         analysis_end_date: end_time.to_rfc3339(),
@@ -565,11 +631,22 @@ impl Checker {
             )
             .emit();
 
+            // Add warning about partial bucket failures if any
+            let partial_failure_warning = if !archived_buckets_failed.is_empty() {
+                format!(
+                    " Warning: {} archived bucket(s) failed to list: {}.",
+                    archived_buckets_failed.len(),
+                    archived_buckets_failed.join(", ")
+                )
+            } else {
+                String::new()
+            };
+
             ComparisonResult {
                 date: date.clone(),
                 hour: hour.clone(),
                 ok: true,
-                message: "Consolidated size matches original size".to_string(),
+                message: format!("Consolidated size matches original size.{}", partial_failure_warning),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
                 archived_files_count,
@@ -622,14 +699,26 @@ impl Checker {
             )
             .emit();
 
+            // Add warning about partial bucket failures if any
+            let partial_failure_warning = if !archived_buckets_failed.is_empty() {
+                format!(
+                    " Warning: {} archived bucket(s) failed to list: {}.",
+                    archived_buckets_failed.len(),
+                    archived_buckets_failed.join(", ")
+                )
+            } else {
+                String::new()
+            };
+
             ComparisonResult {
                 date: date.clone(),
                 hour: hour.clone(),
                 ok: false,
                 message: format!(
-                    "Difference in character count: {} types differ by {} chars",
+                    "Difference in character count: {} types differ by {} chars.{}",
                     differences.len(),
-                    difference_total
+                    difference_total,
+                    partial_failure_warning
                 ),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
