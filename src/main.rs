@@ -16,10 +16,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use futures::{stream, StreamExt};
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn, Level};
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 use utils::date::date_range_to_date_hour_list;
 use utils::recap_html::{aggregate_by_day, generate_recap_html};
@@ -114,56 +112,10 @@ enum Commands {
     },
 }
 
-/// Custom writer that routes logs based on level:
-/// - INFO, DEBUG, TRACE → stdout
-/// - WARN, ERROR → stderr
-struct LevelBasedWriter;
-
-/// The actual writer returned by LevelBasedWriter
-enum LevelWriter {
-    Stdout(io::Stdout),
-    Stderr(io::Stderr),
-}
-
-impl Write for LevelWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            LevelWriter::Stdout(w) => w.write(buf),
-            LevelWriter::Stderr(w) => w.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            LevelWriter::Stdout(w) => w.flush(),
-            LevelWriter::Stderr(w) => w.flush(),
-        }
-    }
-}
-
-impl<'a> MakeWriter<'a> for LevelBasedWriter {
-    type Writer = LevelWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        // Default to stdout for cases where we don't have metadata
-        LevelWriter::Stdout(io::stdout())
-    }
-
-    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
-        if meta.level() <= &Level::WARN {
-            // WARN and ERROR go to stderr
-            LevelWriter::Stderr(io::stderr())
-        } else {
-            // INFO, DEBUG, TRACE go to stdout
-            LevelWriter::Stdout(io::stdout())
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        // Output error as JSON to maintain consistent log format
+        // Output error as JSON to stdout to maintain consistent log format
         let error_json = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "level": "ERROR",
@@ -171,7 +123,7 @@ async fn main() {
             "error": true,
             "target": "log_consolidator_checker_rust",
         });
-        eprintln!(
+        println!(
             "{}",
             serde_json::to_string(&error_json)
                 .unwrap_or_else(|_| format!("{{\"error\": \"{}\"}}", e))
@@ -187,6 +139,7 @@ async fn run() -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
+    // All logs go to stdout with level in JSON "level" field
     fmt()
         .json()
         .flatten_event(true)
@@ -195,7 +148,7 @@ async fn run() -> Result<()> {
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_writer(LevelBasedWriter)
+        .with_writer(std::io::stdout)
         .init();
 
     // Load configuration
