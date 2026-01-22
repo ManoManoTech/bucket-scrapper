@@ -443,3 +443,46 @@ impl WrappedS3Client {
         Ok(())
     }
 }
+
+/// Check if an S3 error is recoverable (can be skipped/retried) or fatal (should crash).
+///
+/// Non-recoverable errors indicate configuration/permission issues:
+/// - AccessDenied: IAM permission issue
+/// - InvalidAccessKeyId, SignatureDoesNotMatch: credential issue
+/// - ExpiredToken: credential expired
+/// - NoSuchBucket: bucket doesn't exist (configuration issue)
+/// - AccountProblem, InvalidSecurity: account issues
+///
+/// Recoverable errors are transient and can be retried/skipped:
+/// - Throttling, SlowDown: rate limiting
+/// - ServiceUnavailable, InternalError: temporary AWS issues
+/// - Network timeouts, connection errors
+pub fn is_recoverable_s3_error(error_msg: &str) -> bool {
+    // Non-recoverable error patterns - these should cause the checker to crash
+    let fatal_patterns = [
+        "AccessDenied",
+        "Access Denied",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "ExpiredToken",
+        "ExpiredTokenException",
+        "NoSuchBucket",
+        "InvalidBucketName",
+        "AccountProblem",
+        "InvalidSecurity",
+        "NotSignedUp",
+        "InvalidIdentityToken",
+        "MalformedPolicy",
+        "InvalidClientTokenId",
+    ];
+
+    // If any fatal pattern is found, the error is NOT recoverable
+    for pattern in &fatal_patterns {
+        if error_msg.contains(pattern) {
+            return false;
+        }
+    }
+
+    // All other errors are considered recoverable (transient)
+    true
+}

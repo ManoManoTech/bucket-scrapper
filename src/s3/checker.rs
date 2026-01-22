@@ -2,7 +2,7 @@
 // Location: src/s3/checker.rs
 
 use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
-use crate::s3::client::WrappedS3Client;
+use crate::s3::client::{is_recoverable_s3_error, WrappedS3Client};
 use crate::s3::downloader::DownloadOrchestrator;
 use crate::utils::character_counter::DetailedCharacterCount;
 use crate::utils::memory_limited_allocator::MemoryLimitedAllocator;
@@ -385,16 +385,28 @@ impl Checker {
                                 differences: HashMap::new(),
                             });
                         } else {
-                            // Archived bucket failure - track it for reporting
+                            // Archived bucket failure - check if recoverable
                             let bucket_name = archived_bucket_configs
                                 .get(idx - 1)
                                 .map(|b| b.bucket.clone())
                                 .unwrap_or_else(|| "unknown".to_string());
+                            let error_str = format!("{:#}", e);
+
+                            if !is_recoverable_s3_error(&error_str) {
+                                // Non-recoverable error (AccessDenied, NoSuchBucket, etc.) - crash
+                                return Err(anyhow::anyhow!(
+                                    "S3 error for bucket '{}': {}",
+                                    bucket_name,
+                                    error_str
+                                ));
+                            }
+
+                            // Recoverable error (transient) - track and skip
                             warn!(
                                 bucket = %bucket_name,
                                 error_message = %e,
                                 error_debug = ?e,
-                                "Failed to list archived bucket"
+                                "Failed to list archived bucket, skipping"
                             );
                             archived_buckets_failed.push(bucket_name);
                         }

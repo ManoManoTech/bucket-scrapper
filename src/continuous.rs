@@ -7,7 +7,7 @@
 
 use crate::config::loader::{get_archived_buckets, get_consolidated_buckets, get_results_bucket};
 use crate::config::types::{BucketConfig, ConfigSchema, ContinuousConsolidationConfig};
-use crate::s3::client::WrappedS3Client;
+use crate::s3::client::{is_recoverable_s3_error, WrappedS3Client};
 use crate::utils::date::{date_to_date_hour, DateHour};
 use crate::utils::duration_parser::{parse_duration, to_chrono_duration};
 use anyhow::Result;
@@ -306,8 +306,18 @@ async fn check_any_bucket_has_files(
         {
             Ok(list) => list,
             Err(e) => {
-                // Log warning but continue checking other buckets
-                // Some buckets may not exist or be inaccessible in certain environments
+                let error_str = format!("{:#}", e);
+
+                if !is_recoverable_s3_error(&error_str) {
+                    // Non-recoverable error (AccessDenied, NoSuchBucket, etc.) - crash
+                    return Err(anyhow::anyhow!(
+                        "S3 error for bucket '{}': {}",
+                        bucket.bucket,
+                        error_str
+                    ));
+                }
+
+                // Recoverable error (transient) - skip this bucket
                 warn!(
                     bucket = %bucket.bucket,
                     date = %date,
