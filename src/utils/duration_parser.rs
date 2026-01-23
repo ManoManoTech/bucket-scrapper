@@ -97,14 +97,20 @@ mod tests {
     fn test_invalid_unit() {
         let result = parse_duration("100x");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown duration unit"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown duration unit"));
     }
 
     #[test]
     fn test_empty_string() {
         let result = parse_duration("");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Empty duration string"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Empty duration string"));
     }
 
     #[test]

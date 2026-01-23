@@ -179,7 +179,8 @@ pub fn aggregate_by_day(
 
             // Show missing hours regardless of whether other hours have results
             // This handles the case where some hours have check results but others are missing
-            let checked_hours: HashSet<String> = hours.iter().map(|(h, _, _, _, _, _)| h.clone()).collect();
+            let checked_hours: HashSet<String> =
+                hours.iter().map(|(h, _, _, _, _, _)| h.clone()).collect();
             let effective_missing: Vec<String> = missing
                 .into_iter()
                 .filter(|h| !checked_hours.contains(h))
