@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use futures::{stream, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 use utils::date::date_range_to_date_hour_list;
 use utils::recap_html::{aggregate_by_day, generate_recap_html};
@@ -262,7 +262,11 @@ async fn run() -> Result<()> {
             }
         }
 
-        Commands::Check { date, hour, dry_run } => {
+        Commands::Check {
+            date,
+            hour,
+            dry_run,
+        } => {
             // Determine target date/hour - either explicit or via continuous mode
             let (target_date, target_hour) = match (date, hour) {
                 // Explicit date/hour provided - use them
@@ -360,7 +364,8 @@ async fn run() -> Result<()> {
             // Set up signal handler for memory monitoring if enabled
             if cli.enable_signals {
                 // Get references to memory allocators from the checker
-                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
+                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour)
+                {
                     if let Err(e) = memory_monitor.setup_signal_handler() {
                         warn!(target_date = %target_date, target_hour = %target_hour, error = %e, "Failed to set up signal handler");
                     } else {
@@ -397,7 +402,12 @@ async fn run() -> Result<()> {
 
             // Perform comparison
             let result = checker
-                .get_comparison_results(&archived_buckets, consolidated_bucket, &target_date, &target_hour)
+                .get_comparison_results(
+                    &archived_buckets,
+                    consolidated_bucket,
+                    &target_date,
+                    &target_hour,
+                )
                 .await?;
 
             // Upload check result to S3
@@ -411,7 +421,8 @@ async fn run() -> Result<()> {
 
             // Log final memory stats if signal handling is enabled
             if cli.enable_signals {
-                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
+                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour)
+                {
                     memory_monitor.log_memory_stats();
                 }
             }

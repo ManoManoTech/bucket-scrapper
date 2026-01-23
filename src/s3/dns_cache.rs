@@ -127,21 +127,6 @@ impl CachingDnsResolver {
 
         info!("DNS cache pre-warming complete");
     }
-
-    /// Get cache statistics for monitoring.
-    pub fn cache_stats(&self) -> (u64, u64) {
-        (self.cache.entry_count(), self.cache.weighted_size())
-    }
-
-    /// Log cache statistics for observability.
-    pub fn log_stats(&self) {
-        let (entries, size) = self.cache_stats();
-        info!(
-            cache_entries = entries,
-            cache_size = size,
-            "DNS cache statistics"
-        );
-    }
 }
 
 /// Adapter that implements AWS SDK's `ResolveDns` trait using our `CachingDnsResolver`.
@@ -263,7 +248,7 @@ mod tests {
         cache.cache.run_pending_tasks().await;
 
         // Check cache stats
-        let (entries, _) = cache.cache_stats();
+        let entries = cache.cache.entry_count();
         assert!(
             entries >= 1,
             "Cache should have at least 1 entry after resolution"

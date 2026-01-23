@@ -111,25 +111,6 @@ impl WrappedS3Client {
         Ok(guard.1.clone())
     }
 
-    /// Lists objects in a bucket with a prefix and returns information about them
-    pub async fn get_matching_filenames_from_s3(
-        &self,
-        bucket_config: &BucketConfig,
-        date: &DateString,
-        hour: &HourString,
-        will_filter: bool,
-    ) -> Result<S3FileList> {
-        let client = self.get_client().await?;
-        self.get_matching_filenames_from_s3_with_client(
-            &client,
-            bucket_config,
-            date,
-            hour,
-            will_filter,
-        )
-        .await
-    }
-
     /// Lists objects using a provided client - use this when making multiple calls
     /// to avoid repeated get_client() overhead
     pub async fn get_matching_filenames_from_s3_with_client(
@@ -205,7 +186,12 @@ impl WrappedS3Client {
                         err_msg
                     )
                 } else {
-                    anyhow::anyhow!("S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}", bucket, prefix, err_msg)
+                    anyhow::anyhow!(
+                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
+                        bucket,
+                        prefix,
+                        err_msg
+                    )
                 }
             })?;
             debug!(
@@ -321,16 +307,9 @@ impl WrappedS3Client {
         Ok(S3FileList {
             bucket: bucket.clone(),
             checksum: files_checksum.clone(),
-            key_prefix: prefix,
             files: filtered.0,
             total_archives_size: filtered.1,
         })
-    }
-
-    /// Downloads an object from S3 and returns its contents as bytes
-    pub async fn download_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        let client = self.get_client().await?;
-        self.download_object_with_client(&client, bucket, key).await
     }
 
     /// Downloads an object using a provided client - use this when making multiple downloads

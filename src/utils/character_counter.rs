@@ -39,6 +39,7 @@ impl DetailedCharacterCount {
     }
 
     /// Increments the count for a specific byte
+    #[allow(dead_code)]
     pub fn increment(&mut self, byte: u8) {
         self.counts[byte as usize] = self.counts[byte as usize].wrapping_add(1);
     }

@@ -18,29 +18,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// Analysis data for a bucket at a specific date/hour
-#[derive(Debug)]
-pub struct AnalysisData {
-    /// The bucket name
-    pub bucket: String,
-    /// The key prefix
-    pub key_prefix: String,
-    /// The files found
-    pub files: Vec<String>,
-    /// Total archives size
-    pub total_archives_size: usize,
-    /// Detailed character count information
-    pub detailed_character_count: DetailedCharacterCount,
-}
-
 /// Result of comparing archived and consolidated data
 #[derive(Debug)]
 pub struct ComparisonResult {
     /// Whether the comparison was successful
     pub ok: bool,
     /// The date of the comparison
+    #[allow(dead_code)]
     pub date: DateString,
     /// The hour of the comparison
+    #[allow(dead_code)]
     pub hour: HourString,
     /// A message describing the result
     pub message: String,
@@ -109,18 +96,6 @@ impl Checker {
         ))
     }
 
-    pub async fn list_bucket_files(
-        &self,
-        bucket_config: &BucketConfig,
-        date: &DateString,
-        hour: &HourString,
-        role: BucketRole,
-    ) -> Result<S3FileList> {
-        let client = self.s3_client.get_client().await?;
-        self.list_bucket_files_with_client(&client, bucket_config, date, hour, role)
-            .await
-    }
-
     /// List bucket files using a provided client - reduces DNS lookups when
     /// listing multiple buckets
     pub async fn list_bucket_files_with_client(
@@ -176,16 +151,6 @@ impl Checker {
         .emit();
 
         Ok(file_list)
-    }
-
-    /// Analyze a bucket for a specific date and hour
-    pub async fn download_and_analyze_files(
-        &self,
-        objects: &[S3ObjectInfo],
-    ) -> Result<HashMap<String, DetailedCharacterCount>> {
-        let client = self.s3_client.get_client().await?;
-        self.download_and_analyze_files_with_client(client, objects, None, None)
-            .await
     }
 
     /// Analyze files using a provided client - reduces DNS lookups when reusing client
@@ -330,7 +295,6 @@ impl Checker {
         let mut archived_files_count = 0usize;
         let mut consolidated_files_count = 0usize;
         let mut archived_buckets_failed: Vec<String> = Vec::new();
-        let mut archived_buckets_with_data = 0usize;
         {
             let results = futures::future::join_all(file_lists_futures).await;
             // First result is consolidated, rest are archived
@@ -344,9 +308,6 @@ impl Checker {
                             consolidated_files_count = files_count;
                         } else {
                             archived_files_count += files_count;
-                            if files_count > 0 {
-                                archived_buckets_with_data += 1;
-                            }
                         }
 
                         info!(
@@ -424,7 +385,9 @@ impl Checker {
             );
 
             // Handle case where ALL archived buckets failed
-            if archived_buckets_failed.len() == archived_bucket_configs.len() && !archived_bucket_configs.is_empty() {
+            if archived_buckets_failed.len() == archived_bucket_configs.len()
+                && !archived_bucket_configs.is_empty()
+            {
                 let end_time = Utc::now();
                 error!(
                     target_date = %date,
@@ -456,9 +419,11 @@ impl Checker {
 
                 // Check if some buckets failed while others were empty
                 let partial_failure_note = if !archived_buckets_failed.is_empty() {
-                    format!(" Note: {} bucket(s) failed to list: {}.",
+                    format!(
+                        " Note: {} bucket(s) failed to list: {}.",
                         archived_buckets_failed.len(),
-                        archived_buckets_failed.join(", "))
+                        archived_buckets_failed.join(", ")
+                    )
                 } else {
                     String::new()
                 };
@@ -658,7 +623,10 @@ impl Checker {
                 date: date.clone(),
                 hour: hour.clone(),
                 ok: true,
-                message: format!("Consolidated size matches original size.{}", partial_failure_warning),
+                message: format!(
+                    "Consolidated size matches original size.{}",
+                    partial_failure_warning
+                ),
                 analysis_start_date: start_time.to_rfc3339(),
                 analysis_end_date: end_time.to_rfc3339(),
                 archived_files_count,

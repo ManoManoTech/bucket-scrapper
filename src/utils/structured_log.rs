@@ -7,6 +7,7 @@ use serde::Serialize;
 /// Log level enum
 #[derive(Serialize, Clone, Copy, Default)]
 #[serde(rename_all = "UPPERCASE")]
+#[allow(dead_code)]
 pub enum LogLevel {
     #[default]
     Info,
@@ -209,6 +210,7 @@ pub struct S3OperationInfo {
 /// S3 operation type
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
 pub enum S3Operation {
     Download,
     Upload,
@@ -443,6 +445,7 @@ impl S3OperationInfo {
         Self::new(bucket, key).with_operation(S3Operation::Download)
     }
 
+    #[allow(dead_code)]
     pub fn upload(bucket: impl Into<String>, key: impl Into<String>) -> Self {
         Self::new(bucket, key).with_operation(S3Operation::Upload)
     }

@@ -141,7 +141,6 @@ impl FakeConsolidationEnvironment {
                         },
                     ],
                     only_prefix_patterns: None,
-                    proceed_without_matching_objects: false,
                     extra: HashMap::new(),
                 },
                 BucketConfig {
@@ -155,7 +154,6 @@ impl FakeConsolidationEnvironment {
                         },
                     ],
                     only_prefix_patterns: None,
-                    proceed_without_matching_objects: false,
                     extra: HashMap::new(),
                 },
             ],
@@ -170,7 +168,6 @@ impl FakeConsolidationEnvironment {
                     },
                 ],
                 only_prefix_patterns: None,
-                proceed_without_matching_objects: false,
                 extra: HashMap::new(),
             }],
             bucketsCheckerResults: vec![],

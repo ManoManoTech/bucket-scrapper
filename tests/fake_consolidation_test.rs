@@ -17,12 +17,16 @@ async fn test_fake_consolidation_with_real_files() -> Result<()> {
     // Create the checker
     let wrapped_s3_client =
         WrappedS3Client::new("us-east-1", 15, Some(env.s3_client.clone())).await?;
+
+    // Get client for listing operations before passing wrapped_s3_client to Checker
+    let client = wrapped_s3_client.get_client().await?;
     let checker = Checker::new(wrapped_s3_client, 4, Some(2), 128);
 
     // List files in all buckets
     println!("\nListing files in input-bucket-1:");
     let files1 = checker
-        .list_bucket_files(
+        .list_bucket_files_with_client(
+            &client,
             &env.config.bucketsToConsolidate[0],
             &env.date,
             &env.hour,
@@ -35,7 +39,8 @@ async fn test_fake_consolidation_with_real_files() -> Result<()> {
 
     println!("\nListing files in input-bucket-2:");
     let files2 = checker
-        .list_bucket_files(
+        .list_bucket_files_with_client(
+            &client,
             &env.config.bucketsToConsolidate[1],
             &env.date,
             &env.hour,
@@ -48,7 +53,8 @@ async fn test_fake_consolidation_with_real_files() -> Result<()> {
 
     println!("\nListing files in consolidated-bucket:");
     let consolidated_files = checker
-        .list_bucket_files(
+        .list_bucket_files_with_client(
+            &client,
             &env.config.bucketsConsolidated[0],
             &env.date,
             &env.hour,

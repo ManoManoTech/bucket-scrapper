@@ -61,7 +61,6 @@ fn extract_single_format_date_and_prefix(
 ///         PathSchema::DateFormat { datefmt: "dt=20231225/hour=14".to_string() }
 ///     ],
 ///     only_prefix_patterns: None,
-///     proceed_without_matching_objects: false,
 ///     extra: HashMap::new(),
 /// };
 ///
@@ -122,7 +121,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -144,7 +142,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -166,7 +163,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -188,7 +184,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -211,7 +206,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -240,7 +234,6 @@ mod tests {
                 }, // Empty - should be filtered
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -257,7 +250,6 @@ mod tests {
                 datefmt: "2006/01/02/15".to_string(),
             }],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 
@@ -308,7 +300,6 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
-            proceed_without_matching_objects: false,
             extra: HashMap::new(),
         };
 

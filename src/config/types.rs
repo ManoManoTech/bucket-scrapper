@@ -18,8 +18,7 @@ pub struct BucketConfig {
     pub path: Vec<PathSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_prefix_patterns: Option<Vec<String>>,
-    #[serde(default, skip_serializing)]
-    pub proceed_without_matching_objects: bool,
+    #[allow(dead_code)]
     #[serde(flatten, skip_serializing)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
@@ -36,15 +35,6 @@ pub struct ContinuousConsolidationConfig {
     /// Maximum age to consider (e.g., "528h" for 22 days).
     /// Hours older than (now - max_age) are not considered.
     pub max_age: String,
-
-    /// Step interval (always "1h" for hourly granularity).
-    /// Currently unused but preserved for config compatibility.
-    #[serde(default = "default_step")]
-    pub step: String,
-}
-
-fn default_step() -> String {
-    "1h".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -56,6 +46,7 @@ pub struct ConfigSchema {
     /// Optional continuous consolidation config for auto-selecting target hours
     #[serde(default)]
     pub continuousConsolidation: Option<ContinuousConsolidationConfig>,
+    #[allow(dead_code)]
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
@@ -74,7 +65,6 @@ pub struct S3ObjectInfo {
 #[derive(Debug, Clone)]
 pub struct S3FileList {
     pub bucket: String,
-    pub key_prefix: String,
     pub checksum: String,
     pub files: Vec<S3ObjectInfo>,
     pub total_archives_size: usize,

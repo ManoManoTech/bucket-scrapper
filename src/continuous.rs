@@ -247,21 +247,28 @@ async fn check_candidate_status(
     hour: &String,
 ) -> CandidateStatus {
     // Step 1: Check if ANY archived bucket has files
-    let has_archived = match check_any_bucket_has_files(client, s3_client, archived_buckets, date, hour).await {
-        Ok(has) => has,
-        Err(e) => return CandidateStatus::Error(format!("Error checking archived buckets: {}", e)),
-    };
+    let has_archived =
+        match check_any_bucket_has_files(client, s3_client, archived_buckets, date, hour).await {
+            Ok(has) => has,
+            Err(e) => {
+                return CandidateStatus::Error(format!("Error checking archived buckets: {}", e))
+            }
+        };
 
     if !has_archived {
         return CandidateStatus::NoArchivedData;
     }
 
     // Step 2: Check if consolidated bucket has files and get latest timestamp
-    let consolidated_latest = match get_bucket_latest_timestamp(client, s3_client, consolidated_bucket, date, hour).await {
-        Ok(Some(ts)) => ts,
-        Ok(None) => return CandidateStatus::NoConsolidatedData,
-        Err(e) => return CandidateStatus::Error(format!("Error checking consolidated bucket: {}", e)),
-    };
+    let consolidated_latest =
+        match get_bucket_latest_timestamp(client, s3_client, consolidated_bucket, date, hour).await
+        {
+            Ok(Some(ts)) => ts,
+            Ok(None) => return CandidateStatus::NoConsolidatedData,
+            Err(e) => {
+                return CandidateStatus::Error(format!("Error checking consolidated bucket: {}", e))
+            }
+        };
 
     // Step 3: Both have data - check results bucket and compare timestamps
     match check_result_status_with_timestamp(client, s3_client, results_bucket, date, hour).await {
@@ -277,16 +284,20 @@ async fn check_candidate_status(
                     "Consolidated output is newer than last check - needs recheck"
                 );
                 CandidateStatus::NeedsRetry {
-                    previous_message: format!("Output updated after last check (output: {}, check: {})",
+                    previous_message: format!(
+                        "Output updated after last check (output: {}, check: {})",
                         consolidated_latest.format("%Y-%m-%dT%H:%M:%SZ"),
-                        check_timestamp.format("%Y-%m-%dT%H:%M:%SZ")),
+                        check_timestamp.format("%Y-%m-%dT%H:%M:%SZ")
+                    ),
                 }
             } else if ok {
                 CandidateStatus::AlreadyPassed
             } else {
-                CandidateStatus::NeedsRetry { previous_message: msg }
+                CandidateStatus::NeedsRetry {
+                    previous_message: msg,
+                }
             }
-        },
+        }
         Err(e) => CandidateStatus::Error(format!("Error checking result: {}", e)),
     }
 }
@@ -425,7 +436,6 @@ mod tests {
         let config = ContinuousConsolidationConfig {
             min_age: "2h".to_string(),
             max_age: "5h".to_string(),
-            step: "1h".to_string(),
         };
 
         // Use a fixed time for reproducible tests
@@ -448,7 +458,6 @@ mod tests {
         let config = ContinuousConsolidationConfig {
             min_age: "1h".to_string(),
             max_age: "3h".to_string(),
-            step: "1h".to_string(),
         };
 
         // Time just after midnight
@@ -471,7 +480,6 @@ mod tests {
         let config = ContinuousConsolidationConfig {
             min_age: "2h".to_string(),
             max_age: "2h".to_string(),
-            step: "1h".to_string(),
         };
 
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 12, 30, 0).unwrap();
@@ -488,7 +496,6 @@ mod tests {
         let config = ContinuousConsolidationConfig {
             min_age: "invalid".to_string(),
             max_age: "5h".to_string(),
-            step: "1h".to_string(),
         };
 
         let now = Utc::now();

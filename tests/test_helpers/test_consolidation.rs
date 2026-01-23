@@ -46,6 +46,8 @@ pub async fn check_consolidation_with_config_and_date(
     let wrapped_s3_client =
         WrappedS3Client::new(TestConstants::DEFAULT_REGION, 15, Some(s3_client.clone())).await?;
 
+    // Get client for listing operations before passing wrapped_s3_client to Checker
+    let client = wrapped_s3_client.get_client().await?;
     let checker = Checker::new(wrapped_s3_client, 4, Some(2), 128); // Small settings for test
 
     let archived_buckets = get_archived_buckets(&config);
@@ -81,7 +83,13 @@ pub async fn check_consolidation_with_config_and_date(
         );
 
         let file_list = checker
-            .list_bucket_files(bucket_config, &date, &hour, BucketRole::Archived)
+            .list_bucket_files_with_client(
+                &client,
+                bucket_config,
+                &date,
+                &hour,
+                BucketRole::Archived,
+            )
             .await?;
         println!(
             "[{}]   Found {} files in bucket {}",
@@ -112,7 +120,13 @@ pub async fn check_consolidation_with_config_and_date(
     println!("  Expected key prefix: {}", expected_key_prefix);
 
     let consolidated_file_list = checker
-        .list_bucket_files(consolidated_bucket, &date, &hour, BucketRole::Consolidated)
+        .list_bucket_files_with_client(
+            &client,
+            consolidated_bucket,
+            &date,
+            &hour,
+            BucketRole::Consolidated,
+        )
         .await?;
     println!(
         "[{}]   Found {} files in consolidated bucket {}",
@@ -127,12 +141,24 @@ pub async fn check_consolidation_with_config_and_date(
     let mut bucket_file_results = Vec::new();
     for (i, bucket_config) in archived_buckets.iter().enumerate() {
         let files = checker
-            .list_bucket_files(bucket_config, &date, &hour, BucketRole::Archived)
+            .list_bucket_files_with_client(
+                &client,
+                bucket_config,
+                &date,
+                &hour,
+                BucketRole::Archived,
+            )
             .await?;
         bucket_file_results.push((i, bucket_config, files));
     }
     let consolidated_files = checker
-        .list_bucket_files(consolidated_bucket, &date, &hour, BucketRole::Consolidated)
+        .list_bucket_files_with_client(
+            &client,
+            consolidated_bucket,
+            &date,
+            &hour,
+            BucketRole::Consolidated,
+        )
         .await?;
 
     let total_input_files: usize = bucket_file_results
