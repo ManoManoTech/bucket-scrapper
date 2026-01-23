@@ -17,20 +17,24 @@ bucketsToConsolidate: # The source buckets
     path:
       - datefmt: '2006/01/02/15'
     force_env: stg
+    proceed_without_matching_objects: true
   - bucket: 'prd-infra-raw-logs-archives'
     path:
       - datefmt: '2006/01/02/15'
     force_env: prd
-bucketsConsolidated: # Where the consolidated output goes. Only one element is really supported as of now.
+# Where the consolidated output goes. Only one element is really supported as of now.
+bucketsConsolidated:
   - bucket: support-infra-log-consolidator-archives
     # - bucket: support-infra-logs-consolidated-archives # test bucket
     path:
       - datefmt: "log-archives/dt=20060102/hour=15"
-bucketsCheckerResults: # Where to find checker results
+# Where to find checker results
+bucketsCheckerResults:
   - bucket: 'support-infra-log-consolidator-checker-data'
     path:
       - datefmt: 'results-continuous/dt=20060102/hour=15'
-continuousConsolidation: # Parameters for continuous consolidation, where the consolidator determines a single target date on its own
+# Parameters for continuous consolidation, where the consolidator determines a single target date on its own
+continuousConsolidation:
   maxAge: 528h # 30 days
   minAge: 70m
   step: 1h

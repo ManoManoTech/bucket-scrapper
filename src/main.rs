@@ -409,73 +409,11 @@ async fn run() -> Result<()> {
                 warn!("No results bucket configured, skipping upload");
             }
 
-            // Generate PGM visualizations
-            {
-                use crate::utils::pgm_visualizer::PgmVisualizer;
-
-                let visualizer = PgmVisualizer::with_default();
-                match visualizer.generate_visualization(
-                    &result.archived_counts,
-                    &result.consolidated_counts,
-                    &result.differences,
-                ) {
-                    Ok(_) => {
-                        info!(
-                            lhs = "/tmp/lhs.pgm",
-                            rhs = "/tmp/rhs.pgm",
-                            diff = "/tmp/diff.pgm",
-                            "Generated PGM visualizations"
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Failed to generate PGM visualizations: {}", e);
-                    }
-                }
-            }
-
-            // Output result
-            if result.ok {
-                info!("✅ Check passed for {}/{}", target_date, target_hour);
-                info!("Message: {}", result.message);
-
-                // info!("Archived buckets:");
-                // for (i, archived) in result.archived_data.iter().enumerate() {
-                //     info!(
-                //         "  {}: {} files in {} (total size: {} bytes)",
-                //         i + 1,
-                //         archived.files.len(),
-                //         archived.bucket,
-                //         archived.total_archives_size
-                //     );
-                // }
-                //
-                // info!(
-                //     "Consolidated bucket: {} files in {} (total size: {} bytes)",
-                //     result.consolidated_data.files.len(),
-                //     result.consolidated_data.bucket,
-                //     result.consolidated_data.total_archives_size
-                // );
-            } else {
-                warn!("❌ Check failed for {}/{}", target_date, target_hour);
-                warn!("Message: {}", result.message);
-
-                // In a real implementation, we would output detailed failure information
-            }
-
-            // Cancel periodic logging task and log final memory stats
-            cancel_token.cancel();
+            // Log final memory stats if signal handling is enabled
             if cli.enable_signals {
                 if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
                     memory_monitor.log_memory_stats();
                 }
-            }
-
-            // Output result - exit 0 regardless of check result
-            // The check result (pass/fail) is reported in logs and S3, not via exit code
-            if result.ok {
-                info!(target_date = %target_date, target_hour = %target_hour, "Check passed");
-            } else {
-                error!(target_date = %target_date, target_hour = %target_hour, message = %result.message, "Check failed");
             }
         }
 

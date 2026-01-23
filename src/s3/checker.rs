@@ -588,7 +588,7 @@ impl Checker {
 
         // If any buckets are completely missing, this is a serious error
         if !missing_buckets.is_empty() {
-            error!(
+            warn!(
                 missing_buckets = ?missing_buckets,
                 "Some archived buckets have no data - check for download failures"
             );
