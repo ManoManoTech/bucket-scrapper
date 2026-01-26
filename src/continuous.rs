@@ -290,11 +290,24 @@ async fn check_candidate_status(
                         check_timestamp.format("%Y-%m-%dT%H:%M:%SZ")
                     ),
                 }
-            } else if ok {
-                CandidateStatus::AlreadyPassed
             } else {
-                CandidateStatus::NeedsRetry {
-                    previous_message: msg,
+                // Check is up-to-date (check_timestamp >= consolidated_latest)
+                // Skip regardless of pass/fail - retrying won't help
+                if ok {
+                    debug!(
+                        date = %date,
+                        hour = %hour,
+                        "Check passed and is up-to-date - skipping"
+                    );
+                    CandidateStatus::AlreadyPassed
+                } else {
+                    debug!(
+                        date = %date,
+                        hour = %hour,
+                        previous_message = %msg,
+                        "Check failed but is up-to-date - skipping (output hasn't changed)"
+                    );
+                    CandidateStatus::AlreadyPassed
                 }
             }
         }
