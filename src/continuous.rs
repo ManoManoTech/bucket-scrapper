@@ -16,6 +16,16 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use futures::{stream, StreamExt};
 use tracing::{debug, error, info, warn};
 
+/// Get the minimum age (in minutes) that consolidated output must be before checking.
+/// This prevents checking prefixes where files might still be written.
+/// Defaults to 20 minutes if not specified via CONSOLIDATION_FRESHNESS_THRESHOLD_MINUTES env var.
+fn get_consolidation_freshness_threshold_minutes() -> i64 {
+    std::env::var("CONSOLIDATION_FRESHNESS_THRESHOLD_MINUTES")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(20)
+}
+
 /// Status of a candidate hour for checking
 #[derive(Debug, Clone)]
 pub enum CandidateStatus {
@@ -269,6 +279,24 @@ async fn check_candidate_status(
                 return CandidateStatus::Error(format!("Error checking consolidated bucket: {}", e))
             }
         };
+
+    // Step 2a: Check if consolidated output is too fresh (might still be writing)
+    let freshness_threshold_minutes = get_consolidation_freshness_threshold_minutes();
+    let min_consolidation_age = Duration::minutes(freshness_threshold_minutes);
+    let now = Utc::now();
+    let output_age = now - consolidated_latest;
+
+    if output_age < min_consolidation_age {
+        debug!(
+            date = %date,
+            hour = %hour,
+            consolidated_latest = %consolidated_latest,
+            output_age_minutes = output_age.num_minutes(),
+            threshold_minutes = freshness_threshold_minutes,
+            "Consolidated output too fresh - skipping to avoid checking during writes"
+        );
+        return CandidateStatus::NoConsolidatedData;
+    }
 
     // Step 3: Both have data - check results bucket and compare timestamps
     match check_result_status_with_timestamp(client, s3_client, results_bucket, date, hour).await {
