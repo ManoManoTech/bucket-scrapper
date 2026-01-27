@@ -281,35 +281,56 @@ async fn main() -> Result<()> {
                 info!("Searching bucket: {}", bucket);
 
                 // Get objects from S3
-                let objects = if let Some(start) = start_date {
+                let mut all_objects = if let Some(start) = start_date {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
 
-                    let mut all_objects = Vec::new();
+                    let mut objects = Vec::new();
                     for dh in date_hours {
                         let prefix = format!("{}/{}", dh.date, dh.hour);
                         let objs = s3_client
                             .get_matching_filenames_from_s3(bucket, &prefix, filter.as_deref())
                             .await?;
-                        all_objects.extend(objs);
+
+                        if !objs.is_empty() {
+                            info!("Found {} objects in prefix {}", objs.len(), prefix);
+                            objects.extend(objs);
+                        }
                     }
-                    all_objects
+                    objects
                 } else {
                     s3_client
                         .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
                         .await?
                 };
 
-                if objects.is_empty() {
+                if all_objects.is_empty() {
                     info!("No matching objects found in {}", bucket);
                     continue;
                 }
 
-                info!("Found {} objects to search", objects.len());
+                // Sort by size for better load balancing (small files first)
+                all_objects.sort_by_key(|o| o.size);
+
+                let total_size: usize = all_objects.iter().map(|o| o.size).sum();
+                info!(
+                    "Processing {} objects ({} MB) in {}",
+                    all_objects.len(),
+                    total_size / 1_000_000,
+                    bucket
+                );
+
+                let batch_start = std::time::Instant::now();
 
                 // Search through objects
                 downloader
-                    .search_objects(&objects, searcher.clone(), collector.clone())
+                    .search_objects(&all_objects, searcher.clone(), collector.clone())
                     .await?;
+
+                info!(
+                    "Completed bucket {} in {:.1}s",
+                    bucket,
+                    batch_start.elapsed().as_secs_f32()
+                );
             }
 
             // Process config buckets (with path formatting)
@@ -322,7 +343,10 @@ async fn main() -> Result<()> {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
                     let formatter = generate_path_formatter(bucket_cfg);
 
-                    // Process each date/hour separately for better logging
+                    // Collect all objects across all prefixes first
+                    let mut all_objects = Vec::new();
+                    let mut total_size = 0usize;
+
                     for dh in date_hours {
                         let prefix = formatter(&dh.date, &dh.hour)?;
                         let objs = s3_client
@@ -338,31 +362,49 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        let total_size: usize = objs.iter().map(|o| o.size).sum();
-                        let prefix_start = std::time::Instant::now();
-                        let matches_before = collector.lock().await.match_count();
-
+                        let prefix_size: usize = objs.iter().map(|o| o.size).sum();
                         info!(
-                            "Processing prefix {}: {} files ({} MB)",
-                            prefix,
+                            "Found {} objects in prefix {}: {} MB",
                             objs.len(),
-                            total_size / 1_000_000
-                        );
-
-                        downloader
-                            .search_objects(&objs, searcher.clone(), collector.clone())
-                            .await?;
-
-                        let matches_after = collector.lock().await.match_count();
-                        let matches_found = matches_after - matches_before;
-
-                        info!(
-                            "Completed prefix {}: found {} matches in {:.1}s",
                             prefix,
-                            matches_found,
-                            prefix_start.elapsed().as_secs_f32()
+                            prefix_size / 1_000_000
                         );
+
+                        total_size += prefix_size;
+                        all_objects.extend(objs);
                     }
+
+                    if all_objects.is_empty() {
+                        info!("No objects found across all prefixes");
+                        continue;
+                    }
+
+                    // Sort by size for better load balancing (small files first)
+                    all_objects.sort_by_key(|o| o.size);
+
+                    info!(
+                        "Processing {} total objects ({} MB) across all prefixes",
+                        all_objects.len(),
+                        total_size / 1_000_000
+                    );
+
+                    let batch_start = std::time::Instant::now();
+                    let matches_before = collector.lock().await.match_count();
+
+                    // Process all objects in one batch for maximum parallelism
+                    downloader
+                        .search_objects(&all_objects, searcher.clone(), collector.clone())
+                        .await?;
+
+                    let matches_after = collector.lock().await.match_count();
+                    let matches_found = matches_after - matches_before;
+
+                    info!(
+                        "Completed all prefixes: {} objects, {} matches found in {:.1}s",
+                        all_objects.len(),
+                        matches_found,
+                        batch_start.elapsed().as_secs_f32()
+                    );
                 } else {
                     // No date range, just use static prefix if any
                     let prefix = if bucket_cfg.path.is_empty() {
