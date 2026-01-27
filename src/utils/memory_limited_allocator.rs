@@ -51,11 +51,12 @@ impl MemoryLimiter {
         // Wake up waiters if possible
         let mut awaken_usage = 0;
         let mut waiters_to_pop = VecDeque::<u64>::new();
-        for kv in self.waiters.iter() {
-            let (waiter_id, (wait_size, waker)) = kv.pair();
+        for entry in self.waiters.iter() {
+            let waiter_id = *entry.key();
+            let (wait_size, waker) = entry.value();
             if self.current_usage + awaken_usage + *wait_size <= self.total_capacity {
                 // This is likely to allocate properly
-                waiters_to_pop.push_back(*waiter_id);
+                waiters_to_pop.push_back(waiter_id);
                 awaken_usage += wait_size;
                 waker.wake_by_ref();
             }
@@ -76,7 +77,7 @@ impl MemoryLimiter {
     }
 
     fn get_waiters_total_size(&self) -> usize {
-        self.waiters.iter().map(|kv| kv.value().0).sum()
+        self.waiters.iter().map(|entry| entry.value().0).sum()
     }
 }
 
@@ -162,6 +163,13 @@ impl std::ops::DerefMut for LimitedVec {
     }
 }
 
+// Implement AsRef<[u8]> to allow LimitedVec to be used with Cursor
+impl AsRef<[u8]> for LimitedVec {
+    fn as_ref(&self) -> &[u8] {
+        self.vec.as_ref()
+    }
+}
+
 // The main entry point for memory-limited vector allocation
 pub struct MemoryLimitedAllocator {
     limiter: Arc<Mutex<MemoryLimiter>>,
@@ -176,7 +184,7 @@ impl MemoryLimitedAllocator {
 
     // Allocate a vec of the given size, blocking if capacity limit is reached
     pub fn alloc_vec(&self, size: usize) -> impl Future<Output = LimitedVec> {
-        let mut rng = rand::rng();
+        let mut rng = rand::thread_rng();
         AllocFuture {
             id: rng.next_u64(),
             limiter: self.limiter.clone(),

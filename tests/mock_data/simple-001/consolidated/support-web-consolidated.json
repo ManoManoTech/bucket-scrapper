@@ -1,1 +1,0 @@
-{"timestamp":"2023-12-25T14:00:30Z","level":"info","message":"HTTP request received","service":"web","env":"support","method":"GET","path":"/api/users"}

@@ -1,868 +1,628 @@
 // src/main.rs
-// Location: src/main.rs
 mod config;
-mod continuous;
 mod s3;
+mod search;
 mod utils;
 
-use crate::config::loader::{
-    get_archived_buckets, get_consolidated_buckets, get_results_bucket, load_config,
-};
-use crate::s3::checker::Checker;
-use crate::s3::client::WrappedS3Client;
-use crate::s3::dns_cache;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use futures::{stream, StreamExt};
-use std::collections::HashMap;
+use s3::{StreamingDownloader, StreamingDownloaderConfig};
+use search::{SearchConfig, SearchResultCollector, StreamSearcher};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, info};
 use tracing_subscriber::{fmt, EnvFilter};
-use utils::date::date_range_to_date_hour_list;
-use utils::recap_html::{aggregate_by_day, generate_recap_html};
 
-/// S3 Log Consolidator Checker
+use crate::config::loader::load_config;
+use crate::config::types::BucketConfig;
+use crate::s3::client::WrappedS3Client;
+use crate::s3::dns_cache;
+use crate::utils::date::{date_range_to_date_hour_list, DateHour};
+
+/// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]
-#[command(name = "consolidator-checker")]
-#[command(about = "Checks that log consolidation in S3 has been done correctly")]
+#[command(name = "bucket-scrapper")]
+#[command(about = "Search through S3 bucket contents using ripgrep patterns")]
 struct Cli {
-    /// Path to the config file
-    #[arg(short, long, default_value = "config.yaml")]
+    /// Path to the config file (optional, for AWS credentials and default buckets)
+    #[arg(short, long, default_value = "config-scrapper.yml")]
     config: PathBuf,
 
     /// AWS region
     #[arg(short, long, default_value = "eu-west-3")]
     region: String,
 
-    /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
-    #[arg(long, default_value = "60")]
-    client_max_age: u64,
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(short = 'v', long, default_value = "info")]
+    log_level: String,
 
-    /// Maximum parallel downloads
-    #[arg(long, default_value = "32")]
-    max_parallel: usize,
-
-    /// Number of processing threads (defaults to CPU count)
-    #[arg(long)]
-    process_threads: Option<usize>,
-
-    /// Memory pool size in MB
-    #[arg(long, default_value = "12288")] // 12GB default
-    memory_pool_mb: usize,
-
-    /// Enable signal handling for memory monitoring (SIGUSR2)
-    #[arg(long, default_value = "true")]
-    enable_signals: bool,
-
-    /// Subcommands
     #[command(subcommand)]
     command: Commands,
-
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List files in archived and consolidated buckets
+    /// Search through S3 bucket contents
+    Search {
+        /// Regex pattern to search for
+        #[arg(short, long)]
+        pattern: String,
+
+        /// S3 buckets to search (can specify multiple, uses config if not provided)
+        #[arg(short, long, value_delimiter = ',')]
+        buckets: Option<Vec<String>>,
+
+        /// Object key filter pattern (e.g., "*.log", "2024/*")
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Start date in ISO 8601 format (e.g., 2023-01-01T00:00:00Z)
+        #[arg(short, long)]
+        start: Option<String>,
+
+        /// End date in ISO 8601 format (defaults to now)
+        #[arg(short, long)]
+        end: Option<String>,
+
+        /// Lines of context to show around matches
+        #[arg(short = 'C', long, default_value = "0")]
+        context: usize,
+
+        /// Case insensitive search
+        #[arg(short, long)]
+        ignore_case: bool,
+
+        /// Only show match counts per file
+        #[arg(short = 'c', long)]
+        count: bool,
+
+        /// Maximum matches per file to return
+        #[arg(long)]
+        max_matches_per_file: Option<usize>,
+
+        /// Maximum parallel downloads
+        #[arg(long, default_value = "32")]
+        max_parallel: usize,
+
+        /// Number of processing threads (defaults to CPU count)
+        #[arg(long)]
+        process_threads: Option<usize>,
+
+        /// Memory pool size in MB
+        #[arg(long, default_value = "2048")]
+        memory_pool_mb: usize,
+
+        /// Stream buffer size in KB
+        #[arg(long, default_value = "64")]
+        buffer_size_kb: usize,
+
+        /// Channel buffer size for backpressure control
+        #[arg(long, default_value = "100")]
+        channel_buffer: usize,
+
+        /// Maximum retry attempts for failed downloads
+        #[arg(long, default_value = "10")]
+        max_retries: u32,
+
+        /// Initial retry delay in seconds
+        #[arg(long, default_value = "2")]
+        retry_delay: u64,
+
+        /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
+        #[arg(long, default_value = "60")]
+        client_max_age: u64,
+
+        /// Output format (json, text, or quiet)
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
+    },
+
+    /// List objects in buckets matching the filter
     List {
-        /// Start date in ISO 8601 format (e.g. 2023-01-01T00:00:00Z)
-        #[arg(short, long)]
-        start: String,
+        /// S3 buckets to list (can specify multiple, uses config if not provided)
+        #[arg(short, long, value_delimiter = ',')]
+        buckets: Option<Vec<String>>,
 
-        /// End date in ISO 8601 format (e.g. 2023-01-01T01:00:00Z)
+        /// Object key filter pattern
         #[arg(short, long)]
-        end: String,
+        filter: Option<String>,
+
+        /// Start date in ISO 8601 format
+        #[arg(short, long)]
+        start: Option<String>,
+
+        /// End date in ISO 8601 format (defaults to now)
+        #[arg(short, long)]
+        end: Option<String>,
     },
+}
 
-    /// Check a specific date and hour, or auto-select in continuous mode
-    Check {
-        /// Date in YYYYMMDD format (optional in continuous mode)
-        #[arg(short, long)]
-        date: Option<String>,
-
-        /// Hour in HH format 00-23 (optional in continuous mode)
-        #[arg(short = 'H', long)]
-        hour: Option<String>,
-
-        /// Dry run: show which hour would be selected without running check
-        #[arg(long, default_value = "false")]
-        dry_run: bool,
-    },
-
-    /// Generate a recap/summary of consolidation checks over a date range
-    Recap {
-        /// Start date in ISO 8601 format (e.g. 2023-01-01T00:00:00Z)
-        #[arg(short, long)]
-        start: String,
-
-        /// End date in ISO 8601 format (e.g. 2023-01-01T01:00:00Z)
-        #[arg(short, long)]
-        end: String,
-
-        /// Output format (json, text, csv, html)
-        #[arg(short, long, default_value = "text")]
-        format: String,
-
-        /// Output file path (required for html format)
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-    },
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+    Quiet,
 }
 
 #[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
-        // Output error as JSON to stdout to maintain consistent log format
-        let error_json = serde_json::json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "level": "ERROR",
-            "message": format!("{:#}", e),
-            "error": true,
-            "target": "log_consolidator_checker_rust",
-        });
-        println!(
-            "{}",
-            serde_json::to_string(&error_json)
-                .unwrap_or_else(|_| format!("{{\"error\": \"{}\"}}", e))
-        );
-        std::process::exit(1);
+async fn main() -> Result<()> {
+    // Set nice priority to prevent system resource starvation
+    #[cfg(unix)]
+    {
+        unsafe {
+            let current_priority = libc::getpriority(libc::PRIO_PROCESS, 0);
+            if current_priority < 10 {
+                // Set to nice 10 if we're running at higher priority
+                if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                    eprintln!("Warning: Could not set nice priority to 10");
+                }
+            }
+        }
     }
-}
 
-async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging with JSON format
-    let filter =
+    // Initialize logging
+    let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
-    // All logs go to stdout with level in JSON "level" field
-    fmt()
-        .json()
-        .flatten_event(true)
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_writer(std::io::stdout)
-        .init();
+    fmt().with_env_filter(env_filter).with_target(false).init();
 
-    // Load configuration
-    info!("Loading config from {}", cli.config.display());
-    let config = load_config(&cli.config)?;
+    // Set up DNS cache with 5 minute TTL
+    dns_cache::init_global_dns_cache(300).await.ok();
 
-    // Initialize DNS cache to reduce CoreDNS load when running many concurrent processes
-    // TTL of 300 seconds (5 minutes) - AWS endpoints are stable
-    if let Err(e) = dns_cache::init_global_dns_cache(300).await {
-        warn!(error = %e, "Failed to initialize DNS cache, continuing without caching");
-    }
-
-    // Initialize S3 client (will pre-warm DNS cache if available)
-    let s3_client = WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?;
-
-    match &cli.command {
-        Commands::List { start, end } => {
-            // Parse dates
-            let start_date = DateTime::parse_from_rfc3339(start)
-                .with_context(|| format!("Invalid start date: {}", start))?
-                .with_timezone(&Utc);
-
-            let end_date = DateTime::parse_from_rfc3339(end)
-                .with_context(|| format!("Invalid end date: {}", end))?
-                .with_timezone(&Utc);
-
-            // Get date range
-            let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
-            info!(
-                "Checking buckets for {} hours (from {}/{} to {}/{})",
-                date_hours.len(),
-                date_hours.first().unwrap().date,
-                date_hours.first().unwrap().hour,
-                date_hours.last().unwrap().date,
-                date_hours.last().unwrap().hour,
-            );
-
-            // Get client once upfront to avoid repeated get_client() calls and DNS lookups
-            let client = s3_client.get_client().await?;
-
-            // List files in archived buckets
-            info!("Checking archived buckets");
-            let archived_buckets = get_archived_buckets(&config);
-            for bucket in archived_buckets {
-                info!("Checking archived bucket: {}", bucket.bucket);
-
-                for date_hour in &date_hours {
-                    let result = s3_client
-                        .get_matching_filenames_from_s3_with_client(
-                            &client,
-                            bucket,
-                            &date_hour.date,
-                            &date_hour.hour,
-                            true,
-                        )
-                        .await?;
-
-                    info!(
-                        "Found {} files in archived bucket {} for {}/{} (total size: {} bytes)",
-                        result.files.len(),
-                        bucket.bucket,
-                        date_hour.date,
-                        date_hour.hour,
-                        result.total_archives_size
-                    );
-
-                    // Print first few files if any
-                    if !result.files.is_empty() {
-                        info!("First few files:");
-                        for (i, file) in result.files.iter().take(5).enumerate() {
-                            info!("  {}: {} ({} bytes)", i + 1, file.key, file.size);
-                        }
-                    }
-                }
+    // Load config if file exists
+    let config = if cli.config.exists() {
+        match load_config(&cli.config) {
+            Ok(cfg) => {
+                info!("Loaded config from {}", cli.config.display());
+                Some(cfg)
             }
-
-            // List files in consolidated bucket
-            info!("Checking consolidated buckets");
-            let consolidated_buckets = get_consolidated_buckets(&config);
-            for bucket in consolidated_buckets {
-                info!("Checking consolidated bucket: {}", bucket.bucket);
-
-                for date_hour in &date_hours {
-                    let result = s3_client
-                        .get_matching_filenames_from_s3_with_client(
-                            &client,
-                            bucket,
-                            &date_hour.date,
-                            &date_hour.hour,
-                            true,
-                        )
-                        .await?;
-
-                    info!(
-                        "Found {} files in consolidated bucket {} for {}/{} (total size: {} bytes)",
-                        result.files.len(),
-                        bucket.bucket,
-                        date_hour.date,
-                        date_hour.hour,
-                        result.total_archives_size
-                    );
-
-                    // Print first few files if any
-                    if !result.files.is_empty() {
-                        info!("First few files:");
-                        for (i, file) in result.files.iter().take(5).enumerate() {
-                            info!("  {}: {} ({} bytes)", i + 1, file.key, file.size);
-                        }
-                    }
-                }
+            Err(e) => {
+                info!("Could not load config from {}: {}", cli.config.display(), e);
+                None
             }
         }
+    } else {
+        info!(
+            "Config file {} not found, using command line arguments only",
+            cli.config.display()
+        );
+        None
+    };
 
-        Commands::Check {
-            date,
-            hour,
-            dry_run,
-        } => {
-            // Determine target date/hour - either explicit or via continuous mode
-            let (target_date, target_hour) = match (date, hour) {
-                // Explicit date/hour provided - use them
-                (Some(d), Some(h)) => (d.clone(), h.clone()),
-
-                // Partial arguments - error
-                (Some(_), None) | (None, Some(_)) => {
-                    return Err(anyhow::anyhow!(
-                        "Both --date and --hour must be provided together, or neither (for continuous mode)"
-                    ));
-                }
-
-                // Neither provided - use continuous mode
-                (None, None) => {
-                    // Check if continuousConsolidation config exists
-                    let continuous_config = config.continuousConsolidation.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No --date/--hour provided and no continuousConsolidation config found. \
-                             Either provide explicit date/hour or add continuousConsolidation to config."
-                        )
-                    })?;
-
-                    info!("Continuous mode: auto-selecting target hour");
-
-                    // Generate candidate hours
-                    let now = Utc::now();
-                    let candidates = continuous::generate_candidate_hours(continuous_config, now)?;
-
-                    if candidates.is_empty() {
-                        return Err(anyhow::anyhow!(
-                            "No candidate hours in range (minAge: {}, maxAge: {})",
-                            continuous_config.min_age,
-                            continuous_config.max_age
-                        ));
-                    }
-
-                    info!(
-                        min_age = %continuous_config.min_age,
-                        max_age = %continuous_config.max_age,
-                        total_candidates = candidates.len(),
-                        oldest = format!("{}/{}", candidates.first().map(|c| &c.date).unwrap_or(&String::new()),
-                                                  candidates.first().map(|c| &c.hour).unwrap_or(&String::new())),
-                        newest = format!("{}/{}", candidates.last().map(|c| &c.date).unwrap_or(&String::new()),
-                                                  candidates.last().map(|c| &c.hour).unwrap_or(&String::new())),
-                        "Generated candidate hours for continuous mode"
-                    );
-
-                    // Select target hour (batch size 16 for parallel checks)
-                    let selection =
-                        continuous::select_target_hour(&config, &s3_client, candidates, 16).await?;
-
-                    match selection.selected {
-                        Some(target) => {
-                            info!(
-                                date = %target.date,
-                                hour = %target.hour,
-                                reason = %selection.reason,
-                                candidates_scanned = selection.candidates_scanned,
-                                "Target hour selected"
-                            );
-
-                            if *dry_run {
-                                info!("Dry run mode - exiting without performing check");
-                                println!("{}\t{}", target.date, target.hour);
-                                return Ok(());
-                            }
-
-                            (target.date, target.hour)
-                        }
-                        None => {
-                            info!(
-                                reason = %selection.reason,
-                                candidates_scanned = selection.candidates_scanned,
-                                "No target hour needs checking - all candidates passed or ineligible"
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-            };
-
-            info!(target_date = %target_date, target_hour = %target_hour, "Starting consolidation check");
-
-            // Log memory buffer settings
-            info!(target_date = %target_date, target_hour = %target_hour, memory_pool_mb = cli.memory_pool_mb, "Memory pool configured");
-
-            // Create a checker with memory limits
-            let checker = Checker::new(
-                s3_client,
-                cli.max_parallel,
-                cli.process_threads,
-                cli.memory_pool_mb,
-            );
-
-            // Set up signal handler for memory monitoring if enabled
-            if cli.enable_signals {
-                // Get references to memory allocators from the checker
-                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour)
-                {
-                    if let Err(e) = memory_monitor.setup_signal_handler() {
-                        warn!(target_date = %target_date, target_hour = %target_hour, error = %e, "Failed to set up signal handler");
-                    } else {
-                        info!(target_date = %target_date, target_hour = %target_hour, pid = std::process::id(), "Signal handler ready (SIGUSR2)");
-                    }
-                }
-            }
-
-            // Spawn a background task for periodic updates with cancellation
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-            let cancel_token_clone = cancel_token.clone();
-            if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour) {
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = cancel_token_clone.cancelled() => {
-                                break;
-                            }
-                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                                // Display stats
-                                memory_monitor.log_memory_stats();
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Get archived and consolidated buckets
-            let archived_buckets = get_archived_buckets(&config);
-            let consolidated_buckets = get_consolidated_buckets(&config);
-            let consolidated_bucket = consolidated_buckets
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("No consolidated bucket found"))?;
-
-            // Perform comparison
-            let result = checker
-                .get_comparison_results(
-                    &archived_buckets,
-                    consolidated_bucket,
-                    &target_date,
-                    &target_hour,
-                )
-                .await?;
-
-            // Upload check result to S3
-            if let Some(results_bucket) = get_results_bucket(&config) {
-                checker
-                    .upload_check_result(results_bucket, &target_date, &target_hour, &result)
-                    .await?;
-            } else {
-                warn!("No results bucket configured, skipping upload");
-            }
-
-            // Log final memory stats if signal handling is enabled
-            if cli.enable_signals {
-                if let Some(memory_monitor) = checker.get_memory_monitor(&target_date, &target_hour)
-                {
-                    memory_monitor.log_memory_stats();
-                }
-            }
-        }
-
-        Commands::Recap {
+    match cli.command {
+        Commands::Search {
+            pattern,
+            buckets,
+            filter,
             start,
             end,
-            format,
+            context,
+            ignore_case,
+            count,
+            max_matches_per_file,
+            max_parallel,
+            process_threads,
+            memory_pool_mb: _,
+            buffer_size_kb,
+            channel_buffer,
+            max_retries,
+            retry_delay,
+            client_max_age,
             output,
         } => {
-            // Parse dates
-            let start_date = DateTime::parse_from_rfc3339(start)
-                .with_context(|| format!("Invalid start date: {}", start))?
-                .with_timezone(&Utc);
+            let end_date = if let Some(end) = end {
+                end.parse::<DateTime<Utc>>()
+                    .context("Invalid end date format")?
+            } else {
+                Utc::now()
+            };
 
-            let end_date = DateTime::parse_from_rfc3339(end)
-                .with_context(|| format!("Invalid end date: {}", end))?
-                .with_timezone(&Utc);
+            let start_date = if let Some(start) = start {
+                Some(
+                    start
+                        .parse::<DateTime<Utc>>()
+                        .context("Invalid start date format")?,
+                )
+            } else {
+                None
+            };
 
-            // Get date range
-            let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
-            info!(
-                "Generating recap for {} hours (from {}/{} to {}/{})",
-                date_hours.len(),
-                date_hours.first().unwrap().date,
-                date_hours.first().unwrap().hour,
-                date_hours.last().unwrap().date,
-                date_hours.last().unwrap().hour,
-            );
+            // Create S3 client
+            let mut s3_client = WrappedS3Client::new(&cli.region, client_max_age, None).await?;
 
-            // Get results bucket config
-            let results_bucket = get_results_bucket(&config)
-                .ok_or_else(|| anyhow::anyhow!("No results bucket configured"))?;
+            // Configure search
+            let search_config = SearchConfig {
+                pattern: pattern.clone(),
+                ignore_case,
+                context_lines: context,
+                count_only: count,
+                max_matches_per_file,
+            };
 
-            info!(
-                bucket = %results_bucket.bucket,
-                "Reading check results from bucket"
-            );
-
-            // Get client once upfront to avoid repeated get_client() calls and DNS lookups
-            let client = s3_client.get_client().await?;
-
-            // Fast path for missing-txt: parallel existence checks only, no downloads
-            if format == "missing-txt" {
-                const CONCURRENT_CHECKS: usize = 64;
-
-                info!(
-                    total_hours = date_hours.len(),
-                    concurrency = CONCURRENT_CHECKS,
-                    "Starting parallel existence checks"
-                );
-
-                let missing_checks: Vec<(String, String)> = stream::iter(date_hours.iter())
-                    .map(|date_hour| {
-                        let client = &client;
-                        let s3_client = &s3_client;
-                        let results_bucket = results_bucket;
-                        async move {
-                            let file_list = s3_client
-                                .get_matching_filenames_from_s3_with_client(
-                                    client,
-                                    results_bucket,
-                                    &date_hour.date,
-                                    &date_hour.hour,
-                                    false,
-                                )
-                                .await;
-
-                            match file_list {
-                                Ok(fl) if fl.files.is_empty() => {
-                                    Some((date_hour.date.clone(), date_hour.hour.clone()))
-                                }
-                                Ok(_) => None,
-                                Err(e) => {
-                                    warn!(
-                                        date = %date_hour.date,
-                                        hour = %date_hour.hour,
-                                        error = %e,
-                                        "Error checking existence, treating as missing"
-                                    );
-                                    Some((date_hour.date.clone(), date_hour.hour.clone()))
-                                }
-                            }
-                        }
-                    })
-                    .buffer_unordered(CONCURRENT_CHECKS)
-                    .filter_map(|x| async { x })
-                    .collect()
-                    .await;
-
-                let mut sorted_missing = missing_checks;
-                sorted_missing.sort();
-
-                info!(
-                    total_hours = date_hours.len(),
-                    total_missing = sorted_missing.len(),
-                    "Parallel existence check complete"
-                );
-
-                // Generate tab-separated output
-                let txt_output: String = sorted_missing
-                    .iter()
-                    .map(|(date, hour)| format!("{}\t{}", date, hour))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if let Some(output_path) = output {
-                    std::fs::write(output_path, &txt_output)?;
-                    info!(
-                        path = %output_path,
-                        total_hours = date_hours.len(),
-                        total_missing = sorted_missing.len(),
-                        "Missing checks txt list written"
-                    );
+            // Get buckets from command line or config
+            let (simple_buckets, config_buckets): (Vec<String>, Vec<&BucketConfig>) =
+                if let Some(b) = buckets {
+                    // Command line buckets are simple strings
+                    (b, vec![])
+                } else if let Some(ref cfg) = config {
+                    // Config buckets have path formatting
+                    (vec![], cfg.buckets.iter().collect())
                 } else {
-                    println!("{}", txt_output);
-                }
+                    eprintln!("Error: No buckets specified. Use -b flag or provide config file.");
+                    std::process::exit(1);
+                };
 
-                return Ok(());
+            if simple_buckets.is_empty() && config_buckets.is_empty() {
+                eprintln!("Error: No buckets to search.");
+                std::process::exit(1);
             }
 
-            // Fast parallel path for formats that need results (html, retry-txt, retry-json)
-            const CONCURRENT_CHECKS: usize = 64;
+            let searcher = Arc::new(StreamSearcher::new(search_config));
+            let collector = Arc::new(tokio::sync::Mutex::new(SearchResultCollector::new()));
 
-            info!(
-                total_hours = date_hours.len(),
-                concurrency = CONCURRENT_CHECKS,
-                "Starting parallel check result fetching"
-            );
+            // Configure downloader
+            let download_config = StreamingDownloaderConfig {
+                max_concurrent_downloads: max_parallel,
+                buffer_size_bytes: buffer_size_kb * 1024,
+                channel_buffer_size: channel_buffer,
+                max_retries,
+                initial_retry_delay: Duration::from_secs(retry_delay),
+            };
 
-            // Phase 1: Parallel list + download
-            // Tuple: (date, hour, json_result, check_count)
-            let fetch_results: Vec<(String, String, Option<serde_json::Value>, usize)> =
-                stream::iter(date_hours.iter())
-                    .map(|date_hour| {
-                        let client = &client;
-                        let s3_client = &s3_client;
-                        let results_bucket = results_bucket;
-                        async move {
-                            // List files for this date/hour
-                            let file_list = match s3_client
-                                .get_matching_filenames_from_s3_with_client(
-                                    client,
-                                    results_bucket,
-                                    &date_hour.date,
-                                    &date_hour.hour,
-                                    false,
-                                )
-                                .await
-                            {
-                                Ok(fl) => fl,
-                                Err(e) => {
-                                    warn!(
-                                        date = %date_hour.date,
-                                        hour = %date_hour.hour,
-                                        error = %e,
-                                        "Error listing files"
-                                    );
-                                    return (
-                                        date_hour.date.clone(),
-                                        date_hour.hour.clone(),
-                                        None,
-                                        0,
-                                    );
-                                }
-                            };
+            let downloader =
+                StreamingDownloader::new(s3_client.get_client().await?, download_config);
 
-                            let check_count = file_list.files.len();
+            // Process simple buckets (from command line)
+            for bucket in &simple_buckets {
+                info!("Searching bucket: {}", bucket);
 
-                            if file_list.files.is_empty() {
-                                return (date_hour.date.clone(), date_hour.hour.clone(), None, 0);
-                            }
+                // Get objects from S3
+                let objects = if let Some(start) = start_date {
+                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
 
-                            // Download the last result file (check_result.json comes last lexicographically)
-                            if let Some(file) = file_list.files.last() {
-                                match s3_client
-                                    .download_object_with_client(client, &file.bucket, &file.key)
-                                    .await
-                                {
-                                    Ok(bytes) => {
-                                        match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                            Ok(json) => {
-                                                return (
-                                                    date_hour.date.clone(),
-                                                    date_hour.hour.clone(),
-                                                    Some(json),
-                                                    check_count,
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    date = %date_hour.date,
-                                                    hour = %date_hour.hour,
-                                                    error = %e,
-                                                    "Error parsing JSON"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            date = %date_hour.date,
-                                            hour = %date_hour.hour,
-                                            error = %e,
-                                            "Error downloading file"
-                                        );
-                                    }
-                                }
-                            }
+                    let mut all_objects = Vec::new();
+                    for dh in date_hours {
+                        let prefix = format!("{}/{}", dh.date, dh.hour);
+                        let objs = s3_client
+                            .get_matching_filenames_from_s3(bucket, &prefix, filter.as_deref())
+                            .await?;
+                        all_objects.extend(objs);
+                    }
+                    all_objects
+                } else {
+                    s3_client
+                        .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
+                        .await?
+                };
 
-                            (
-                                date_hour.date.clone(),
-                                date_hour.hour.clone(),
-                                None,
-                                check_count,
+                if objects.is_empty() {
+                    info!("No matching objects found in {}", bucket);
+                    continue;
+                }
+
+                info!("Found {} objects to search", objects.len());
+
+                // Search through objects
+                downloader
+                    .search_objects(&objects, searcher.clone(), collector.clone())
+                    .await?;
+            }
+
+            // Process config buckets (with path formatting)
+            use crate::utils::path_formatter::generate_path_formatter;
+            for bucket_cfg in &config_buckets {
+                info!("Searching bucket: {}", bucket_cfg.bucket);
+
+                if let Some(start) = start_date {
+                    // Use path formatter for date-based paths
+                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+                    let formatter = generate_path_formatter(bucket_cfg);
+
+                    // Process each date/hour separately for better logging
+                    for dh in date_hours {
+                        let prefix = formatter(&dh.date, &dh.hour)?;
+                        let objs = s3_client
+                            .get_matching_filenames_from_s3(
+                                &bucket_cfg.bucket,
+                                &prefix,
+                                filter.as_deref(),
                             )
-                        }
-                    })
-                    .buffer_unordered(CONCURRENT_CHECKS)
-                    .collect()
-                    .await;
+                            .await?;
 
-            // Phase 2: Build results and missing lists
-            let mut results: HashMap<String, serde_json::Value> = HashMap::new();
-            let mut missing_checks: Vec<(String, String)> = Vec::new();
-
-            for (date, hour, json_opt, check_count) in fetch_results {
-                let key = format!("{}/{}", date, hour);
-                match json_opt {
-                    Some(mut json) => {
-                        // Inject check_count into the JSON result
-                        if let Some(obj) = json.as_object_mut() {
-                            obj.insert("check_count".to_string(), serde_json::json!(check_count));
+                        if objs.is_empty() {
+                            debug!("No objects found for prefix: {}", prefix);
+                            continue;
                         }
-                        results.insert(key, json);
+
+                        let total_size: usize = objs.iter().map(|o| o.size).sum();
+                        let prefix_start = std::time::Instant::now();
+                        let matches_before = collector.lock().await.match_count();
+
+                        info!(
+                            "Processing prefix {}: {} files ({} MB)",
+                            prefix,
+                            objs.len(),
+                            total_size / 1_000_000
+                        );
+
+                        downloader
+                            .search_objects(&objs, searcher.clone(), collector.clone())
+                            .await?;
+
+                        let matches_after = collector.lock().await.match_count();
+                        let matches_found = matches_after - matches_before;
+
+                        info!(
+                            "Completed prefix {}: found {} matches in {:.1}s",
+                            prefix,
+                            matches_found,
+                            prefix_start.elapsed().as_secs_f32()
+                        );
                     }
-                    None => {
-                        missing_checks.push((date, hour));
+                } else {
+                    // No date range, just use static prefix if any
+                    let prefix = if bucket_cfg.path.is_empty() {
+                        String::new()
+                    } else {
+                        // Generate prefix without date formatting
+                        let formatter = generate_path_formatter(bucket_cfg);
+                        let empty_date = String::new();
+                        let empty_hour = String::new();
+                        formatter(&empty_date, &empty_hour)?
+                    };
+
+                    let objects = s3_client
+                        .get_matching_filenames_from_s3(
+                            &bucket_cfg.bucket,
+                            &prefix,
+                            filter.as_deref(),
+                        )
+                        .await?;
+
+                    if objects.is_empty() {
+                        info!("No matching objects found in {}", bucket_cfg.bucket);
+                        continue;
+                    }
+
+                    info!("Found {} objects to search", objects.len());
+                    downloader
+                        .search_objects(&objects, searcher.clone(), collector.clone())
+                        .await?;
+                }
+            }
+
+            // Get and display results
+            let final_collector = Arc::try_unwrap(collector)
+                .map_err(|_| anyhow::anyhow!("Failed to get collector"))?
+                .into_inner();
+
+            let results = final_collector.into_result();
+
+            // Determine output directory
+            let output_dir = config
+                .as_ref()
+                .and_then(|c| c.output_dir.clone())
+                .unwrap_or_else(|| "./scrapper-output".to_string());
+
+            // Create output directory if it doesn't exist
+            std::fs::create_dir_all(&output_dir)?;
+
+            info!("Writing results to {}", output_dir);
+
+            // Write results grouped by date/hour
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+
+            let mut files_written = 0;
+            for (prefix, matches) in &results.matches_by_prefix {
+                if matches.is_empty() {
+                    continue;
+                }
+
+                // Create output file like "20240115H10.gz"
+                let output_file = format!("{}/{}.gz", output_dir, prefix);
+                let file = std::fs::File::create(&output_file)?;
+                let mut encoder = GzEncoder::new(file, Compression::default());
+
+                // Write matches as JSON lines (one per line for easy streaming)
+                for match_item in matches {
+                    // Write just the line content with metadata as JSON
+                    let output_line = serde_json::json!({
+                        "file": format!("{}/{}", match_item.bucket, match_item.key),
+                        "line": match_item.line_number,
+                        "content": match_item.line_content.trim()
+                    });
+                    writeln!(encoder, "{}", output_line)?;
+                }
+
+                encoder.finish()?;
+                files_written += 1;
+                info!("Wrote {} matches to {}", matches.len(), output_file);
+            }
+
+            // Print summary
+            match output {
+                OutputFormat::Json => {
+                    let summary = serde_json::json!({
+                        "pattern": pattern,
+                        "files_searched": results.files_searched,
+                        "files_with_matches": results.files_with_matches,
+                        "total_matches": results.total_matches,
+                        "output_files_written": files_written,
+                        "output_directory": output_dir
+                    });
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+                OutputFormat::Text | OutputFormat::Quiet => {
+                    println!("\n=== Search Complete ===");
+                    println!("Pattern: {}", pattern);
+                    println!("Files searched: {}", results.files_searched);
+                    println!("Files with matches: {}", results.files_with_matches);
+                    println!("Total matches: {}", results.total_matches);
+                    println!("Output files written: {}", files_written);
+                    println!("Output directory: {}", output_dir);
+
+                    if count && !results.file_counts.is_empty() {
+                        println!("\n--- Match Counts by File ---");
+                        let mut counts: Vec<_> = results.file_counts.iter().collect();
+                        counts.sort_by(|a, b| b.1.cmp(a.1));
+                        for (file, count) in counts.iter().take(10) {
+                            println!("  {}: {}", file, count);
+                        }
+                        if counts.len() > 10 {
+                            println!("  ... and {} more files", counts.len() - 10);
+                        }
+                    }
+                }
+            }
+        }
+        Commands::List {
+            buckets,
+            filter,
+            start,
+            end,
+        } => {
+            let end_date = if let Some(end) = end {
+                end.parse::<DateTime<Utc>>()
+                    .context("Invalid end date format")?
+            } else {
+                Utc::now()
+            };
+
+            let start_date = if let Some(start) = start {
+                Some(
+                    start
+                        .parse::<DateTime<Utc>>()
+                        .context("Invalid start date format")?,
+                )
+            } else {
+                None
+            };
+
+            // Get buckets from command line or config
+            let (simple_buckets, config_buckets): (Vec<String>, Vec<&BucketConfig>) =
+                if let Some(b) = buckets {
+                    (b, vec![])
+                } else if let Some(ref cfg) = config {
+                    (vec![], cfg.buckets.iter().collect())
+                } else {
+                    eprintln!("Error: No buckets specified. Use -b flag or provide config file.");
+                    std::process::exit(1);
+                };
+
+            if simple_buckets.is_empty() && config_buckets.is_empty() {
+                eprintln!("Error: No buckets to list.");
+                std::process::exit(1);
+            }
+
+            // Create S3 client
+            let mut s3_client = WrappedS3Client::new(&cli.region, 60, None).await?;
+
+            // List objects in simple buckets
+            for bucket in &simple_buckets {
+                println!("\nBucket: {}", bucket);
+
+                let objects = if let Some(start) = start_date {
+                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+
+                    let mut all_objects = Vec::new();
+                    for dh in date_hours {
+                        let prefix = format!("{}/{}", dh.date, dh.hour);
+                        let objs = s3_client
+                            .get_matching_filenames_from_s3(bucket, &prefix, filter.as_deref())
+                            .await?;
+                        all_objects.extend(objs);
+                    }
+                    all_objects
+                } else {
+                    s3_client
+                        .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
+                        .await?
+                };
+
+                if objects.is_empty() {
+                    println!("  No matching objects found");
+                } else {
+                    println!("  Found {} objects:", objects.len());
+                    for obj in objects.iter().take(100) {
+                        println!("    {} ({} bytes)", obj.key, obj.size);
+                    }
+                    if objects.len() > 100 {
+                        println!("    ... and {} more", objects.len() - 100);
                     }
                 }
             }
 
-            info!(
-                total_hours = date_hours.len(),
-                found = results.len(),
-                missing = missing_checks.len(),
-                "Parallel check result fetching complete"
-            );
+            // List objects in config buckets (with path formatting)
+            use crate::utils::path_formatter::generate_path_formatter;
+            for bucket_cfg in &config_buckets {
+                println!("\nBucket: {} (configured)", bucket_cfg.bucket);
 
-            // Output based on format
-            match format.as_str() {
-                "json" => println!("{}", serde_json::to_string_pretty(&results)?),
-                "text" => {
-                    // TODO: Implement human-readable text summary
-                    info!("Text format not yet implemented, falling back to JSON");
-                    println!("{}", serde_json::to_string_pretty(&results)?);
-                }
-                "csv" => {
-                    // TODO: Implement CSV output format
-                    info!("CSV format not yet implemented, falling back to JSON");
-                    println!("{}", serde_json::to_string_pretty(&results)?);
-                }
-                "html" => {
-                    let output_path = output
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("--output is required for html format"))?;
+                if let Some(start) = start_date {
+                    // Use path formatter for date-based paths
+                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+                    let formatter = generate_path_formatter(bucket_cfg);
 
-                    let summaries = aggregate_by_day(&results, &missing_checks);
-                    let html = generate_recap_html(&summaries);
+                    let mut all_objects = Vec::new();
+                    for dh in date_hours {
+                        let prefix = formatter(&dh.date, &dh.hour)?;
+                        let objs = s3_client
+                            .get_matching_filenames_from_s3(
+                                &bucket_cfg.bucket,
+                                &prefix,
+                                filter.as_deref(),
+                            )
+                            .await?;
+                        all_objects.extend(objs);
+                    }
 
-                    std::fs::write(output_path, &html)?;
-                    info!(path = %output_path, days = summaries.len(), "HTML recap written");
-                }
-                "retry-json" => {
-                    // Filter for failed checks and generate retry list (exclude cleaned entries)
-                    let mut failed_checks: Vec<serde_json::Value> = Vec::new();
-
-                    for (key, value) in &results {
-                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
-
-                        // Skip cleaned entries (check both old and new message patterns)
-                        let is_cleaned = message.contains("No input files found")
-                            && message.contains("consolidated files exist")
-                            || message.starts_with("Cleaned:");
-
-                        if !ok && !is_cleaned {
-                            // Key format: "YYYYMMDD/HH"
-                            let parts: Vec<&str> = key.split('/').collect();
-                            if parts.len() == 2 {
-                                failed_checks.push(serde_json::json!({
-                                    "date": parts[0],
-                                    "hour": parts[1]
-                                }));
-                            }
+                    if all_objects.is_empty() {
+                        println!("  No matching objects found");
+                    } else {
+                        println!("  Found {} objects:", all_objects.len());
+                        for obj in all_objects.iter().take(100) {
+                            println!("    {} ({} bytes)", obj.key, obj.size);
+                        }
+                        if all_objects.len() > 100 {
+                            println!("    ... and {} more", all_objects.len() - 100);
                         }
                     }
-
-                    // Sort by date then hour
-                    failed_checks.sort_by(|a, b| {
-                        let a_date = a.get("date").and_then(|v| v.as_str()).unwrap_or("");
-                        let b_date = b.get("date").and_then(|v| v.as_str()).unwrap_or("");
-                        let a_hour = a.get("hour").and_then(|v| v.as_str()).unwrap_or("");
-                        let b_hour = b.get("hour").and_then(|v| v.as_str()).unwrap_or("");
-                        (a_date, a_hour).cmp(&(b_date, b_hour))
-                    });
-
-                    let retry_report = serde_json::json!({
-                        "generated_at": chrono::Utc::now().to_rfc3339(),
-                        "date_range": {
-                            "start": start,
-                            "end": end
-                        },
-                        "total_checked": results.len(),
-                        "total_failed": failed_checks.len(),
-                        "failed_checks": failed_checks
-                    });
-
-                    let json_output = serde_json::to_string_pretty(&retry_report)?;
-
-                    if let Some(output_path) = output {
-                        std::fs::write(output_path, &json_output)?;
-                        info!(
-                            path = %output_path,
-                            total_checked = results.len(),
-                            total_failed = failed_checks.len(),
-                            "Retry list written"
-                        );
+                } else {
+                    // No date range, use static prefix or empty
+                    let prefix = if bucket_cfg.path.is_empty() {
+                        String::new()
                     } else {
-                        println!("{}", json_output);
-                    }
-                }
-                "retry-txt" => {
-                    // Filter for failed checks and generate tab-separated retry list
-                    // Format: YYYYMMDD\tHH (compatible with retry-from-textfile.sh)
-                    let mut failed_checks: Vec<(String, String)> = Vec::new();
+                        let formatter = generate_path_formatter(bucket_cfg);
+                        let empty_date = String::new();
+                        let empty_hour = String::new();
+                        formatter(&empty_date, &empty_hour)?
+                    };
 
-                    for (key, value) in &results {
-                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let objects = s3_client
+                        .get_matching_filenames_from_s3(
+                            &bucket_cfg.bucket,
+                            &prefix,
+                            filter.as_deref(),
+                        )
+                        .await?;
 
-                        // Skip cleaned entries (check both old and new message patterns)
-                        let is_cleaned = message.contains("No input files found")
-                            && message.contains("consolidated files exist")
-                            || message.starts_with("Cleaned:");
-
-                        if !ok && !is_cleaned {
-                            // Key format: "YYYYMMDD/HH"
-                            let parts: Vec<&str> = key.split('/').collect();
-                            if parts.len() == 2 {
-                                failed_checks.push((parts[0].to_string(), parts[1].to_string()));
-                            }
+                    if objects.is_empty() {
+                        println!("  No matching objects found");
+                    } else {
+                        println!("  Found {} objects:", objects.len());
+                        for obj in objects.iter().take(100) {
+                            println!("    {} ({} bytes)", obj.key, obj.size);
+                        }
+                        if objects.len() > 100 {
+                            println!("    ... and {} more", objects.len() - 100);
                         }
                     }
-
-                    // Sort by date then hour
-                    failed_checks.sort();
-
-                    // Generate tab-separated output
-                    let txt_output: String = failed_checks
-                        .iter()
-                        .map(|(date, hour)| format!("{}\t{}", date, hour))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    if let Some(output_path) = output {
-                        std::fs::write(output_path, &txt_output)?;
-                        info!(
-                            path = %output_path,
-                            total_checked = results.len(),
-                            total_failed = failed_checks.len(),
-                            "Retry txt list written"
-                        );
-                    } else {
-                        println!("{}", txt_output);
-                    }
                 }
-                "to-fix-txt" => {
-                    // Filter for pending and KO checks only (exclude cleaned entries)
-                    // Format: YYYYMMDD\tHH\tTYPE (PEND or KO)
-                    let mut to_fix: Vec<(String, String, String)> = Vec::new();
-
-                    for (key, value) in &results {
-                        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
-
-                        // Skip cleaned entries (check both old and new message patterns)
-                        let is_cleaned = message.contains("No input files found")
-                            && message.contains("consolidated files exist")
-                            || message.starts_with("Cleaned:");
-
-                        if !ok && !is_cleaned {
-                            // Key format: "YYYYMMDD/HH"
-                            let parts: Vec<&str> = key.split('/').collect();
-                            if parts.len() == 2 {
-                                let status_type = if message.contains("Consolidation pending") {
-                                    "PEND"
-                                } else {
-                                    "KO"
-                                };
-                                to_fix.push((
-                                    parts[0].to_string(),
-                                    parts[1].to_string(),
-                                    status_type.to_string(),
-                                ));
-                            }
-                        }
-                    }
-
-                    // Sort by date then hour
-                    to_fix.sort();
-
-                    // Count by type
-                    let pend_count = to_fix.iter().filter(|(_, _, t)| t == "PEND").count();
-                    let ko_count = to_fix.iter().filter(|(_, _, t)| t == "KO").count();
-
-                    // Generate tab-separated output
-                    let txt_output: String = to_fix
-                        .iter()
-                        .map(|(date, hour, status)| format!("{}\t{}\t{}", date, hour, status))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    if let Some(output_path) = output {
-                        std::fs::write(output_path, &txt_output)?;
-                        info!(
-                            path = %output_path,
-                            total_checked = results.len(),
-                            total_to_fix = to_fix.len(),
-                            pending = pend_count,
-                            ko = ko_count,
-                            "To-fix txt list written"
-                        );
-                    } else {
-                        println!("{}", txt_output);
-                    }
-                }
-                // Note: "missing-txt" is handled above with fast parallel path
-                _ => return Err(anyhow::anyhow!("Unknown format: {}", format)),
             }
         }
     }

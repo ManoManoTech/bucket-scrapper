@@ -92,8 +92,8 @@ pub fn generate_path_formatter(
             // Filter out empty parts and join with "/"
             let path = parts
                 .iter()
-                .filter(|part| !part.is_empty())
-                .map(|s| s.as_str())
+                .filter(|part: &&String| !part.is_empty())
+                .map(|s: &String| s.as_str())
                 .collect::<Vec<_>>()
                 .join("/");
 

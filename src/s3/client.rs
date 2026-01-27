@@ -312,6 +312,69 @@ impl WrappedS3Client {
         })
     }
 
+    /// Get matching files from S3 with simple parameters
+    pub async fn get_matching_filenames_from_s3(
+        &mut self,
+        bucket: &str,
+        prefix: &str,
+        filter_pattern: Option<&str>,
+    ) -> Result<Vec<S3ObjectInfo>> {
+        let client = self.get_client().await?;
+
+        debug!("Listing objects in s3://{}/{}", bucket, prefix);
+
+        let mut result = Vec::new();
+        let mut continuation_token = None;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+
+            if let Some(token) = continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await?;
+
+            if let Some(contents) = response.contents {
+                for obj in contents {
+                    if let (Some(key), Some(size), Some(last_modified)) =
+                        (obj.key, obj.size, obj.last_modified)
+                    {
+                        // Apply filter if provided
+                        if let Some(pattern) = filter_pattern {
+                            if !key.contains(pattern) {
+                                continue;
+                            }
+                        }
+
+                        result.push(S3ObjectInfo {
+                            bucket: bucket.to_string(),
+                            key,
+                            size: size as usize,
+                            last_modified: chrono::DateTime::from_timestamp_nanos(
+                                last_modified.as_nanos() as i64,
+                            ),
+                        });
+                    }
+                }
+            }
+
+            if response.is_truncated.unwrap_or(false) {
+                continuation_token = response.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        debug!(
+            "Found {} objects in s3://{}/{}",
+            result.len(),
+            bucket,
+            prefix
+        );
+        Ok(result)
+    }
+
     /// Downloads an object using a provided client - use this when making multiple downloads
     /// to avoid repeated get_client() overhead and reduce DNS lookups
     pub async fn download_object_with_client(

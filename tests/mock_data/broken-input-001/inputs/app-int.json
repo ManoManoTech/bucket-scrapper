@@ -1,8 +1,0 @@
-{
-  "timestamp": "2023-12-25T14:00:00Z",
-  "level": "info",
-  "message": "Integration test started",
-  "service": "app",
-  "env": "int",
-  "test_suite": "api_tests"
-}

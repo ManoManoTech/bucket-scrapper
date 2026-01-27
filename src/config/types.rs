@@ -1,5 +1,4 @@
 // src/config/types.rs
-// Location: src/config/types.rs
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,6 +10,7 @@ pub enum PathSchema {
     DateFormat { datefmt: String },
 }
 
+/// Bucket configuration with path components and patterns
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BucketConfig {
     pub bucket: String,
@@ -23,37 +23,38 @@ pub struct BucketConfig {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-/// Configuration for continuous consolidation mode.
-/// Allows the checker to automatically select a target hour to check.
+/// Simplified config schema for bucket scrapper
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ContinuousConsolidationConfig {
-    /// Minimum age before checking (e.g., "70m" for 70 minutes).
-    /// Hours newer than (now - min_age) are not eligible.
-    pub min_age: String,
-
-    /// Maximum age to consider (e.g., "528h" for 22 days).
-    /// Hours older than (now - max_age) are not considered.
-    pub max_age: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[allow(non_snake_case)]
 pub struct ConfigSchema {
-    pub bucketsToConsolidate: Vec<BucketConfig>,
-    pub bucketsConsolidated: Vec<BucketConfig>,
-    pub bucketsCheckerResults: Vec<BucketConfig>,
-    /// Optional continuous consolidation config for auto-selecting target hours
+    /// List of buckets to search
     #[serde(default)]
-    pub continuousConsolidation: Option<ContinuousConsolidationConfig>,
+    pub buckets: Vec<BucketConfig>,
+
+    /// Default AWS region (optional)
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Output directory for search results
+    #[serde(default)]
+    pub output_dir: Option<String>,
+
     #[allow(dead_code)]
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-pub type DateString = String; // YYYYMMDD format
-pub type HourString = String; // HH format 00-23
+impl Default for ConfigSchema {
+    fn default() -> Self {
+        Self {
+            buckets: Vec::new(),
+            region: None,
+            output_dir: None,
+            extra: HashMap::new(),
+        }
+    }
+}
 
+/// Information about an S3 object
 #[derive(Debug, Clone, Serialize)]
 pub struct S3ObjectInfo {
     pub bucket: String,
@@ -62,6 +63,11 @@ pub struct S3ObjectInfo {
     pub last_modified: DateTime<Utc>,
 }
 
+// Type aliases for date/hour strings
+pub type DateString = String; // YYYYMMDD format
+pub type HourString = String; // HH format 00-23
+
+/// Collection of S3 files with metadata
 #[derive(Debug, Clone)]
 pub struct S3FileList {
     pub bucket: String,

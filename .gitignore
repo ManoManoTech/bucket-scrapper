@@ -1,4 +1,4 @@
-/target
+target
 generated
 tests/minio_data/
 log-consolidator-checker-rust
@@ -6,3 +6,4 @@ infra/k8s/jobs/
 .claude/
 report.html
 
+scrapper-output/

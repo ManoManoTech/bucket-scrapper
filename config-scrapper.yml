@@ -1,0 +1,40 @@
+# Bucket Scrapper Configuration
+# Targets the consolidated log archives bucket for searching
+
+buckets:
+  # The consolidated log archives bucket
+  - bucket: support-infra-log-consolidator-archives
+    path:
+      - static_path: "log-archives"
+      - datefmt: "dt=20240115/hour=10"
+    # Optional: Filter patterns for specific file types
+    # only_prefix_patterns:
+    #   - ".*\\.json\\.zst$"
+
+# AWS region
+region: eu-west-3
+
+# Output configuration
+output_dir: ./scrapper-output
+
+# Note: AWS credentials should be configured via:
+# - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+# - AWS CLI profile (~/.aws/credentials)
+# - IAM role (when running on EC2/ECS/Lambda)
+# - AWS SSO (aws sso login)
+
+# Example usage:
+# Search for errors in today's logs:
+# bucket-scrapper search -p "ERROR.*timeout" 
+#
+# Search specific date range:
+# bucket-scrapper search -p "exception" --start 2024-01-01T00:00:00Z --end 2024-01-02T00:00:00Z
+#
+# List files for a specific date/hour:
+# bucket-scrapper list --start 2024-01-15T10:00:00Z --end 2024-01-15T11:00:00Z
+#
+# Search with case-insensitive and context:
+# bucket-scrapper search -p "failed.*auth" -i -C 3
+#
+# Count matches per file:
+# bucket-scrapper search -p "WARNING" --count
