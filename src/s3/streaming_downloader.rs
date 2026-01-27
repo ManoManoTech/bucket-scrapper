@@ -350,7 +350,7 @@ impl StreamingDownloader {
         }
 
         debug!("Completed search in {}/{}", obj.bucket, obj.key);
-        Ok((buffer_size, matches_found))
+        Ok((bytes_processed, matches_found))
     }
 }
 
