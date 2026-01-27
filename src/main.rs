@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use s3::{StreamingDownloader, StreamingDownloaderConfig};
-use search::{SearchConfig, SearchResultCollector, StreamSearcher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +18,10 @@ use crate::config::loader::load_config;
 use crate::config::types::BucketConfig;
 use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
+use crate::s3::{StreamingSearchConfig, StreamingSearchExecutor};
+use crate::search::{
+    SearchConfig, SearchResultCollector, StreamSearcher, StreamingSearchCollector,
+};
 use crate::utils::date::{date_range_to_date_hour_list, DateHour};
 
 /// High-performance S3 bucket content searcher using ripgrep
@@ -117,6 +120,10 @@ enum Commands {
         /// Output format (json, text, or quiet)
         #[arg(long, default_value = "text")]
         output: OutputFormat,
+
+        /// Use streaming output (reduces memory usage)
+        #[arg(long, default_value = "true")]
+        streaming: bool,
     },
 
     /// List objects in buckets matching the filter
@@ -213,6 +220,7 @@ async fn main() -> Result<()> {
             retry_delay,
             client_max_age,
             output,
+            streaming,
         } => {
             let end_date = if let Some(end) = end {
                 end.parse::<DateTime<Utc>>()
@@ -238,9 +246,7 @@ async fn main() -> Result<()> {
             let search_config = SearchConfig {
                 pattern: pattern.clone(),
                 ignore_case,
-                context_lines: context,
                 count_only: count,
-                max_matches_per_file,
             };
 
             // Get buckets from command line or config
@@ -261,7 +267,15 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let searcher = Arc::new(StreamSearcher::new(search_config));
+            let searcher = Arc::new(StreamSearcher::new(search_config)?);
+
+            // Determine output directory
+            let output_dir = config
+                .as_ref()
+                .and_then(|c| c.output_dir.clone())
+                .unwrap_or_else(|| "./scrapper-output".to_string());
+
+            // Create collector based on mode
             let collector = Arc::new(tokio::sync::Mutex::new(SearchResultCollector::new()));
 
             // Configure downloader

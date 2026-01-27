@@ -273,7 +273,7 @@ impl StreamingDownloader {
     async fn download_and_search_inner(
         client: &Client,
         obj: &S3ObjectInfo,
-        searcher: &StreamSearcher,
+        searcher: &Arc<StreamSearcher>,
         collector: &Arc<tokio::sync::Mutex<SearchResultCollector>>,
         buffer_size: usize,
     ) -> Result<(usize, usize)> {

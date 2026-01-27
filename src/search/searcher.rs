@@ -1,6 +1,6 @@
 // src/search/searcher.rs
 use anyhow::Result;
-use grep_regex::RegexMatcherBuilder;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
 use std::io::Read;
 use tracing::debug;
@@ -12,9 +12,7 @@ use super::result_collector::SearchResultCollector;
 pub struct SearchConfig {
     pub pattern: String,
     pub ignore_case: bool,
-    pub context_lines: usize,
     pub count_only: bool,
-    pub max_matches_per_file: Option<usize>,
 }
 
 impl Default for SearchConfig {
@@ -22,22 +20,31 @@ impl Default for SearchConfig {
         Self {
             pattern: String::new(),
             ignore_case: false,
-            context_lines: 0,
             count_only: false,
-            max_matches_per_file: None,
         }
     }
 }
 
 /// A searcher that can process streams of data using ripgrep's engine
-#[derive(Clone)]
 pub struct StreamSearcher {
     config: SearchConfig,
+    matcher: RegexMatcher,
 }
 
+// We can't derive Clone because RegexMatcher doesn't implement it
+// But we can work with Arc<StreamSearcher> instead
+
 impl StreamSearcher {
-    pub fn new(config: SearchConfig) -> Self {
-        Self { config }
+    pub fn new(config: SearchConfig) -> Result<Self> {
+        // Build the regex matcher once at initialization
+        let mut matcher_builder = RegexMatcherBuilder::new();
+        matcher_builder.case_insensitive(config.ignore_case);
+
+        let matcher = matcher_builder
+            .build(&config.pattern)
+            .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?;
+
+        Ok(Self { config, matcher })
     }
 
     /// Search through a readable stream and collect results
@@ -50,21 +57,11 @@ impl StreamSearcher {
     ) -> Result<()> {
         debug!("Starting search in {}/{}", bucket, key);
 
-        // Build the regex matcher
-        let mut matcher_builder = RegexMatcherBuilder::new();
-        matcher_builder.case_insensitive(self.config.ignore_case);
-
-        let matcher = matcher_builder
-            .build(&self.config.pattern)
-            .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?;
-
-        // Configure the searcher
+        // Configure the searcher (no context lines needed, but keep line numbers for the sink API)
         let mut searcher_builder = SearcherBuilder::new();
         searcher_builder
             .binary_detection(BinaryDetection::quit(b'\x00'))
-            .line_number(true)
-            .before_context(self.config.context_lines)
-            .after_context(self.config.context_lines)
+            .line_number(true) // Keep enabled for the sink API (we'll ignore the values)
             .memory_map(MmapChoice::never()); // Never mmap since we're streaming
 
         let mut searcher = searcher_builder.build();
@@ -74,7 +71,7 @@ impl StreamSearcher {
             // Just count matches without storing them
             let mut count = 0u64;
             searcher.search_reader(
-                &matcher,
+                &self.matcher,
                 &mut reader,
                 grep_searcher::sinks::UTF8(|_line_num, _line| {
                     count += 1;
@@ -87,19 +84,15 @@ impl StreamSearcher {
                 debug!("Found {} matches in {}/{}", count, bucket, key);
             }
         } else {
-            // Collect full match information
+            // Collect full match information (no line numbers)
             let mut match_count = 0u64;
-            let max_matches = self.config.max_matches_per_file.unwrap_or(usize::MAX);
 
             searcher.search_reader(
-                &matcher,
+                &self.matcher,
                 &mut reader,
-                grep_searcher::sinks::UTF8(|line_num, line| {
-                    if match_count >= max_matches as u64 {
-                        return Ok(false); // Stop searching
-                    }
-
-                    collector.add_match(bucket, key, line_num, line);
+                grep_searcher::sinks::UTF8(|_line_num, line| {
+                    // Line number is always 0 since we disabled line tracking
+                    collector.add_match(bucket, key, 0, line);
                     match_count += 1;
                     Ok(true)
                 }),
