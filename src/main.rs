@@ -18,7 +18,7 @@ use crate::config::loader::load_config;
 use crate::config::types::BucketConfig;
 use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
-use crate::s3::{StreamingSearchConfig, StreamingSearchExecutor};
+use crate::s3::{ParallelLister, StreamingSearchConfig, StreamingSearchExecutor};
 use crate::search::{
     SearchConfig, SearchResultCollector, StreamSearcher, StreamingSearchCollector,
 };
@@ -290,6 +290,9 @@ async fn main() -> Result<()> {
             let downloader =
                 StreamingDownloader::new(s3_client.get_client().await?, download_config);
 
+            // Create parallel lister for efficient prefix listing
+            let parallel_lister = ParallelLister::new(max_parallel);
+
             // Process simple buckets (from command line)
             for bucket in &simple_buckets {
                 info!("Searching bucket: {}", bucket);
@@ -298,19 +301,15 @@ async fn main() -> Result<()> {
                 let mut all_objects = if let Some(start) = start_date {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
 
-                    let mut objects = Vec::new();
-                    for dh in date_hours {
-                        let prefix = format!("{}/{}", dh.date, dh.hour);
-                        let objs = s3_client
-                            .get_matching_filenames_from_s3(bucket, &prefix, filter.as_deref())
-                            .await?;
+                    // Use parallel listing for date-based prefixes
+                    let prefixes: Vec<String> = date_hours
+                        .iter()
+                        .map(|dh| format!("{}/{}", dh.date, dh.hour))
+                        .collect();
 
-                        if !objs.is_empty() {
-                            info!("Found {} objects in prefix {}", objs.len(), prefix);
-                            objects.extend(objs);
-                        }
-                    }
-                    objects
+                    parallel_lister
+                        .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
+                        .await?
                 } else {
                     s3_client
                         .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
@@ -357,36 +356,21 @@ async fn main() -> Result<()> {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
                     let formatter = generate_path_formatter(bucket_cfg);
 
-                    // Collect all objects across all prefixes first
-                    let mut all_objects = Vec::new();
-                    let mut total_size = 0usize;
-
-                    for dh in date_hours {
-                        let prefix = formatter(&dh.date, &dh.hour)?;
-                        let objs = s3_client
-                            .get_matching_filenames_from_s3(
-                                &bucket_cfg.bucket,
-                                &prefix,
-                                filter.as_deref(),
-                            )
-                            .await?;
-
-                        if objs.is_empty() {
-                            debug!("No objects found for prefix: {}", prefix);
-                            continue;
-                        }
-
-                        let prefix_size: usize = objs.iter().map(|o| o.size).sum();
-                        info!(
-                            "Found {} objects in prefix {}: {} MB",
-                            objs.len(),
-                            prefix,
-                            prefix_size / 1_000_000
-                        );
-
-                        total_size += prefix_size;
-                        all_objects.extend(objs);
+                    // Build all prefixes for parallel listing
+                    let mut prefixes = Vec::new();
+                    for dh in &date_hours {
+                        prefixes.push(formatter(&dh.date, &dh.hour)?);
                     }
+
+                    // Use parallel listing
+                    let all_objects = parallel_lister
+                        .list_prefixes_parallel(
+                            &s3_client,
+                            &bucket_cfg.bucket,
+                            prefixes,
+                            filter.as_deref(),
+                        )
+                        .await?;
 
                     if all_objects.is_empty() {
                         info!("No objects found across all prefixes");
@@ -394,8 +378,10 @@ async fn main() -> Result<()> {
                     }
 
                     // Sort by size for better load balancing (small files first)
+                    let mut all_objects = all_objects;
                     all_objects.sort_by_key(|o| o.size);
 
+                    let total_size: usize = all_objects.iter().map(|o| o.size).sum();
                     info!(
                         "Processing {} total objects ({} MB) across all prefixes",
                         all_objects.len(),
@@ -579,6 +565,9 @@ async fn main() -> Result<()> {
             // Create S3 client
             let mut s3_client = WrappedS3Client::new(&cli.region, 60, None).await?;
 
+            // Create parallel lister for efficient prefix listing (use default max_parallel of 32)
+            let parallel_lister = ParallelLister::new(32);
+
             // List objects in simple buckets
             for bucket in &simple_buckets {
                 println!("\nBucket: {}", bucket);
@@ -586,15 +575,15 @@ async fn main() -> Result<()> {
                 let objects = if let Some(start) = start_date {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
 
-                    let mut all_objects = Vec::new();
-                    for dh in date_hours {
-                        let prefix = format!("{}/{}", dh.date, dh.hour);
-                        let objs = s3_client
-                            .get_matching_filenames_from_s3(bucket, &prefix, filter.as_deref())
-                            .await?;
-                        all_objects.extend(objs);
-                    }
-                    all_objects
+                    // Use parallel listing for date-based prefixes
+                    let prefixes: Vec<String> = date_hours
+                        .iter()
+                        .map(|dh| format!("{}/{}", dh.date, dh.hour))
+                        .collect();
+
+                    parallel_lister
+                        .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
+                        .await?
                 } else {
                     s3_client
                         .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
@@ -624,18 +613,21 @@ async fn main() -> Result<()> {
                     let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
                     let formatter = generate_path_formatter(bucket_cfg);
 
-                    let mut all_objects = Vec::new();
-                    for dh in date_hours {
-                        let prefix = formatter(&dh.date, &dh.hour)?;
-                        let objs = s3_client
-                            .get_matching_filenames_from_s3(
-                                &bucket_cfg.bucket,
-                                &prefix,
-                                filter.as_deref(),
-                            )
-                            .await?;
-                        all_objects.extend(objs);
+                    // Build all prefixes for parallel listing
+                    let mut prefixes = Vec::new();
+                    for dh in &date_hours {
+                        prefixes.push(formatter(&dh.date, &dh.hour)?);
                     }
+
+                    // Use parallel listing
+                    let all_objects = parallel_lister
+                        .list_prefixes_parallel(
+                            &s3_client,
+                            &bucket_cfg.bucket,
+                            prefixes,
+                            filter.as_deref(),
+                        )
+                        .await?;
 
                     if all_objects.is_empty() {
                         println!("  No matching objects found");

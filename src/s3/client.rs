@@ -314,7 +314,7 @@ impl WrappedS3Client {
 
     /// Get matching files from S3 with simple parameters
     pub async fn get_matching_filenames_from_s3(
-        &mut self,
+        &self,
         bucket: &str,
         prefix: &str,
         filter_pattern: Option<&str>,

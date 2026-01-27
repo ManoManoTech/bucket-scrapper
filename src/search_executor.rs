@@ -2,7 +2,8 @@
 use crate::config::types::{BucketConfig, S3ObjectInfo};
 use crate::s3::client::WrappedS3Client;
 use crate::s3::{
-    StreamingDownloader, StreamingDownloaderConfig, StreamingSearchConfig, StreamingSearchExecutor,
+    ParallelLister, StreamingDownloader, StreamingDownloaderConfig, StreamingSearchConfig,
+    StreamingSearchExecutor,
 };
 use crate::search::{SearchResultCollector, StreamSearcher, StreamingSearchCollector};
 use crate::utils::date::date_range_to_date_hour_list;
@@ -11,7 +12,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::info;
 
 pub struct SearchExecutor {
     s3_client: WrappedS3Client,
@@ -21,6 +22,7 @@ pub struct SearchExecutor {
     channel_buffer: usize,
     max_retries: u32,
     retry_delay: u64,
+    parallel_lister: ParallelLister,
 }
 
 impl SearchExecutor {
@@ -33,6 +35,7 @@ impl SearchExecutor {
         max_retries: u32,
         retry_delay: u64,
     ) -> Self {
+        let parallel_lister = ParallelLister::new(max_parallel);
         Self {
             s3_client,
             searcher,
@@ -41,6 +44,7 @@ impl SearchExecutor {
             channel_buffer,
             max_retries,
             retry_delay,
+            parallel_lister,
         }
     }
 
@@ -176,25 +180,21 @@ impl SearchExecutor {
         let mut all_objects = if let Some(start) = start_date {
             let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
 
-            let mut objects = Vec::new();
-            for dh in date_hours {
-                let prefix = if prefix.is_empty() {
-                    format!("{}/{}", dh.date, dh.hour)
-                } else {
-                    format!("{}/{}/{}", prefix, dh.date, dh.hour)
-                };
+            // Use parallel listing for date-based prefixes
+            let prefixes: Vec<String> = date_hours
+                .iter()
+                .map(|dh| {
+                    if prefix.is_empty() {
+                        format!("{}/{}", dh.date, dh.hour)
+                    } else {
+                        format!("{}/{}/{}", prefix, dh.date, dh.hour)
+                    }
+                })
+                .collect();
 
-                let objs: Vec<S3ObjectInfo> = self
-                    .s3_client
-                    .get_matching_filenames_from_s3(bucket, &prefix, filter)
-                    .await?;
-
-                if !objs.is_empty() {
-                    info!("Found {} objects in prefix {}", objs.len(), prefix);
-                    objects.extend(objs);
-                }
-            }
-            objects
+            self.parallel_lister
+                .list_prefixes_parallel(&self.s3_client, bucket, prefixes, filter)
+                .await?
         } else {
             self.s3_client
                 .get_matching_filenames_from_s3(bucket, prefix, filter)
@@ -231,19 +231,17 @@ impl SearchExecutor {
             let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
             let formatter = generate_path_formatter(bucket_cfg);
 
-            let mut all_objects = Vec::new();
-            for dh in date_hours {
-                let prefix = formatter(&dh.date, &dh.hour)?;
-                let objs: Vec<S3ObjectInfo> = self
-                    .s3_client
-                    .get_matching_filenames_from_s3(&bucket_cfg.bucket, &prefix, filter)
-                    .await?;
-
-                if !objs.is_empty() {
-                    debug!("Found {} objects in prefix {}", objs.len(), prefix);
-                    all_objects.extend(objs);
-                }
+            // Build all prefixes for parallel listing
+            let mut prefixes = Vec::new();
+            for dh in &date_hours {
+                prefixes.push(formatter(&dh.date, &dh.hour)?);
             }
+
+            // Use parallel listing
+            let mut all_objects = self
+                .parallel_lister
+                .list_prefixes_parallel(&self.s3_client, &bucket_cfg.bucket, prefixes, filter)
+                .await?;
 
             // Sort by size for better load balancing
             all_objects.sort_by_key(|o| o.size);
