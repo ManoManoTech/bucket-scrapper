@@ -1,6 +1,6 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::search::{SearchResultCollector, StreamSearcher};
+use crate::search::{HttpMatchToSend, HttpStreamingCollector, SearchCollector, SearchResultCollector, StreamSearcher};
 use anyhow::Result;
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use aws_sdk_s3::Client;
@@ -350,6 +350,226 @@ impl StreamingDownloader {
         }
 
         debug!("Completed search in {}/{}", obj.bucket, obj.key);
+        Ok((bytes_processed, matches_found))
+    }
+
+    /// Process a batch of S3 objects, streaming results directly to HTTP API
+    /// Returns (files_searched, total_matches)
+    pub async fn search_objects_to_http(
+        &self,
+        objects: &[S3ObjectInfo],
+        searcher: Arc<StreamSearcher>,
+        http_sender: mpsc::Sender<HttpMatchToSend>,
+    ) -> Result<(usize, usize)> {
+        if objects.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // Calculate total size for progress tracking
+        let total_bytes: usize = objects.iter().map(|o| o.size).sum();
+        let progress = Arc::new(Mutex::new(SearchProgress::new(objects.len(), total_bytes)));
+
+        let (tx, mut rx) =
+            mpsc::channel::<(Result<()>, usize, usize)>(self.config.channel_buffer_size);
+
+        // Spawn tasks for each object
+        let mut handles = Vec::new();
+        for obj in objects {
+            let obj_clone = obj.clone();
+            let obj_size = obj.size;
+            let client = self.client.clone();
+            let searcher = searcher.clone();
+            let http_sender = http_sender.clone();
+            let tx = tx.clone();
+            let semaphore = self.download_semaphore.clone();
+            let config = self.config.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await?;
+
+                let result = Self::download_and_search_to_http(
+                    client,
+                    obj_clone,
+                    searcher,
+                    http_sender,
+                    config,
+                )
+                .await;
+
+                // Send result with size info for progress tracking
+                match result {
+                    Ok((bytes, matches)) => tx.send((Ok(()), bytes, matches)).await.ok(),
+                    Err(e) => tx.send((Err(e), obj_size, 0)).await.ok(),
+                };
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            handles.push(handle);
+        }
+
+        // Drop original sender to allow channel to close when done
+        drop(tx);
+
+        // Collect results and update progress
+        let mut errors = Vec::new();
+        let mut total_matches = 0usize;
+        let mut files_searched = 0usize;
+        while let Some((result, bytes, matches)) = rx.recv().await {
+            files_searched += 1;
+            total_matches += matches;
+
+            // Update progress
+            {
+                let mut prog = progress.lock().await;
+                prog.update(bytes, matches);
+                if prog.should_report() {
+                    prog.report();
+                }
+            }
+
+            if let Err(e) = result {
+                errors.push(e.to_string());
+            }
+        }
+
+        // Wait for all tasks
+        for handle in handles {
+            if let Err(e) = handle.await {
+                errors.push(format!("Task panic: {}", e));
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} downloads failed: {}",
+                errors.len(),
+                errors.first().unwrap_or(&"unknown".to_string())
+            ));
+        }
+
+        Ok((files_searched, total_matches))
+    }
+
+    /// Download a single object and stream results to HTTP with retries
+    /// Returns (bytes_processed, matches_found)
+    async fn download_and_search_to_http(
+        client: Client,
+        obj: S3ObjectInfo,
+        searcher: Arc<StreamSearcher>,
+        http_sender: mpsc::Sender<HttpMatchToSend>,
+        config: StreamingDownloaderConfig,
+    ) -> Result<(usize, usize)> {
+        let bucket = obj.bucket.clone();
+        let key = obj.key.clone();
+
+        let inner = || async {
+            Self::download_and_search_to_http_inner(
+                &client,
+                &obj,
+                &searcher,
+                http_sender.clone(),
+                config.buffer_size_bytes,
+            )
+            .await
+        };
+
+        let retry_params = ExponentialBuilder::default()
+            .with_min_delay(config.initial_retry_delay)
+            .with_max_delay(Duration::from_secs(60))
+            .with_factor(2.0)
+            .with_jitter()
+            .with_max_times(config.max_retries as usize);
+
+        inner
+            .retry(retry_params)
+            .sleep(tokio::time::sleep)
+            .notify(move |err: &anyhow::Error, dur: Duration| {
+                warn!(
+                    "Retry scheduled for {}/{} in {:.1}s: {}",
+                    bucket,
+                    key,
+                    dur.as_secs_f64(),
+                    err
+                );
+            })
+            .await
+    }
+
+    /// Inner download and search to HTTP function (without retries)
+    /// Returns (bytes_processed, matches_found)
+    async fn download_and_search_to_http_inner(
+        client: &Client,
+        obj: &S3ObjectInfo,
+        searcher: &Arc<StreamSearcher>,
+        http_sender: mpsc::Sender<HttpMatchToSend>,
+        buffer_size: usize,
+    ) -> Result<(usize, usize)> {
+        debug!(
+            "Starting streaming download and HTTP search for {}/{}",
+            obj.bucket, obj.key
+        );
+
+        // Get object from S3
+        let resp = client
+            .get_object()
+            .bucket(&obj.bucket)
+            .key(&obj.key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {}", e))?;
+
+        // Get content length if available
+        let content_length = resp.content_length.unwrap_or(0) as usize;
+        debug!(
+            "Content length for {}/{}: {} bytes",
+            obj.bucket, obj.key, content_length
+        );
+
+        // Convert to async reader
+        let stream = resp.body.into_async_read();
+        let buffered = BufReader::with_capacity(buffer_size, stream);
+
+        // Apply decompression based on file extension
+        let decompressed: Pin<Box<dyn AsyncRead + Send>> = if obj.key.ends_with(".gz") {
+            Box::pin(GzipDecoder::new(buffered))
+        } else if obj.key.ends_with(".zst") || obj.key.ends_with(".zstd") {
+            Box::pin(ZstdDecoder::new(buffered))
+        } else {
+            Box::pin(buffered)
+        };
+
+        // Clone necessary data for the blocking task
+        let bucket = obj.bucket.clone();
+        let key = obj.key.clone();
+        let searcher_clone = searcher.clone();
+
+        // Create a streaming collector that sends to HTTP
+        let mut http_collector = HttpStreamingCollector::new(http_sender);
+        http_collector.mark_file_searched();
+
+        // Use spawn_blocking with SyncIoBridge for true streaming
+        let (bytes_processed, matches_found) = tokio::task::spawn_blocking(move || {
+            // Create a sync bridge from the async reader
+            let sync_reader = SyncIoBridge::new(decompressed);
+
+            // Use a buffered reader for better performance
+            let buffered_sync = std::io::BufReader::with_capacity(buffer_size, sync_reader);
+
+            // Count bytes as we read
+            let (counting_reader, bytes_counter) = CountingReader::new(buffered_sync);
+
+            // Search the stream directly, streaming results to HTTP
+            searcher_clone.search_stream(&bucket, &key, counting_reader, &mut http_collector)?;
+
+            let bytes_processed = bytes_counter.load(Ordering::Relaxed);
+            let matches_found = http_collector.match_count();
+
+            Ok::<(usize, usize), anyhow::Error>((bytes_processed, matches_found))
+        })
+        .await??;
+
+        debug!("Completed HTTP streaming search in {}/{}", obj.bucket, obj.key);
         Ok((bytes_processed, matches_found))
     }
 }

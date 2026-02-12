@@ -5,7 +5,7 @@ use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
 use std::io::Read;
 use tracing::debug;
 
-use super::result_collector::SearchResultCollector;
+use super::result_collector::{SearchCollector, SearchResultCollector};
 
 /// Configuration for the stream searcher
 #[derive(Clone)]
@@ -47,13 +47,13 @@ impl StreamSearcher {
         Ok(Self { config, matcher })
     }
 
-    /// Search through a readable stream and collect results
-    pub fn search_stream<R: Read>(
+    /// Search through a readable stream and collect results using any SearchCollector
+    pub fn search_stream<R: Read, C: SearchCollector>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
-        collector: &mut SearchResultCollector,
+        collector: &mut C,
     ) -> Result<()> {
         debug!("Starting search in {}/{}", bucket, key);
 

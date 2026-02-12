@@ -3,6 +3,15 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Trait for collecting search results
+/// Implemented by both SearchResultCollector (file output) and HttpStreamingCollector (HTTP output)
+pub trait SearchCollector {
+    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str);
+    fn add_count(&mut self, bucket: &str, key: &str, count: u64);
+    fn mark_file_searched(&mut self);
+    fn match_count(&self) -> usize;
+}
+
 /// A single search match
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
@@ -111,6 +120,36 @@ impl SearchResultCollector {
             *self.file_counts.entry(k).or_insert(0) += v;
         }
         self.files_searched += other.files_searched;
+    }
+}
+
+impl SearchCollector for SearchResultCollector {
+    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) {
+        let file_key = format!("{}/{}", bucket, key);
+
+        self.matches.push(SearchMatch {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            line_number,
+            line_content: line.to_string(),
+        });
+
+        *self.file_counts.entry(file_key).or_insert(0) += 1;
+    }
+
+    fn add_count(&mut self, bucket: &str, key: &str, count: u64) {
+        if count > 0 {
+            let file_key = format!("{}/{}", bucket, key);
+            self.file_counts.insert(file_key, count);
+        }
+    }
+
+    fn mark_file_searched(&mut self) {
+        self.files_searched += 1;
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
     }
 }
 

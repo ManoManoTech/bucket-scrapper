@@ -20,7 +20,8 @@ use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
 use crate::s3::{ParallelLister, StreamingSearchConfig, StreamingSearchExecutor};
 use crate::search::{
-    SearchConfig, SearchResultCollector, StreamSearcher, StreamingSearchCollector,
+    HttpMatchToSend, HttpResultWriter, HttpWriterConfig, SearchConfig, SearchResultCollector,
+    StreamSearcher, StreamingSearchCollector,
 };
 use crate::utils::date::{date_range_to_date_hour_list, DateHour};
 
@@ -124,6 +125,34 @@ enum Commands {
         /// Use streaming output (reduces memory usage)
         #[arg(long, default_value = "true")]
         streaming: bool,
+
+        /// Send results to HTTP API instead of writing to files
+        #[arg(long)]
+        http_output: bool,
+
+        /// HTTP API URL for log ingestion (e.g., https://intake.handy-mango.http.com/api/v1/logs)
+        #[arg(long, env = "HTTP_URL")]
+        http_url: Option<String>,
+
+        /// API key for HTTP authentication (can also use HTTP_BEARER_AUTH env var)
+        #[arg(long, env = "HTTP_BEARER_AUTH")]
+        http_api_key: Option<String>,
+
+        /// Maximum batch size in MB for HTTP requests.
+        #[arg(long, default_value = "2")]
+        http_batch_max_mb: usize,
+
+        /// Timeout for HTTP requests in seconds
+        #[arg(long, default_value = "30")]
+        http_timeout: u64,
+
+        /// Hostname to include in log entries (defaults to machine hostname)
+        #[arg(long, env = "HTTP_HOSTNAME")]
+        http_hostname: Option<String>,
+
+        /// Service name to include in log entries
+        #[arg(long, env = "HTTP_SERVICE", default_value = "bucket-scrapper")]
+        http_service: String,
     },
 
     /// List objects in buckets matching the filter
@@ -221,6 +250,13 @@ async fn main() -> Result<()> {
             client_max_age,
             output,
             streaming,
+            http_output,
+            http_url,
+            http_api_key,
+            http_batch_max_mb,
+            http_timeout,
+            http_hostname,
+            http_service,
         } => {
             let end_date = if let Some(end) = end {
                 end.parse::<DateTime<Utc>>()
@@ -269,15 +305,6 @@ async fn main() -> Result<()> {
 
             let searcher = Arc::new(StreamSearcher::new(search_config)?);
 
-            // Determine output directory
-            let output_dir = config
-                .as_ref()
-                .and_then(|c| c.output_dir.clone())
-                .unwrap_or_else(|| "./scrapper-output".to_string());
-
-            // Create collector based on mode
-            let collector = Arc::new(tokio::sync::Mutex::new(SearchResultCollector::new()));
-
             // Configure downloader
             let download_config = StreamingDownloaderConfig {
                 max_concurrent_downloads: max_parallel,
@@ -293,232 +320,246 @@ async fn main() -> Result<()> {
             // Create parallel lister for efficient prefix listing
             let parallel_lister = ParallelLister::new(max_parallel);
 
-            // Process simple buckets (from command line)
-            for bucket in &simple_buckets {
-                info!("Searching bucket: {}", bucket);
+            // Check if we're using HTTP streaming output
+            let http_streaming = if http_output {
+                // Validate HTTP config early
+                let api_url = http_url.clone()
+                    .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().map(|h| h.url.clone())))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "HTTP output enabled but no URL specified. Use --http-url or set HTTP_URL env var"
+                    ))?;
 
-                // Get objects from S3
-                let mut all_objects = if let Some(start) = start_date {
-                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+                let api_key = http_api_key.clone()
+                    .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().and_then(|h| h.api_key.clone())))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "HTTP output enabled but no API key specified. Use --http-api-key or set HTTP_BEARER_AUTH env var"
+                    ))?;
 
-                    // Use parallel listing for date-based prefixes
-                    let prefixes: Vec<String> = date_hours
-                        .iter()
-                        .map(|dh| format!("{}/{}", dh.date, dh.hour))
-                        .collect();
+                let timeout_secs = config.as_ref()
+                    .and_then(|c| c.http_output.as_ref().map(|h| h.timeout_secs))
+                    .unwrap_or(http_timeout);
 
-                    parallel_lister
-                        .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
-                        .await?
-                } else {
-                    s3_client
-                        .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
-                        .await?
+                let batch_max_bytes = http_batch_max_mb * 1024 * 1024;
+
+                info!("HTTP streaming mode enabled - results will be sent to: {} (max batch: {} MB)", api_url, http_batch_max_mb);
+
+                let hostname = http_hostname.clone().unwrap_or_else(|| {
+                    gethostname::gethostname().to_string_lossy().to_string()
+                });
+
+                let http_config = HttpWriterConfig {
+                    url: api_url,
+                    api_key,
+                    batch_max_bytes,
+                    timeout_secs,
+                    max_retries,
+                    hostname,
+                    service: http_service.clone(),
                 };
 
-                if all_objects.is_empty() {
-                    info!("No matching objects found in {}", bucket);
-                    continue;
+                Some(HttpResultWriter::new(http_config)?)
+            } else {
+                None
+            };
+
+            // Track stats for both modes
+            let mut total_files_searched = 0usize;
+            let mut total_matches = 0usize;
+
+            // Create collector for file output mode (or for stats tracking)
+            let collector = Arc::new(tokio::sync::Mutex::new(SearchResultCollector::new()));
+
+            use crate::utils::path_formatter::generate_path_formatter;
+
+            // Process all buckets
+            let all_bucket_objects = {
+                let mut all_objects = Vec::new();
+
+                // Collect objects from simple buckets
+                for bucket in &simple_buckets {
+                    info!("Listing bucket: {}", bucket);
+
+                    let objects = if let Some(start) = start_date {
+                        let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+                        let prefixes: Vec<String> = date_hours
+                            .iter()
+                            .map(|dh| format!("{}/{}", dh.date, dh.hour))
+                            .collect();
+                        parallel_lister
+                            .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
+                            .await?
+                    } else {
+                        s3_client
+                            .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
+                            .await?
+                    };
+
+                    all_objects.extend(objects);
                 }
 
-                // Sort by size for better load balancing (small files first)
-                all_objects.sort_by_key(|o| o.size);
+                // Collect objects from config buckets
+                for bucket_cfg in &config_buckets {
+                    info!("Listing bucket: {}", bucket_cfg.bucket);
 
-                let total_size: usize = all_objects.iter().map(|o| o.size).sum();
+                    let objects = if let Some(start) = start_date {
+                        let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
+                        let formatter = generate_path_formatter(bucket_cfg);
+                        let mut prefixes = Vec::new();
+                        for dh in &date_hours {
+                            prefixes.push(formatter(&dh.date, &dh.hour)?);
+                        }
+                        parallel_lister
+                            .list_prefixes_parallel(&s3_client, &bucket_cfg.bucket, prefixes, filter.as_deref())
+                            .await?
+                    } else {
+                        let prefix = if bucket_cfg.path.is_empty() {
+                            String::new()
+                        } else {
+                            let formatter = generate_path_formatter(bucket_cfg);
+                            formatter(&String::new(), &String::new())?
+                        };
+                        s3_client
+                            .get_matching_filenames_from_s3(&bucket_cfg.bucket, &prefix, filter.as_deref())
+                            .await?
+                    };
+
+                    all_objects.extend(objects);
+                }
+
+                // Sort by size for better load balancing
+                all_objects.sort_by_key(|o| o.size);
+                all_objects
+            };
+
+            if all_bucket_objects.is_empty() {
+                info!("No objects found to search");
+            } else {
+                let total_size: usize = all_bucket_objects.iter().map(|o| o.size).sum();
                 info!(
-                    "Processing {} objects ({} MB) in {}",
-                    all_objects.len(),
-                    total_size / 1_000_000,
-                    bucket
+                    "Processing {} total objects ({} MB)",
+                    all_bucket_objects.len(),
+                    total_size / 1_000_000
                 );
 
                 let batch_start = std::time::Instant::now();
 
-                // Search through objects
-                downloader
-                    .search_objects(&all_objects, searcher.clone(), collector.clone())
-                    .await?;
+                if let Some(ref http_writer) = http_streaming {
+                    // HTTP streaming mode - stream results directly to API
+                    let http_sender = http_writer.get_sender();
+                    let (files, matches) = downloader
+                        .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender)
+                        .await?;
+                    total_files_searched = files;
+                    total_matches = matches;
+                } else {
+                    // File output mode - collect results in memory
+                    downloader
+                        .search_objects(&all_bucket_objects, searcher.clone(), collector.clone())
+                        .await?;
+                }
 
                 info!(
-                    "Completed bucket {} in {:.1}s",
-                    bucket,
+                    "Search completed in {:.1}s",
                     batch_start.elapsed().as_secs_f32()
                 );
             }
 
-            // Process config buckets (with path formatting)
-            use crate::utils::path_formatter::generate_path_formatter;
-            for bucket_cfg in &config_buckets {
-                info!("Searching bucket: {}", bucket_cfg.bucket);
+            // Determine output mode and finalize
+            let (output_count, output_destination) = if let Some(http_writer) = http_streaming {
+                // Finish HTTP writer and get final count
+                let api_url = http_writer.url().to_string();
+                let lines_sent = http_writer.finish().await?;
+                info!("HTTP streaming complete: {} lines sent to {}", lines_sent, api_url);
 
-                if let Some(start) = start_date {
-                    // Use path formatter for date-based paths
-                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
-                    let formatter = generate_path_formatter(bucket_cfg);
+                (lines_sent, api_url)
+            } else {
+                // File output mode - get results from collector and write to compressed files
+                let final_collector = Arc::try_unwrap(collector)
+                    .map_err(|_| anyhow::anyhow!("Failed to get collector"))?
+                    .into_inner();
+                let results = final_collector.into_result();
 
-                    // Build all prefixes for parallel listing
-                    let mut prefixes = Vec::new();
-                    for dh in &date_hours {
-                        prefixes.push(formatter(&dh.date, &dh.hour)?);
-                    }
+                total_files_searched = results.files_searched;
+                total_matches = results.total_matches as usize;
 
-                    // Use parallel listing
-                    let all_objects = parallel_lister
-                        .list_prefixes_parallel(
-                            &s3_client,
-                            &bucket_cfg.bucket,
-                            prefixes,
-                            filter.as_deref(),
-                        )
-                        .await?;
+                let output_dir = config
+                    .as_ref()
+                    .and_then(|c| c.output_dir.clone())
+                    .unwrap_or_else(|| "./scrapper-output".to_string());
 
-                    if all_objects.is_empty() {
-                        info!("No objects found across all prefixes");
+                // Create output directory if it doesn't exist
+                std::fs::create_dir_all(&output_dir)?;
+
+                info!("Writing results to {}", output_dir);
+
+                // Write results grouped by date/hour
+                use flate2::write::GzEncoder;
+                use flate2::Compression;
+                use std::io::Write;
+
+                let mut files_written = 0;
+                for (prefix, matches) in &results.matches_by_prefix {
+                    if matches.is_empty() {
                         continue;
                     }
 
-                    // Sort by size for better load balancing (small files first)
-                    let mut all_objects = all_objects;
-                    all_objects.sort_by_key(|o| o.size);
+                    // Create output file like "20240115H10.gz"
+                    let output_file = format!("{}/{}.gz", output_dir, prefix);
+                    let file = std::fs::File::create(&output_file)?;
+                    let mut encoder = GzEncoder::new(file, Compression::default());
 
-                    let total_size: usize = all_objects.iter().map(|o| o.size).sum();
-                    info!(
-                        "Processing {} total objects ({} MB) across all prefixes",
-                        all_objects.len(),
-                        total_size / 1_000_000
-                    );
-
-                    let batch_start = std::time::Instant::now();
-                    let matches_before = collector.lock().await.match_count();
-
-                    // Process all objects in one batch for maximum parallelism
-                    downloader
-                        .search_objects(&all_objects, searcher.clone(), collector.clone())
-                        .await?;
-
-                    let matches_after = collector.lock().await.match_count();
-                    let matches_found = matches_after - matches_before;
-
-                    info!(
-                        "Completed all prefixes: {} objects, {} matches found in {:.1}s",
-                        all_objects.len(),
-                        matches_found,
-                        batch_start.elapsed().as_secs_f32()
-                    );
-                } else {
-                    // No date range, just use static prefix if any
-                    let prefix = if bucket_cfg.path.is_empty() {
-                        String::new()
-                    } else {
-                        // Generate prefix without date formatting
-                        let formatter = generate_path_formatter(bucket_cfg);
-                        let empty_date = String::new();
-                        let empty_hour = String::new();
-                        formatter(&empty_date, &empty_hour)?
-                    };
-
-                    let objects = s3_client
-                        .get_matching_filenames_from_s3(
-                            &bucket_cfg.bucket,
-                            &prefix,
-                            filter.as_deref(),
-                        )
-                        .await?;
-
-                    if objects.is_empty() {
-                        info!("No matching objects found in {}", bucket_cfg.bucket);
-                        continue;
+                    // Write matches as JSON lines (one per line for easy streaming)
+                    for match_item in matches {
+                        // Write just the line content with metadata as JSON
+                        let output_line = serde_json::json!({
+                            "file": format!("{}/{}", match_item.bucket, match_item.key),
+                            "line": match_item.line_number,
+                            "content": match_item.line_content.trim()
+                        });
+                        writeln!(encoder, "{}", output_line)?;
                     }
 
-                    info!("Found {} objects to search", objects.len());
-                    downloader
-                        .search_objects(&objects, searcher.clone(), collector.clone())
-                        .await?;
-                }
-            }
-
-            // Get and display results
-            let final_collector = Arc::try_unwrap(collector)
-                .map_err(|_| anyhow::anyhow!("Failed to get collector"))?
-                .into_inner();
-
-            let results = final_collector.into_result();
-
-            // Determine output directory
-            let output_dir = config
-                .as_ref()
-                .and_then(|c| c.output_dir.clone())
-                .unwrap_or_else(|| "./scrapper-output".to_string());
-
-            // Create output directory if it doesn't exist
-            std::fs::create_dir_all(&output_dir)?;
-
-            info!("Writing results to {}", output_dir);
-
-            // Write results grouped by date/hour
-            use flate2::write::GzEncoder;
-            use flate2::Compression;
-            use std::io::Write;
-
-            let mut files_written = 0;
-            for (prefix, matches) in &results.matches_by_prefix {
-                if matches.is_empty() {
-                    continue;
+                    encoder.finish()?;
+                    files_written += 1;
+                    info!("Wrote {} matches to {}", matches.len(), output_file);
                 }
 
-                // Create output file like "20240115H10.gz"
-                let output_file = format!("{}/{}.gz", output_dir, prefix);
-                let file = std::fs::File::create(&output_file)?;
-                let mut encoder = GzEncoder::new(file, Compression::default());
-
-                // Write matches as JSON lines (one per line for easy streaming)
-                for match_item in matches {
-                    // Write just the line content with metadata as JSON
-                    let output_line = serde_json::json!({
-                        "file": format!("{}/{}", match_item.bucket, match_item.key),
-                        "line": match_item.line_number,
-                        "content": match_item.line_content.trim()
-                    });
-                    writeln!(encoder, "{}", output_line)?;
-                }
-
-                encoder.finish()?;
-                files_written += 1;
-                info!("Wrote {} matches to {}", matches.len(), output_file);
-            }
+                (files_written, output_dir)
+            };
 
             // Print summary
             match output {
                 OutputFormat::Json => {
-                    let summary = serde_json::json!({
-                        "pattern": pattern,
-                        "files_searched": results.files_searched,
-                        "files_with_matches": results.files_with_matches,
-                        "total_matches": results.total_matches,
-                        "output_files_written": files_written,
-                        "output_directory": output_dir
-                    });
+                    let summary = if http_output {
+                        serde_json::json!({
+                            "pattern": pattern,
+                            "files_searched": total_files_searched,
+                            "total_matches": total_matches,
+                            "lines_sent": output_count,
+                            "http_url": output_destination
+                        })
+                    } else {
+                        serde_json::json!({
+                            "pattern": pattern,
+                            "files_searched": total_files_searched,
+                            "total_matches": total_matches,
+                            "output_files_written": output_count,
+                            "output_directory": output_destination
+                        })
+                    };
                     println!("{}", serde_json::to_string_pretty(&summary)?);
                 }
                 OutputFormat::Text | OutputFormat::Quiet => {
                     println!("\n=== Search Complete ===");
                     println!("Pattern: {}", pattern);
-                    println!("Files searched: {}", results.files_searched);
-                    println!("Files with matches: {}", results.files_with_matches);
-                    println!("Total matches: {}", results.total_matches);
-                    println!("Output files written: {}", files_written);
-                    println!("Output directory: {}", output_dir);
-
-                    if count && !results.file_counts.is_empty() {
-                        println!("\n--- Match Counts by File ---");
-                        let mut counts: Vec<_> = results.file_counts.iter().collect();
-                        counts.sort_by(|a, b| b.1.cmp(a.1));
-                        for (file, count) in counts.iter().take(10) {
-                            println!("  {}: {}", file, count);
-                        }
-                        if counts.len() > 10 {
-                            println!("  ... and {} more files", counts.len() - 10);
-                        }
+                    println!("Files searched: {}", total_files_searched);
+                    println!("Total matches: {}", total_matches);
+                    if http_output {
+                        println!("Lines sent: {}", output_count);
+                        println!("HTTP URL: {}", output_destination);
+                    } else {
+                        println!("Output files written: {}", output_count);
+                        println!("Output directory: {}", output_destination);
                     }
                 }
             }

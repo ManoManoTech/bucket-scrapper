@@ -33,11 +33,21 @@ buckets:
 
 region: eu-west-3
 output_dir: ./scrapper-output
+
+# Optional: HTTP output configuration for REST API
+http_output:
+  url: https://intake.handy-mango.http.com/api/v1/logs
+  api_key: your-api-key  # Can also use HTTP_BEARER_AUTH env var
+  timeout_secs: 30       # HTTP request timeout
 ```
 
 ## Usage
 
 ### Search for patterns in S3 objects
+
+Results can be saved to compressed files or sent to an HTTP API (like REST API).
+
+#### File Output (default)
 
 Results are automatically saved to compressed files in the output directory, organized by date/hour.
 
@@ -60,6 +70,29 @@ bucket-scrapper search -p "WARNING" --count
 
 # JSON summary output
 bucket-scrapper search -p "error" --output json
+```
+
+#### HTTP Output (HTTP/REST API)
+
+Send results directly to an HTTP API instead of writing to files. Results are sent as newline-delimited JSON (NDJSON) without compression.
+
+```bash
+# Send results to HTTP API
+bucket-scrapper search -p "ERROR" \
+  --http-output \
+  --http-url "https://intake.handy-mango.http.com/api/v1/logs" \
+  --http-api-key "your-api-key"
+
+# Using environment variables
+export HTTP_URL="https://intake.handy-mango.http.com/api/v1/logs"
+export HTTP_BEARER_AUTH="your-api-key"
+bucket-scrapper search -p "ERROR" --http-output
+
+# With custom batch size (in MB) and timeout
+bucket-scrapper search -p "ERROR" \
+  --http-output \
+  --http-batch-max-mb 5 \
+  --http-timeout 60
 ```
 
 ### Output Format
@@ -110,6 +143,15 @@ bucket-scrapper list -b my-archive \
 - `--channel-buffer` - Channel buffer size (default: 100)
 - `--max-retries` - Max retry attempts (default: 10)
 - `--retry-delay` - Initial retry delay in seconds (default: 2)
+
+### HTTP Output Options
+- `--http-output` - Enable HTTP output mode (send to REST API)
+- `--http-url` - HTTP API URL (or use `HTTP_URL` env var)
+- `--http-api-key` - API key for authentication (or use `HTTP_BEARER_AUTH` env var)
+- `--http-batch-max-mb` - Maximum batch size in MB (default: 2)
+- `--http-timeout` - HTTP request timeout in seconds (default: 30)
+- `--http-hostname` - Hostname in log entries (or use `HTTP_HOSTNAME` env var)
+- `--http-service` - Service name in log entries (default: bucket-scrapper, or use `HTTP_SERVICE` env var)
 
 ## AWS Authentication
 

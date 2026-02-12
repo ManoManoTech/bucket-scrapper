@@ -23,6 +23,23 @@ pub struct BucketConfig {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
+/// HTTP output configuration for sending logs to a REST API (e.g., HTTP)
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpOutputConfig {
+    /// The URL to send logs to (e.g., https://intake.handy-mango.http.com/api/v1/logs)
+    pub url: String,
+    /// API key for authentication (can also be set via HTTP_BEARER_AUTH env var)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Timeout for HTTP requests in seconds (default: 30)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
 /// Simplified config schema for bucket scrapper
 #[derive(Debug, Deserialize, Clone)]
 pub struct ConfigSchema {
@@ -34,9 +51,13 @@ pub struct ConfigSchema {
     #[serde(default)]
     pub region: Option<String>,
 
-    /// Output directory for search results
+    /// Output directory for search results (file mode)
     #[serde(default)]
     pub output_dir: Option<String>,
+
+    /// HTTP output configuration (for sending to REST API like REST API)
+    #[serde(default)]
+    pub http_output: Option<HttpOutputConfig>,
 
     #[allow(dead_code)]
     #[serde(flatten)]
@@ -49,6 +70,7 @@ impl Default for ConfigSchema {
             buckets: Vec::new(),
             region: None,
             output_dir: None,
+            http_output: None,
             extra: HashMap::new(),
         }
     }
