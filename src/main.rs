@@ -11,19 +11,18 @@ use s3::{StreamingDownloader, StreamingDownloaderConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::config::loader::load_config;
 use crate::config::types::BucketConfig;
 use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
-use crate::s3::{ParallelLister, StreamingSearchConfig, StreamingSearchExecutor};
+use crate::s3::ParallelLister;
 use crate::search::{
-    HttpMatchToSend, HttpResultWriter, HttpWriterConfig, SearchConfig, SearchResultCollector,
-    StreamSearcher, StreamingSearchCollector,
+    HttpMatchToSend, HttpResultWriter, HttpWriterConfig, SearchConfig, StreamSearcher,
 };
-use crate::utils::date::{date_range_to_date_hour_list, DateHour};
+use crate::utils::date::date_range_to_date_hour_list;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]
@@ -54,11 +53,7 @@ enum Commands {
         #[arg(short, long)]
         pattern: String,
 
-        /// S3 buckets to search (can specify multiple, uses config if not provided)
-        #[arg(short, long, value_delimiter = ',')]
-        buckets: Option<Vec<String>>,
-
-        /// Object key filter pattern (e.g., "*.log", "2024/*")
+        /// Regex filter pattern applied to S3 object keys (e.g., "\\.log$", "service-a")
         #[arg(short, long)]
         filter: Option<String>,
 
@@ -82,28 +77,16 @@ enum Commands {
         #[arg(short = 'c', long)]
         count: bool,
 
-        /// Maximum matches per file to return
-        #[arg(long)]
-        max_matches_per_file: Option<usize>,
-
         /// Maximum parallel downloads
         #[arg(long, default_value = "32")]
         max_parallel: usize,
-
-        /// Number of processing threads (defaults to CPU count)
-        #[arg(long)]
-        process_threads: Option<usize>,
-
-        /// Memory pool size in MB
-        #[arg(long, default_value = "2048")]
-        memory_pool_mb: usize,
 
         /// Stream buffer size in KB
         #[arg(long, default_value = "64")]
         buffer_size_kb: usize,
 
-        /// Channel buffer size for backpressure control
-        #[arg(long, default_value = "100")]
+        /// Channel buffer size for match backpressure (max matches buffered in memory)
+        #[arg(long, default_value = "1000")]
         channel_buffer: usize,
 
         /// Maximum retry attempts for failed downloads
@@ -121,10 +104,6 @@ enum Commands {
         /// Output format (json, text, or quiet)
         #[arg(long, default_value = "text")]
         output: OutputFormat,
-
-        /// Use streaming output (reduces memory usage)
-        #[arg(long, default_value = "true")]
-        streaming: bool,
 
         /// Send results to HTTP API instead of writing to files
         #[arg(long)]
@@ -157,11 +136,7 @@ enum Commands {
 
     /// List objects in buckets matching the filter
     List {
-        /// S3 buckets to list (can specify multiple, uses config if not provided)
-        #[arg(short, long, value_delimiter = ',')]
-        buckets: Option<Vec<String>>,
-
-        /// Object key filter pattern
+        /// Regex filter pattern applied to S3 object keys (e.g., "\\.log$", "service-a")
         #[arg(short, long)]
         filter: Option<String>,
 
@@ -232,24 +207,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Search {
             pattern,
-            buckets,
             filter,
             start,
             end,
-            context,
+            context: _,
             ignore_case,
             count,
-            max_matches_per_file,
             max_parallel,
-            process_threads,
-            memory_pool_mb: _,
             buffer_size_kb,
             channel_buffer,
             max_retries,
             retry_delay,
             client_max_age,
             output,
-            streaming,
             http_output,
             http_url,
             http_api_key,
@@ -285,21 +255,16 @@ async fn main() -> Result<()> {
                 count_only: count,
             };
 
-            // Get buckets from command line or config
-            let (simple_buckets, config_buckets): (Vec<String>, Vec<&BucketConfig>) =
-                if let Some(b) = buckets {
-                    // Command line buckets are simple strings
-                    (b, vec![])
-                } else if let Some(ref cfg) = config {
-                    // Config buckets have path formatting
-                    (vec![], cfg.buckets.iter().collect())
-                } else {
-                    eprintln!("Error: No buckets specified. Use -b flag or provide config file.");
-                    std::process::exit(1);
-                };
+            // Get buckets from config
+            let config_buckets: Vec<&BucketConfig> = if let Some(ref cfg) = config {
+                cfg.buckets.iter().collect()
+            } else {
+                eprintln!("Error: No buckets specified. Provide a config file with bucket definitions.");
+                std::process::exit(1);
+            };
 
-            if simple_buckets.is_empty() && config_buckets.is_empty() {
-                eprintln!("Error: No buckets to search.");
+            if config_buckets.is_empty() {
+                eprintln!("Error: No buckets to search. Add buckets to your config file.");
                 std::process::exit(1);
             }
 
@@ -355,6 +320,7 @@ async fn main() -> Result<()> {
                     max_retries,
                     hostname,
                     service: http_service.clone(),
+                    channel_buffer_size: channel_buffer,
                 };
 
                 Some(HttpResultWriter::new(http_config)?)
@@ -366,38 +332,12 @@ async fn main() -> Result<()> {
             let mut total_files_searched = 0usize;
             let mut total_matches = 0usize;
 
-            // Create collector for file output mode (or for stats tracking)
-            let collector = Arc::new(tokio::sync::Mutex::new(SearchResultCollector::new()));
-
             use crate::utils::path_formatter::generate_path_formatter;
 
             // Process all buckets
             let all_bucket_objects = {
                 let mut all_objects = Vec::new();
 
-                // Collect objects from simple buckets
-                for bucket in &simple_buckets {
-                    info!("Listing bucket: {}", bucket);
-
-                    let objects = if let Some(start) = start_date {
-                        let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
-                        let prefixes: Vec<String> = date_hours
-                            .iter()
-                            .map(|dh| format!("{}/{}", dh.date, dh.hour))
-                            .collect();
-                        parallel_lister
-                            .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
-                            .await?
-                    } else {
-                        s3_client
-                            .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
-                            .await?
-                    };
-
-                    all_objects.extend(objects);
-                }
-
-                // Collect objects from config buckets
                 for bucket_cfg in &config_buckets {
                     info!("Listing bucket: {}", bucket_cfg.bucket);
 
@@ -452,10 +392,34 @@ async fn main() -> Result<()> {
                     total_files_searched = files;
                     total_matches = matches;
                 } else {
-                    // File output mode - collect results in memory
-                    downloader
-                        .search_objects(&all_bucket_objects, searcher.clone(), collector.clone())
+                    // File output mode - stream results through bounded channel to file writer
+                    let output_dir = config
+                        .as_ref()
+                        .and_then(|c| c.output_dir.clone())
+                        .unwrap_or_else(|| "./scrapper-output".to_string());
+                    std::fs::create_dir_all(&output_dir)?;
+
+                    let (file_tx, file_rx) = tokio::sync::mpsc::channel::<HttpMatchToSend>(channel_buffer);
+
+                    let file_writer_handle =
+                        tokio::spawn(file_writer_task(file_rx, output_dir.clone()));
+
+                    let (files, matches) = downloader
+                        .search_objects_to_http(
+                            &all_bucket_objects,
+                            searcher.clone(),
+                            file_tx,
+                        )
                         .await?;
+                    total_files_searched = files;
+                    total_matches = matches;
+
+                    // Wait for file writer to finish flushing
+                    let files_written = file_writer_handle.await??;
+                    info!(
+                        "File output complete: {} files written to {}",
+                        files_written, output_dir
+                    );
                 }
 
                 info!(
@@ -473,58 +437,13 @@ async fn main() -> Result<()> {
 
                 (lines_sent, api_url)
             } else {
-                // File output mode - get results from collector and write to compressed files
-                let final_collector = Arc::try_unwrap(collector)
-                    .map_err(|_| anyhow::anyhow!("Failed to get collector"))?
-                    .into_inner();
-                let results = final_collector.into_result();
-
-                total_files_searched = results.files_searched;
-                total_matches = results.total_matches as usize;
-
+                // File output mode - results already written by file_writer_task
                 let output_dir = config
                     .as_ref()
                     .and_then(|c| c.output_dir.clone())
                     .unwrap_or_else(|| "./scrapper-output".to_string());
 
-                // Create output directory if it doesn't exist
-                std::fs::create_dir_all(&output_dir)?;
-
-                info!("Writing results to {}", output_dir);
-
-                // Write results grouped by date/hour
-                use flate2::write::GzEncoder;
-                use flate2::Compression;
-                use std::io::Write;
-
-                let mut files_written = 0;
-                for (prefix, matches) in &results.matches_by_prefix {
-                    if matches.is_empty() {
-                        continue;
-                    }
-
-                    // Create output file like "20240115H10.gz"
-                    let output_file = format!("{}/{}.gz", output_dir, prefix);
-                    let file = std::fs::File::create(&output_file)?;
-                    let mut encoder = GzEncoder::new(file, Compression::default());
-
-                    // Write matches as JSON lines (one per line for easy streaming)
-                    for match_item in matches {
-                        // Write just the line content with metadata as JSON
-                        let output_line = serde_json::json!({
-                            "file": format!("{}/{}", match_item.bucket, match_item.key),
-                            "line": match_item.line_number,
-                            "content": match_item.line_content.trim()
-                        });
-                        writeln!(encoder, "{}", output_line)?;
-                    }
-
-                    encoder.finish()?;
-                    files_written += 1;
-                    info!("Wrote {} matches to {}", matches.len(), output_file);
-                }
-
-                (files_written, output_dir)
+                (total_matches, output_dir)
             };
 
             // Print summary
@@ -565,7 +484,6 @@ async fn main() -> Result<()> {
             }
         }
         Commands::List {
-            buckets,
             filter,
             start,
             end,
@@ -587,19 +505,16 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // Get buckets from command line or config
-            let (simple_buckets, config_buckets): (Vec<String>, Vec<&BucketConfig>) =
-                if let Some(b) = buckets {
-                    (b, vec![])
-                } else if let Some(ref cfg) = config {
-                    (vec![], cfg.buckets.iter().collect())
-                } else {
-                    eprintln!("Error: No buckets specified. Use -b flag or provide config file.");
-                    std::process::exit(1);
-                };
+            // Get buckets from config
+            let config_buckets: Vec<&BucketConfig> = if let Some(ref cfg) = config {
+                cfg.buckets.iter().collect()
+            } else {
+                eprintln!("Error: No buckets specified. Provide a config file with bucket definitions.");
+                std::process::exit(1);
+            };
 
-            if simple_buckets.is_empty() && config_buckets.is_empty() {
-                eprintln!("Error: No buckets to list.");
+            if config_buckets.is_empty() {
+                eprintln!("Error: No buckets to list. Add buckets to your config file.");
                 std::process::exit(1);
             }
 
@@ -609,45 +524,9 @@ async fn main() -> Result<()> {
             // Create parallel lister for efficient prefix listing (use default max_parallel of 32)
             let parallel_lister = ParallelLister::new(32);
 
-            // List objects in simple buckets
-            for bucket in &simple_buckets {
-                println!("\nBucket: {}", bucket);
-
-                let objects = if let Some(start) = start_date {
-                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
-
-                    // Use parallel listing for date-based prefixes
-                    let prefixes: Vec<String> = date_hours
-                        .iter()
-                        .map(|dh| format!("{}/{}", dh.date, dh.hour))
-                        .collect();
-
-                    parallel_lister
-                        .list_prefixes_parallel(&s3_client, bucket, prefixes, filter.as_deref())
-                        .await?
-                } else {
-                    s3_client
-                        .get_matching_filenames_from_s3(bucket, "", filter.as_deref())
-                        .await?
-                };
-
-                if objects.is_empty() {
-                    println!("  No matching objects found");
-                } else {
-                    println!("  Found {} objects:", objects.len());
-                    for obj in objects.iter().take(100) {
-                        println!("    {} ({} bytes)", obj.key, obj.size);
-                    }
-                    if objects.len() > 100 {
-                        println!("    ... and {} more", objects.len() - 100);
-                    }
-                }
-            }
-
-            // List objects in config buckets (with path formatting)
             use crate::utils::path_formatter::generate_path_formatter;
             for bucket_cfg in &config_buckets {
-                println!("\nBucket: {} (configured)", bucket_cfg.bucket);
+                println!("\nBucket: {}", bucket_cfg.bucket);
 
                 if let Some(start) = start_date {
                     // Use path formatter for date-based paths
@@ -717,4 +596,52 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Background task that receives search matches from a bounded channel
+/// and writes them to gzip-compressed output files grouped by date/hour prefix.
+async fn file_writer_task(
+    mut rx: tokio::sync::mpsc::Receiver<HttpMatchToSend>,
+    output_dir: String,
+) -> anyhow::Result<usize> {
+    use crate::search::extract_prefix;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let mut encoders: HashMap<String, GzEncoder<std::fs::File>> = HashMap::new();
+    let mut files_written = 0usize;
+
+    while let Some(match_item) = rx.recv().await {
+        let prefix = extract_prefix(&match_item.key);
+
+        let encoder = match encoders.get_mut(&prefix) {
+            Some(enc) => enc,
+            None => {
+                let output_file = format!("{}/{}.gz", output_dir, prefix);
+                let file = std::fs::File::create(&output_file)?;
+                let enc = GzEncoder::new(file, Compression::default());
+                encoders.insert(prefix.clone(), enc);
+                files_written += 1;
+                encoders.get_mut(&prefix).unwrap()
+            }
+        };
+
+        let output_line = serde_json::json!({
+            "file": format!("{}/{}", match_item.bucket, match_item.key),
+            "content": match_item.content.trim()
+        });
+        writeln!(encoder, "{}", output_line)?;
+    }
+
+    // Finish all encoders
+    for (prefix, encoder) in encoders {
+        encoder.finish().map_err(|e| {
+            anyhow::anyhow!("Failed to finish gzip encoder for {}: {}", prefix, e)
+        })?;
+        info!("Finished writing {}.gz", prefix);
+    }
+
+    Ok(files_written)
 }

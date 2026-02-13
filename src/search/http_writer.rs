@@ -36,6 +36,8 @@ pub struct HttpWriterConfig {
     pub hostname: String,
     /// Service name to include in log entries
     pub service: String,
+    /// Channel buffer size for backpressure control
+    pub channel_buffer_size: usize,
 }
 
 impl Default for HttpWriterConfig {
@@ -50,6 +52,7 @@ impl Default for HttpWriterConfig {
                 .to_string_lossy()
                 .to_string(),
             service: "bucket-scrapper".to_string(),
+            channel_buffer_size: 1000,
         }
     }
 }
@@ -69,7 +72,7 @@ pub struct HttpResultWriter {
 impl HttpResultWriter {
     /// Create a new HTTP writer
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
-        let (write_tx, write_rx) = mpsc::channel::<HttpMatchToSend>(1000);
+        let (write_tx, write_rx) = mpsc::channel::<HttpMatchToSend>(config.channel_buffer_size);
         let lines_sent = Arc::new(AtomicUsize::new(0));
         let lines_sent_clone = lines_sent.clone();
         let url = config.url.clone();
