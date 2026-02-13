@@ -30,15 +30,15 @@ use crate::utils::date::date_range_to_date_hour_list;
 #[command(about = "Search through S3 bucket contents using ripgrep patterns")]
 struct Cli {
     /// Path to the config file (optional, for AWS credentials and default buckets)
-    #[arg(short, long, default_value = "config-scrapper.yml")]
+    #[arg(short, long, global = true, default_value = "config-scrapper.yml")]
     config: PathBuf,
 
     /// AWS region
-    #[arg(short, long, default_value = "eu-west-3")]
+    #[arg(short, long, global = true, default_value = "eu-west-3")]
     region: String,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'v', long, default_value = "info")]
+    #[arg(short = 'v', long, global = true, default_value = "info")]
     log_level: String,
 
     #[command(subcommand)]
