@@ -1,8 +1,7 @@
 // src/s3/client.rs
 // Location: src/s3/client.rs
-use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
+use crate::config::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
-use crate::utils::path_formatter::generate_path_formatter;
 use anyhow::Result;
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
@@ -111,207 +110,6 @@ impl WrappedS3Client {
         Ok(guard.1.clone())
     }
 
-    /// Lists objects using a provided client - use this when making multiple calls
-    /// to avoid repeated get_client() overhead
-    pub async fn get_matching_filenames_from_s3_with_client(
-        &self,
-        client: &Client,
-        bucket_config: &BucketConfig,
-        date: &DateString,
-        hour: &HourString,
-        will_filter: bool,
-    ) -> Result<S3FileList> {
-        let formatter = generate_path_formatter(bucket_config);
-        let prefix = formatter(date, hour)?;
-        let bucket = &bucket_config.bucket;
-
-        debug!("Get filenames for {} in {}", prefix, bucket);
-
-        let mut result = Vec::new();
-        let mut continuation_token = None;
-        let mut total_size: usize = 0;
-
-        // Build regex filters if needed
-        let filename_pattern_filter = if let Some(patterns) = &bucket_config.only_prefix_patterns {
-            let compiled_patterns = patterns
-                .iter()
-                .map(|pattern| Regex::new(pattern).unwrap())
-                .collect::<Vec<_>>();
-
-            Some(compiled_patterns)
-        } else {
-            None
-        };
-
-        // List objects in the bucket with the specified prefix
-        loop {
-            debug!(
-                "Listing objects for {} in {} with continuation token {:?}",
-                prefix, bucket, continuation_token
-            );
-
-            let list_objects_req = client.list_objects_v2().bucket(bucket).prefix(&prefix);
-
-            let list_objects_req = if let Some(token) = &continuation_token {
-                list_objects_req.continuation_token(token)
-            } else {
-                list_objects_req
-            };
-
-            let response = list_objects_req.send().await.map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
-
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    prefix = %prefix,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 list_objects_v2 failed"
-                );
-
-                if err_msg.contains("dispatch failure") {
-                    anyhow::anyhow!(
-                        "S3 request failed: {}. This often indicates expired AWS credentials. \
-                         Try running 'aws sso login' or check your AWS_* environment variables.",
-                        err_msg
-                    )
-                } else if err_msg.contains("service error") {
-                    // Extract more detail from service errors
-                    anyhow::anyhow!(
-                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
-                        bucket,
-                        prefix,
-                        err_msg
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
-                        bucket,
-                        prefix,
-                        err_msg
-                    )
-                }
-            })?;
-            debug!(
-                "Got {} objects for {} in {}",
-                response.contents().len(),
-                prefix,
-                bucket
-            );
-
-            if !response.contents().is_empty() {
-                let mapped = response
-                    .contents()
-                    .iter()
-                    .map(|o| {
-                        // +1 to remove the trailing slash
-                        let filename = o.key().unwrap_or_default();
-                        let filename_only = if let Some(stripped) = filename.strip_prefix(&prefix) {
-                            if stripped.starts_with('/') {
-                                &stripped[1..]
-                            } else {
-                                stripped
-                            }
-                        } else {
-                            filename
-                        };
-
-                        (
-                            S3ObjectInfo {
-                                bucket: bucket.clone(),
-                                key: filename.to_string(),
-                                size: o.size().unwrap_or_default() as usize,
-                                last_modified: o
-                                    .last_modified()
-                                    .map(|dt| {
-                                        chrono::DateTime::from_timestamp_nanos(dt.as_nanos() as i64)
-                                    })
-                                    .unwrap_or_default(),
-                            },
-                            filename_only.to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                for (obj_info, _) in &mapped {
-                    total_size += obj_info.size;
-                }
-
-                result.extend(mapped);
-            }
-
-            continuation_token = response.next_continuation_token().map(|s| s.to_owned());
-
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        debug!(
-            "Before filter: Found {} files for {} in {} ({} bytes)",
-            result.len(),
-            prefix,
-            bucket,
-            total_size
-        );
-
-        // Apply filters if needed
-        let filtered = if will_filter {
-            let filtered_items = result
-                .into_iter()
-                .filter(|(obj_info, filename_only)| {
-                    // First check if it matches our extension filters
-                    let key = &obj_info.key;
-                    let ext_match = key.ends_with(".json.zst")
-                        || key.ends_with(".json.gz")
-                        || key.ends_with(".log.gz");
-
-                    // Then check if it matches any pattern filters if they exist
-                    let pattern_match = if let Some(patterns) = &filename_pattern_filter {
-                        patterns.iter().any(|regex| regex.is_match(filename_only))
-                    } else {
-                        true
-                    };
-
-                    ext_match && pattern_match
-                })
-                .map(|(obj_info, _)| obj_info)
-                .collect::<Vec<_>>();
-
-            let filtered_size = filtered_items.iter().map(|item| item.size).sum();
-
-            debug!(
-                "After filter: Found {} files for {} in {} ({} bytes)",
-                filtered_items.len(),
-                prefix,
-                bucket,
-                filtered_size
-            );
-
-            (filtered_items, filtered_size)
-        } else {
-            let items = result.into_iter().map(|(obj_info, _)| obj_info).collect();
-            (items, total_size)
-        };
-
-        // Calculate a checksum of all filenames to enable identifying changes in file lists
-        let files_checksum = {
-            let mut filenames = filtered.0.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
-            filenames.sort();
-            let joined = filenames.join("");
-            format!("{:x}", md5::compute(joined))
-        };
-
-        Ok(S3FileList {
-            bucket: bucket.clone(),
-            checksum: files_checksum.clone(),
-            files: filtered.0,
-            total_archives_size: filtered.1,
-        })
-    }
-
     /// Get matching files from S3 with simple parameters
     pub async fn get_matching_filenames_from_s3(
         &self,
@@ -321,8 +119,15 @@ impl WrappedS3Client {
     ) -> Result<Vec<S3ObjectInfo>> {
         let client = self.get_client().await?;
 
+        // Compile regex filter up front (before pagination loop)
+        let filter_regex = filter_pattern
+            .map(Regex::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid filter regex '{}': {}", filter_pattern.unwrap_or(""), e))?;
+
         debug!("Listing objects in s3://{}/{}", bucket, prefix);
 
+        let mut all_objects = Vec::new();
         let mut result = Vec::new();
         let mut continuation_token = None;
 
@@ -340,21 +145,24 @@ impl WrappedS3Client {
                     if let (Some(key), Some(size), Some(last_modified)) =
                         (obj.key, obj.size, obj.last_modified)
                     {
-                        // Apply filter if provided
-                        if let Some(pattern) = filter_pattern {
-                            if !key.contains(pattern) {
-                                continue;
-                            }
-                        }
-
-                        result.push(S3ObjectInfo {
+                        let obj_info = S3ObjectInfo {
                             bucket: bucket.to_string(),
                             key,
                             size: size as usize,
                             last_modified: chrono::DateTime::from_timestamp_nanos(
                                 last_modified.as_nanos() as i64,
                             ),
-                        });
+                        };
+
+                        // Apply regex filter if provided
+                        if let Some(ref regex) = filter_regex {
+                            all_objects.push(obj_info.key.clone());
+                            if regex.is_match(&obj_info.key) {
+                                result.push(obj_info);
+                            }
+                        } else {
+                            result.push(obj_info);
+                        }
                     }
                 }
             }
@@ -366,12 +174,23 @@ impl WrappedS3Client {
             }
         }
 
-        debug!(
-            "Found {} objects in s3://{}/{}",
-            result.len(),
-            bucket,
-            prefix
-        );
+        if let Some(pattern) = filter_pattern {
+            info!(
+                "Filter '{}': {} objects matched out of {} total in s3://{}/{}",
+                pattern,
+                result.len(),
+                all_objects.len(),
+                bucket,
+                prefix
+            );
+        } else {
+            debug!(
+                "Found {} objects in s3://{}/{}",
+                result.len(),
+                bucket,
+                prefix
+            );
+        }
         Ok(result)
     }
 
