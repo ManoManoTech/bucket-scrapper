@@ -112,11 +112,23 @@ impl ParallelLister {
         }
 
         if !errors.is_empty() {
-            warn!(
-                "{} prefix listings failed (first error: {})",
-                errors.len(),
-                errors.first().unwrap_or(&"unknown".to_string())
-            );
+            let first_error = errors.first().unwrap_or(&"unknown".to_string()).clone();
+
+            if successful_prefixes == 0 {
+                // All listings failed - this is a fatal error
+                return Err(anyhow::anyhow!(
+                    "All {} prefix listings failed (first error: {})",
+                    errors.len(),
+                    first_error
+                ));
+            } else {
+                // Some listings failed - warn but continue
+                warn!(
+                    "{} prefix listings failed (first error: {})",
+                    errors.len(),
+                    first_error
+                );
+            }
         }
 
         info!(
