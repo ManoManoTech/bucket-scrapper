@@ -3,8 +3,6 @@ pub mod client;
 pub mod dns_cache;
 pub mod parallel_lister;
 pub mod streaming_downloader;
-pub mod streaming_search_executor;
 
 pub use parallel_lister::{ParallelListBuilder, ParallelLister};
 pub use streaming_downloader::{StreamingDownloader, StreamingDownloaderConfig};
-pub use streaming_search_executor::{StreamingSearchConfig, StreamingSearchExecutor};

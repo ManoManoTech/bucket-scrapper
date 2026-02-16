@@ -6,10 +6,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 /// A match to be written to the output
 #[derive(Debug, Clone)]
@@ -22,8 +20,6 @@ pub struct MatchToWrite {
 
 /// Manages streaming writes of search results to compressed files
 pub struct StreamingResultWriter {
-    output_dir: String,
-    encoders: Arc<Mutex<HashMap<String, GzEncoder<File>>>>,
     write_tx: mpsc::Sender<MatchToWrite>,
     write_handle: Option<tokio::task::JoinHandle<Result<usize>>>,
 }
@@ -34,25 +30,25 @@ impl StreamingResultWriter {
         // Create output directory if it doesn't exist
         fs::create_dir_all(&output_dir)?;
 
-        let encoders = Arc::new(Mutex::new(HashMap::new()));
         let (write_tx, mut write_rx) = mpsc::channel::<MatchToWrite>(1000);
+        let output_dir_clone = output_dir;
 
-        let encoders_clone = encoders.clone();
-        let output_dir_clone = output_dir.clone();
-
-        // Spawn a task to handle writes
-        let write_handle = tokio::spawn(async move {
+        // Spawn a blocking thread for the writer — pure sync I/O (gzip file writes).
+        // Using blocking_recv() in spawn_blocking avoids async scheduling overhead
+        // per item, which matters when match volume is high (e.g., `.*` pattern).
+        let write_handle = tokio::task::spawn_blocking(move || {
             let mut files_written = 0usize;
+            let mut matches_written = 0usize;
             let mut local_encoders: HashMap<String, GzEncoder<File>> = HashMap::new();
 
-            while let Some(match_item) = write_rx.recv().await {
+            while let Some(match_item) = write_rx.blocking_recv() {
                 // Get or create encoder for this prefix
                 let encoder = match local_encoders.get_mut(&match_item.prefix) {
                     Some(enc) => enc,
                     None => {
                         // Create new file and encoder
                         let output_file = format!("{}/{}.gz", output_dir_clone, match_item.prefix);
-                        debug!("Creating new output file: {}", output_file);
+                        info!("Creating output file: {}", output_file);
 
                         let file = match File::create(&output_file) {
                             Ok(f) => f,
@@ -79,6 +75,11 @@ impl StreamingResultWriter {
                 if let Err(e) = writeln!(encoder, "{}", output_line) {
                     eprintln!("Failed to write match: {}", e);
                 }
+
+                matches_written += 1;
+                if matches_written == 1 || matches_written % 10000 == 0 {
+                    info!("Writer: {} matches written to {} files", matches_written, files_written);
+                }
             }
 
             // Finish all encoders
@@ -90,18 +91,18 @@ impl StreamingResultWriter {
                 }
             }
 
-            // Update shared state with final encoders (for cleanup if needed)
-            *encoders_clone.lock().await = HashMap::new();
-
             Ok(files_written)
         });
 
         Ok(Self {
-            output_dir,
-            encoders,
             write_tx,
             write_handle: Some(write_handle),
         })
+    }
+
+    /// Get a sender that can be cloned for use in multiple tasks
+    pub fn get_sender(&self) -> mpsc::Sender<MatchToWrite> {
+        self.write_tx.clone()
     }
 
     /// Send a match to be written

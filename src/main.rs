@@ -20,7 +20,7 @@ use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
 use crate::s3::ParallelLister;
 use crate::search::{
-    HttpMatchToSend, HttpResultWriter, HttpWriterConfig, SearchConfig, StreamSearcher,
+    HttpResultWriter, HttpWriterConfig, SearchConfig, StreamSearcher, StreamingResultWriter,
 };
 use crate::utils::date::date_range_to_date_hour_list;
 
@@ -30,7 +30,7 @@ use crate::utils::date::date_range_to_date_hour_list;
 #[command(about = "Search through S3 bucket contents using ripgrep patterns")]
 struct Cli {
     /// Path to the config file (optional, for AWS credentials and default buckets)
-    #[arg(short, long, global = true, default_value = "config-scrapper.yml")]
+    #[arg(long, global = true, default_value = "config-scrapper.yml")]
     config: PathBuf,
 
     /// AWS region
@@ -397,25 +397,22 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .and_then(|c| c.output_dir.clone())
                         .unwrap_or_else(|| "./scrapper-output".to_string());
-                    std::fs::create_dir_all(&output_dir)?;
 
-                    let (file_tx, file_rx) = tokio::sync::mpsc::channel::<HttpMatchToSend>(channel_buffer);
-
-                    let file_writer_handle =
-                        tokio::spawn(file_writer_task(file_rx, output_dir.clone()));
+                    let file_writer = StreamingResultWriter::new(output_dir.clone())?;
+                    let file_sender = file_writer.get_sender();
 
                     let (files, matches) = downloader
-                        .search_objects_to_http(
+                        .search_objects_to_file(
                             &all_bucket_objects,
                             searcher.clone(),
-                            file_tx,
+                            file_sender,
                         )
                         .await?;
                     total_files_searched = files;
                     total_matches = matches;
 
-                    // Wait for file writer to finish flushing
-                    let files_written = file_writer_handle.await??;
+                    // Finish writer — flushes and finalizes all gzip files
+                    let files_written = file_writer.finish().await?;
                     info!(
                         "File output complete: {} files written to {}",
                         files_written, output_dir
@@ -598,50 +595,3 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Background task that receives search matches from a bounded channel
-/// and writes them to gzip-compressed output files grouped by date/hour prefix.
-async fn file_writer_task(
-    mut rx: tokio::sync::mpsc::Receiver<HttpMatchToSend>,
-    output_dir: String,
-) -> anyhow::Result<usize> {
-    use crate::search::extract_prefix;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::collections::HashMap;
-    use std::io::Write;
-
-    let mut encoders: HashMap<String, GzEncoder<std::fs::File>> = HashMap::new();
-    let mut files_written = 0usize;
-
-    while let Some(match_item) = rx.recv().await {
-        let prefix = extract_prefix(&match_item.key);
-
-        let encoder = match encoders.get_mut(&prefix) {
-            Some(enc) => enc,
-            None => {
-                let output_file = format!("{}/{}.gz", output_dir, prefix);
-                let file = std::fs::File::create(&output_file)?;
-                let enc = GzEncoder::new(file, Compression::default());
-                encoders.insert(prefix.clone(), enc);
-                files_written += 1;
-                encoders.get_mut(&prefix).unwrap()
-            }
-        };
-
-        let output_line = serde_json::json!({
-            "file": format!("{}/{}", match_item.bucket, match_item.key),
-            "content": match_item.content.trim()
-        });
-        writeln!(encoder, "{}", output_line)?;
-    }
-
-    // Finish all encoders
-    for (prefix, encoder) in encoders {
-        encoder.finish().map_err(|e| {
-            anyhow::anyhow!("Failed to finish gzip encoder for {}: {}", prefix, e)
-        })?;
-        info!("Finished writing {}.gz", prefix);
-    }
-
-    Ok(files_written)
-}

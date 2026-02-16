@@ -92,9 +92,9 @@ impl StreamSearcher {
                 &mut reader,
                 grep_searcher::sinks::UTF8(|_line_num, line| {
                     // Line number is always 0 since we disabled line tracking
-                    collector.add_match(bucket, key, 0, line);
+                    let keep_going = collector.add_match(bucket, key, 0, line);
                     match_count += 1;
-                    Ok(true)
+                    Ok(keep_going)
                 }),
             )?;
 
