@@ -14,8 +14,8 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
         serde_yaml::from_str(&config_str).with_context(|| "Failed to parse YAML config")?;
 
     info!(
-        "Config loaded successfully with {} buckets",
-        config.buckets.len()
+        buckets = config.buckets.len(),
+        "Config loaded"
     );
     Ok(config)
 }

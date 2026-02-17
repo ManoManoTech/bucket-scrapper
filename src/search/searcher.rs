@@ -55,7 +55,7 @@ impl StreamSearcher {
         mut reader: R,
         collector: &mut C,
     ) -> Result<()> {
-        debug!("Starting search in {}/{}", bucket, key);
+        debug!(bucket = %bucket, key = %key, "Starting search");
 
         // Configure the searcher (no context lines needed, but keep line numbers for the sink API)
         let mut searcher_builder = SearcherBuilder::new();
@@ -81,7 +81,7 @@ impl StreamSearcher {
 
             collector.add_count(bucket, key, count);
             if count > 0 {
-                debug!("Found {} matches in {}/{}", count, bucket, key);
+                debug!(matches = count, bucket = %bucket, key = %key, "Found matches");
             }
         } else {
             // Collect full match information (no line numbers)
@@ -99,7 +99,7 @@ impl StreamSearcher {
             )?;
 
             if match_count > 0 {
-                debug!("Found {} matches in {}/{}", match_count, bucket, key);
+                debug!(matches = match_count, bucket = %bucket, key = %key, "Found matches");
             }
         }
 

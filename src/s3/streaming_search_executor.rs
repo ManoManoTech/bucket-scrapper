@@ -137,9 +137,9 @@ impl StreamingSearchExecutor {
         let start_time = std::time::Instant::now();
 
         info!(
-            "Starting streaming search on {} objects ({} MB total)",
-            objects.len(),
-            total_bytes / 1_000_000
+            objects = objects.len(),
+            mb = total_bytes / 1_000_000,
+            "Starting streaming search"
         );
 
         let (tx, mut rx) = mpsc::channel::<Result<()>>(self.config.channel_buffer_size);
@@ -192,11 +192,11 @@ impl StreamingSearchExecutor {
         let (files_searched, files_with_matches, total_matches) = collector.get_stats().await;
 
         info!(
-            "Streaming search complete in {:.1}s: {} files searched, {} with matches, {} total matches",
-            elapsed.as_secs_f32(),
-            files_searched,
-            files_with_matches,
-            total_matches
+            elapsed_s = elapsed.as_secs_f32(),
+            files = files_searched,
+            files_with_matches = files_with_matches,
+            matches = total_matches,
+            "Streaming search complete"
         );
 
         if !errors.is_empty() {
@@ -244,11 +244,11 @@ impl StreamingSearchExecutor {
             .sleep(tokio::time::sleep)
             .notify(move |err: &anyhow::Error, dur: Duration| {
                 warn!(
-                    "Retry scheduled for {}/{} in {:.1}s: {}",
-                    bucket,
-                    key,
-                    dur.as_secs_f64(),
-                    err
+                    bucket = %bucket,
+                    key = %key,
+                    retry_in_s = dur.as_secs_f64(),
+                    error = %err,
+                    "Retry scheduled"
                 );
             })
             .await
@@ -262,7 +262,7 @@ impl StreamingSearchExecutor {
         collector: &Arc<StreamingSearchCollector>,
         buffer_size: usize,
     ) -> Result<()> {
-        debug!("Starting streaming search for {}/{}", obj.bucket, obj.key);
+        debug!(bucket = %obj.bucket, key = %obj.key, "Starting streaming search");
 
         // Mark file as being searched
         collector.mark_file_searched().await?;
@@ -328,7 +328,7 @@ impl StreamingSearchExecutor {
                 .await?;
         }
 
-        debug!("Completed streaming search for {}/{}", obj.bucket, obj.key);
+        debug!(bucket = %obj.bucket, key = %obj.key, "Completed streaming search");
         Ok(())
     }
 }

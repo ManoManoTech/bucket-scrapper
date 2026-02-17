@@ -51,18 +51,16 @@ impl SearchProgress {
 
     fn report(&mut self) {
         let pct = (self.files_processed * 100) / self.total_files.max(1);
-        let mb_processed = self.bytes_processed / 1_000_000;
-        let mb_total = self.total_bytes / 1_000_000;
 
         info!(
-            "[{}/{} files ({}%), {}MB/{}MB] {} matches found, elapsed: {:.1}s",
-            self.files_processed,
-            self.total_files,
-            pct,
-            mb_processed,
-            mb_total,
-            self.matches_found,
-            self.start_time.elapsed().as_secs_f32()
+            files_done = self.files_processed,
+            files_total = self.total_files,
+            pct = pct,
+            mb_done = self.bytes_processed / 1_000_000,
+            mb_total = self.total_bytes / 1_000_000,
+            matches = self.matches_found,
+            elapsed_s = self.start_time.elapsed().as_secs_f32(),
+            "Search progress"
         );
 
         self.last_report_time = std::time::Instant::now();
@@ -241,11 +239,11 @@ impl StreamingDownloader {
             .sleep(tokio::time::sleep)
             .notify(move |err: &anyhow::Error, dur: Duration| {
                 warn!(
-                    "Retry scheduled for {}/{} in {:.1}s: {}",
-                    bucket,
-                    key,
-                    dur.as_secs_f64(),
-                    err
+                    bucket = %bucket,
+                    key = %key,
+                    retry_in_s = dur.as_secs_f64(),
+                    error = %err,
+                    "Retry scheduled"
                 );
             })
             .await
@@ -261,8 +259,9 @@ impl StreamingDownloader {
         buffer_size: usize,
     ) -> Result<(usize, usize)> {
         debug!(
-            "Starting streaming download and HTTP search for {}/{}",
-            obj.bucket, obj.key
+            bucket = %obj.bucket,
+            key = %obj.key,
+            "Starting streaming download and HTTP search"
         );
 
         // Get object from S3
@@ -277,8 +276,10 @@ impl StreamingDownloader {
         // Get content length if available
         let content_length = resp.content_length.unwrap_or(0) as usize;
         debug!(
-            "Content length for {}/{}: {} bytes",
-            obj.bucket, obj.key, content_length
+            bucket = %obj.bucket,
+            key = %obj.key,
+            bytes = content_length,
+            "Content length"
         );
 
         // Convert to async reader
@@ -315,7 +316,7 @@ impl StreamingDownloader {
         })
         .await??;
 
-        debug!("Completed HTTP streaming search in {}/{}", obj.bucket, obj.key);
+        debug!(bucket = %obj.bucket, key = %obj.key, "Completed HTTP streaming search");
         Ok((compressed_size, matches_found))
     }
 
@@ -335,10 +336,10 @@ impl StreamingDownloader {
 
         let total_bytes: usize = objects.iter().map(|o| o.size).sum();
         info!(
-            "Starting file search: {} objects ({} MB), concurrency={}",
-            objects.len(),
-            total_bytes / 1_000_000,
-            self.config.max_concurrent_downloads,
+            objects = objects.len(),
+            mb = total_bytes / 1_000_000,
+            concurrency = self.config.max_concurrent_downloads,
+            "Starting file search"
         );
 
         let progress = Arc::new(Mutex::new(SearchProgress::new(objects.len(), total_bytes)));
@@ -377,11 +378,11 @@ impl StreamingDownloader {
                     Ok(Err(e)) => {
                         files_searched += 1;
                         errors.push(e.to_string());
-                        warn!("Task error: {}", e);
+                        warn!(error = %e, "Task error");
                     }
                     Err(e) => {
                         errors.push(format!("Task panic: {}", e));
-                        warn!("Task panic: {}", e);
+                        warn!(error = %e, "Task panic");
                     }
                 }
             }
@@ -401,16 +402,16 @@ impl StreamingDownloader {
             spawned += 1;
             if spawned == self.config.max_concurrent_downloads {
                 info!(
-                    "All {} concurrent slots filled, processing...",
-                    self.config.max_concurrent_downloads
+                    concurrency = self.config.max_concurrent_downloads,
+                    "All concurrent slots filled, processing"
                 );
             }
         }
 
         info!(
-            "All {} tasks spawned, draining {} remaining...",
-            spawned,
-            join_set.len()
+            spawned = spawned,
+            remaining = join_set.len(),
+            "All tasks spawned, draining"
         );
 
         // Drain remaining tasks
@@ -428,11 +429,11 @@ impl StreamingDownloader {
                 Ok(Err(e)) => {
                     files_searched += 1;
                     errors.push(e.to_string());
-                    warn!("Task error: {}", e);
+                    warn!(error = %e, "Task error");
                 }
                 Err(e) => {
                     errors.push(format!("Task panic: {}", e));
-                    warn!("Task panic: {}", e);
+                    warn!(error = %e, "Task panic");
                 }
             }
         }
@@ -483,11 +484,11 @@ impl StreamingDownloader {
             .sleep(tokio::time::sleep)
             .notify(move |err: &anyhow::Error, dur: Duration| {
                 warn!(
-                    "Retry scheduled for {}/{} in {:.1}s: {}",
-                    bucket,
-                    key,
-                    dur.as_secs_f64(),
-                    err
+                    bucket = %bucket,
+                    key = %key,
+                    retry_in_s = dur.as_secs_f64(),
+                    error = %err,
+                    "Retry scheduled"
                 );
             })
             .await
@@ -503,8 +504,10 @@ impl StreamingDownloader {
         buffer_size: usize,
     ) -> Result<(usize, usize)> {
         debug!(
-            "Downloading {}/{} ({} bytes)",
-            obj.bucket, obj.key, obj.size
+            bucket = %obj.bucket,
+            key = %obj.key,
+            bytes = obj.size,
+            "Downloading"
         );
 
         // Get object from S3
@@ -518,8 +521,10 @@ impl StreamingDownloader {
 
         let content_length = resp.content_length.unwrap_or(0) as usize;
         debug!(
-            "Content length for {}/{}: {} bytes",
-            obj.bucket, obj.key, content_length
+            bucket = %obj.bucket,
+            key = %obj.key,
+            bytes = content_length,
+            "Content length"
         );
 
         // Convert to async reader
@@ -554,7 +559,7 @@ impl StreamingDownloader {
         })
         .await??;
 
-        debug!("Completed file streaming search in {}/{}", obj.bucket, obj.key);
+        debug!(bucket = %obj.bucket, key = %obj.key, "Completed file streaming search");
         Ok((compressed_size, matches_found))
     }
 }

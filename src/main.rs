@@ -43,6 +43,10 @@ struct Cli {
     #[arg(short = 'v', long, global = true, default_value = "info")]
     log_level: String,
 
+    /// Log output format (text for human-readable, json for structured)
+    #[arg(long, global = true, default_value = "text")]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -144,6 +148,12 @@ enum OutputFormat {
     Quiet,
 }
 
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Set nice priority to prevent system resource starvation
@@ -166,7 +176,10 @@ async fn main() -> Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
-    fmt().with_env_filter(env_filter).with_target(false).init();
+    match cli.log_format {
+        LogFormat::Json => fmt().with_env_filter(env_filter).with_target(false).json().init(),
+        LogFormat::Text => fmt().with_env_filter(env_filter).with_target(false).init(),
+    }
 
     // Set up DNS cache with 5 minute TTL
     dns_cache::init_global_dns_cache(300).await.ok();
@@ -175,18 +188,18 @@ async fn main() -> Result<()> {
     let config = if cli.config.exists() {
         match load_config(&cli.config) {
             Ok(cfg) => {
-                info!("Loaded config from {}", cli.config.display());
+                info!(path = %cli.config.display(), "Loaded config");
                 Some(cfg)
             }
             Err(e) => {
-                info!("Could not load config from {}: {}", cli.config.display(), e);
+                info!(path = %cli.config.display(), error = %e, "Could not load config");
                 None
             }
         }
     } else {
         info!(
-            "Config file {} not found, using command line arguments only",
-            cli.config.display()
+            path = %cli.config.display(),
+            "Config file not found, using command line arguments only"
         );
         None
     };
@@ -291,7 +304,7 @@ async fn main() -> Result<()> {
 
                 let batch_max_bytes = http_batch_max_mb * 1024 * 1024;
 
-                info!("HTTP streaming mode enabled - results will be sent to: {} (max batch: {} MB)", api_url, http_batch_max_mb);
+                info!(url = %api_url, batch_max_mb = http_batch_max_mb, "HTTP streaming mode enabled");
 
                 let hostname = http_hostname.clone().unwrap_or_else(|| {
                     gethostname::gethostname().to_string_lossy().to_string()
@@ -337,18 +350,18 @@ async fn main() -> Result<()> {
                             let _permit = sem.acquire().await
                                 .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
 
-                            debug!("Listing {}/{}", bucket, prefix);
+                            debug!(bucket = %bucket, prefix = %prefix, "Listing");
                             let result = client
                                 .get_matching_filenames_from_s3(&bucket, &prefix, filter.as_deref())
                                 .await;
 
                             match &result {
                                 Ok(objs) if !objs.is_empty() => {
-                                    debug!("Found {} objects in {}/{}", objs.len(), bucket, prefix);
+                                    debug!(objects = objs.len(), bucket = %bucket, prefix = %prefix, "Found objects");
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
-                                    warn!("Failed to list {}/{}: {}", bucket, prefix, e);
+                                    warn!(bucket = %bucket, prefix = %prefix, error = %e, "Failed to list");
                                 }
                             }
                             result
@@ -357,7 +370,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                info!("Spawned {} listing tasks across {} buckets", total_tasks, config_buckets.len());
+                info!(tasks = total_tasks, buckets = config_buckets.len(), "Spawned listing tasks");
 
                 // Drain results, preserving "fail if ALL fail, warn if SOME fail"
                 let mut all_objects = Vec::new();
@@ -365,7 +378,7 @@ async fn main() -> Result<()> {
                 let mut successful = 0usize;
 
                 let listing_start = std::time::Instant::now();
-                let report_every = (total_tasks / 10).max(1);
+                let mut last_report = listing_start;
 
                 while let Some(join_result) = join_set.join_next().await {
                     match join_result {
@@ -382,10 +395,14 @@ async fn main() -> Result<()> {
                     }
 
                     let done = successful + errors.len();
-                    if done % report_every == 0 || done == total_tasks {
+                    if done < total_tasks && last_report.elapsed() >= std::time::Duration::from_secs(5) {
+                        last_report = std::time::Instant::now();
                         info!(
-                            "Listing progress: {}/{} prefixes done ({:.1}s), {} objects found",
-                            done, total_tasks, listing_start.elapsed().as_secs_f32(), all_objects.len()
+                            prefixes_done = done,
+                            prefixes_total = total_tasks,
+                            elapsed_s = listing_start.elapsed().as_secs_f32(),
+                            objects = all_objects.len(),
+                            "Listing progress"
                         );
                     }
                 }
@@ -399,16 +416,19 @@ async fn main() -> Result<()> {
                         ));
                     }
                     warn!(
-                        "{} of {} prefix listings failed (first error: {})",
-                        errors.len(),
-                        total_tasks,
-                        errors[0]
+                        failed = errors.len(),
+                        total = total_tasks,
+                        first_error = %errors[0],
+                        "Some prefix listings failed"
                     );
                 }
 
                 info!(
-                    "Listing complete: {}/{} prefixes successful, {} objects found",
-                    successful, total_tasks, all_objects.len()
+                    prefixes_ok = successful,
+                    prefixes_total = total_tasks,
+                    objects = all_objects.len(),
+                    elapsed_s = listing_start.elapsed().as_secs_f32(),
+                    "Listing complete"
                 );
 
                 // Sort by size for better load balancing
@@ -421,9 +441,9 @@ async fn main() -> Result<()> {
             } else {
                 let total_size: usize = all_bucket_objects.iter().map(|o| o.size).sum();
                 info!(
-                    "Processing {} total objects ({} MB)",
-                    all_bucket_objects.len(),
-                    total_size / 1_000_000
+                    objects = all_bucket_objects.len(),
+                    mb = total_size / 1_000_000,
+                    "Processing objects"
                 );
 
                 let batch_start = std::time::Instant::now();
@@ -458,14 +478,15 @@ async fn main() -> Result<()> {
                     // Finish writer — flushes and finalizes all gzip files
                     let files_written = file_writer.finish()?;
                     info!(
-                        "File output complete: {} files written to {}",
-                        files_written, output_dir
+                        files = files_written,
+                        output_dir = %output_dir,
+                        "File output complete"
                     );
                 }
 
                 info!(
-                    "Search completed in {:.1}s",
-                    batch_start.elapsed().as_secs_f32()
+                    elapsed_s = batch_start.elapsed().as_secs_f32(),
+                    "Search completed"
                 );
             }
 
@@ -474,7 +495,7 @@ async fn main() -> Result<()> {
                 // Finish HTTP writer and get final count
                 let api_url = http_writer.url().to_string();
                 let lines_sent = http_writer.finish().await?;
-                info!("HTTP streaming complete: {} lines sent to {}", lines_sent, api_url);
+                info!(lines = lines_sent, url = %api_url, "HTTP streaming complete");
 
                 (lines_sent, api_url)
             } else {

@@ -139,7 +139,7 @@ impl WrappedS3Client {
             .transpose()
             .map_err(|e| anyhow::anyhow!("Invalid filter regex '{}': {}", filter_pattern.unwrap_or(""), e))?;
 
-        debug!("Listing objects in s3://{}/{}", bucket, prefix);
+        debug!(bucket = %bucket, prefix = %prefix, "Listing objects");
 
         let mut all_objects = Vec::new();
         let mut result = Vec::new();
@@ -192,23 +192,33 @@ impl WrappedS3Client {
             if response.is_truncated.unwrap_or(false) {
                 continuation_token = response.next_continuation_token;
                 debug!(
-                    "s3://{}/{} page {} returned {} keys, continuing...",
-                    bucket, prefix, pages, result.len()
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    page = pages,
+                    keys = result.len(),
+                    "Listing page, continuing"
                 );
             } else {
                 break;
             }
         }
 
-        if let Some(_pattern) = filter_pattern {
+        if filter_pattern.is_some() {
             debug!(
-                "Listed s3://{}/{}: {} matched / {} total ({} pages)",
-                bucket, prefix, result.len(), all_objects.len(), pages
+                bucket = %bucket,
+                prefix = %prefix,
+                matched = result.len(),
+                total = all_objects.len(),
+                pages = pages,
+                "Listed with filter"
             );
         } else {
             debug!(
-                "Listed s3://{}/{}: {} objects ({} pages)",
-                bucket, prefix, result.len(), pages
+                bucket = %bucket,
+                prefix = %prefix,
+                objects = result.len(),
+                pages = pages,
+                "Listed"
             );
         }
         Ok(result)
@@ -222,7 +232,7 @@ impl WrappedS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Vec<u8>> {
-        debug!("Downloading object s3://{}/{}", bucket, key);
+        debug!(bucket = %bucket, key = %key, "Downloading object");
 
         let response = client
             .get_object()
@@ -262,10 +272,10 @@ impl WrappedS3Client {
         let bytes = response.body.collect().await?.into_bytes().to_vec();
 
         debug!(
-            "Downloaded {} bytes from s3://{}/{}",
-            bytes.len(),
-            bucket,
-            key
+            bytes = bytes.len(),
+            bucket = %bucket,
+            key = %key,
+            "Downloaded object"
         );
 
         Ok(bytes)
@@ -286,7 +296,7 @@ impl WrappedS3Client {
         key: &str,
         data: Vec<u8>,
     ) -> Result<()> {
-        debug!("Uploading object to s3://{}/{}", bucket, key);
+        debug!(bucket = %bucket, key = %key, "Uploading object");
 
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
 
@@ -319,7 +329,7 @@ impl WrappedS3Client {
                 )
             })?;
 
-        info!("Uploaded check result to s3://{}/{}", bucket, key);
+        info!(bucket = %bucket, key = %key, "Uploaded check result");
 
         Ok(())
     }
@@ -333,7 +343,7 @@ fn build_tls_context() -> Result<TlsContext> {
     if let Some(path) = resolve_ca_bundle_path() {
         let pem = std::fs::read(&path)
             .with_context(|| format!("Failed to read CA bundle: {}", path))?;
-        info!("Loaded custom CA bundle from {}", path);
+        info!(path = %path, "Loaded custom CA bundle");
         trust_store = trust_store.with_pem_certificate(pem);
     }
 
@@ -363,7 +373,7 @@ fn resolve_ca_bundle_path() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{}/.mitmproxy/mitmproxy-ca-cert.pem", home);
     if std::path::Path::new(&path).exists() {
-        info!("Auto-detected mitmproxy CA at {}", path);
+        info!(path = %path, "Auto-detected mitmproxy CA");
         Some(path)
     } else {
         None

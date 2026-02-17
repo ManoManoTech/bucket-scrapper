@@ -147,10 +147,10 @@ impl HttpResultWriter {
                     Ok(count) => {
                         total_sent += count;
                         lines_sent.fetch_add(count, Ordering::Relaxed);
-                        debug!("Sent batch of {} log lines ({} bytes) to {}", count, batch_bytes, config.url);
+                        debug!(lines = count, bytes = batch_bytes, url = %config.url, "Sent batch");
                     }
                     Err(e) => {
-                        error!("Failed to send batch ({} lines, {} bytes): {}", batch.len(), batch_bytes, e);
+                        error!(lines = batch.len(), bytes = batch_bytes, error = %e, "Failed to send batch");
                     }
                 }
                 batch.clear();
@@ -169,15 +169,15 @@ impl HttpResultWriter {
                 Ok(count) => {
                     total_sent += count;
                     lines_sent.fetch_add(count, Ordering::Relaxed);
-                    info!("Sent final batch of {} log lines to {}", count, config.url);
+                    info!(lines = count, url = %config.url, "Sent final batch");
                 }
                 Err(e) => {
-                    error!("Failed to send final batch ({} lines, {} bytes): {}", final_batch_lines, final_batch_bytes, e);
+                    error!(lines = final_batch_lines, bytes = final_batch_bytes, error = %e, "Failed to send final batch");
                 }
             }
         }
 
-        info!("HTTP writer finished. Total lines sent: {}", total_sent);
+        info!(total_lines = total_sent, "HTTP writer finished");
         Ok(total_sent)
     }
 
@@ -197,10 +197,10 @@ impl HttpResultWriter {
             if attempt > 0 {
                 let delay = Duration::from_millis(100 * 2u64.pow(attempt - 1));
                 warn!(
-                    "Retrying HTTP request (attempt {}/{}), waiting {:?}",
-                    attempt + 1,
-                    config.max_retries + 1,
-                    delay
+                    attempt = attempt + 1,
+                    max_attempts = config.max_retries + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    "Retrying HTTP request"
                 );
                 tokio::time::sleep(delay).await;
             }
@@ -220,16 +220,13 @@ impl HttpResultWriter {
 
                     if status.is_success() {
                         debug!(
-                            "HTTP batch sent: {} lines, {} bytes, status={}, response={}",
-                            count,
-                            body.len(),
-                            status,
-                            response_body
+                            lines = count,
+                            bytes = body.len(),
+                            status = %status,
+                            response = %response_body,
+                            "HTTP batch sent"
                         );
-                        trace!(
-                            "--- PAYLOAD ---\n{}\n--- END PAYLOAD ---",
-                            body
-                        );
+                        trace!(payload = %body, "HTTP batch payload");
                         return Ok(count);
                     } else {
                         last_error = Some(anyhow::anyhow!(

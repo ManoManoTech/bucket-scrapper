@@ -36,7 +36,7 @@ fn extract_single_format_date_and_prefix(
             Ok(format!("{}{}", key_prefix, formatted))
         });
     } else {
-        warn!("No date formatter found for prefix: {}", prefix);
+        warn!(prefix = %prefix, "No date formatter found for prefix");
 
         let prefix_clone = prefix.clone();
         return Box::new(move |date: &DateString, hour: &HourString| {

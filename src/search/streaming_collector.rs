@@ -32,8 +32,9 @@ impl SearchCollector for DirectFileCollector {
             Ok(()) => true,
             Err(e) => {
                 warn!(
-                    "Failed to write match, stopping search (wrote {} matches): {}",
-                    self.match_count, e
+                    matches_written = self.match_count,
+                    error = %e,
+                    "Failed to write match, stopping search"
                 );
                 false
             }
