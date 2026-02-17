@@ -541,7 +541,7 @@ impl StreamingDownloader {
         let searcher_clone = searcher.clone();
 
         // Create a direct file collector that writes to SharedFileWriter
-        let mut file_collector = DirectFileCollector::new(writer);
+        let mut file_collector = DirectFileCollector::new(writer, obj.prefix.clone());
         file_collector.mark_file_searched();
 
         let matches_found = tokio::task::spawn_blocking(move || {

@@ -76,8 +76,7 @@ impl SharedFileWriter {
         // Lock only this prefix's encoder
         let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
 
-        encoder.write_all(content.trim().as_bytes())?;
-        encoder.write_all(b"\n")?;
+        encoder.write_all(content.as_bytes())?;
 
         self.matches_written.fetch_add(1, Ordering::Relaxed);
 
@@ -124,34 +123,3 @@ impl SharedFileWriter {
     }
 }
 
-/// Extract date/hour prefix from S3 key for grouping
-pub fn extract_prefix(key: &str) -> String {
-    // Try to extract dt=YYYYMMDD/hour=HH pattern
-    if let Some(dt_pos) = key.find("dt=") {
-        if let Some(hour_pos) = key.find("hour=") {
-            if dt_pos < hour_pos {
-                let dt_start = dt_pos + 3;
-                let dt_end = dt_start + 8; // YYYYMMDD
-                let hour_start = hour_pos + 5;
-                let hour_end = hour_start + 2; // HH
-
-                if dt_end <= key.len() && hour_end <= key.len() {
-                    if let (Ok(date), Ok(hour)) = (
-                        key[dt_start..dt_end].parse::<String>(),
-                        key[hour_start..hour_end].parse::<String>(),
-                    ) {
-                        return format!("{}H{}", date, hour);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: use directory structure
-    let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() >= 2 {
-        parts[..parts.len() - 1].join("_")
-    } else {
-        "unknown".to_string()
-    }
-}
