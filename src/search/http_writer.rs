@@ -4,7 +4,6 @@ use reqwest::Client;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 use super::result_exporter::SearchExporter;
@@ -24,6 +23,8 @@ pub struct HttpWriterConfig {
     pub max_retries: u32,
     /// Channel buffer size for backpressure control
     pub channel_buffer_size: usize,
+    /// Number of concurrent upload tasks consuming from the shared channel
+    pub num_upload_tasks: usize,
 }
 
 impl Default for HttpWriterConfig {
@@ -35,42 +36,53 @@ impl Default for HttpWriterConfig {
             timeout_secs: 30,
             max_retries: 3,
             channel_buffer_size: 1000,
+            num_upload_tasks: std::thread::available_parallelism()
+                .map(|n| n.get() / 8)
+                .unwrap_or(1)
+                .max(1),
         }
     }
 }
 
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
-    write_tx: mpsc::Sender<String>,
-    write_handle: Option<tokio::task::JoinHandle<Result<usize>>>,
-    /// Tracks total lines sent (shared with writer task)
+    write_tx: flume::Sender<String>,
+    write_handles: Vec<tokio::task::JoinHandle<Result<usize>>>,
+    /// Tracks total lines sent (shared with writer tasks)
     lines_sent: Arc<AtomicUsize>,
     /// URL for display purposes
     url: String,
 }
 
 impl HttpResultWriter {
-    /// Create a new HTTP writer
+    /// Create a new HTTP writer with N concurrent upload tasks
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
-        let (write_tx, write_rx) = mpsc::channel::<String>(config.channel_buffer_size);
+        let (write_tx, write_rx) = flume::bounded::<String>(config.channel_buffer_size);
         let lines_sent = Arc::new(AtomicUsize::new(0));
-        let lines_sent_clone = lines_sent.clone();
         let url = config.url.clone();
+        let num_tasks = config.num_upload_tasks;
 
-        let write_handle = tokio::spawn(async move {
-            Self::writer_task(write_rx, config, lines_sent_clone).await
-        });
+        let mut write_handles = Vec::with_capacity(num_tasks);
+        for task_id in 0..num_tasks {
+            let rx = write_rx.clone();
+            let cfg = config.clone();
+            let ls = lines_sent.clone();
+            let handle = tokio::spawn(async move {
+                Self::writer_task(task_id, rx, cfg, ls).await
+            });
+            write_handles.push(handle);
+        }
 
         Ok(Self {
             write_tx,
-            write_handle: Some(write_handle),
+            write_handles,
             lines_sent,
             url,
         })
     }
 
     /// Get a sender that can be cloned for use in multiple tasks
-    pub fn get_sender(&self) -> mpsc::Sender<String> {
+    pub fn get_sender(&self) -> flume::Sender<String> {
         self.write_tx.clone()
     }
 
@@ -79,9 +91,11 @@ impl HttpResultWriter {
         self.lines_sent.load(Ordering::Relaxed)
     }
 
-    /// Background task that batches and sends lines to the HTTP API
+    /// Background task that batches and sends lines to the HTTP API.
+    /// Multiple instances run concurrently, each pulling from the shared channel.
     async fn writer_task(
-        mut write_rx: mpsc::Receiver<String>,
+        task_id: usize,
+        write_rx: flume::Receiver<String>,
         config: HttpWriterConfig,
         lines_sent: Arc<AtomicUsize>,
     ) -> Result<usize> {
@@ -94,7 +108,7 @@ impl HttpResultWriter {
         let mut batch_bytes = 0usize;
         let mut total_sent = 0usize;
 
-        while let Some(line) = write_rx.recv().await {
+        while let Ok(line) = write_rx.recv_async().await {
             let line_bytes = line.len() + 1; // +1 for newline
 
             // Flush if adding this line would exceed the byte limit
@@ -103,10 +117,10 @@ impl HttpResultWriter {
                     Ok(count) => {
                         total_sent += count;
                         lines_sent.fetch_add(count, Ordering::Relaxed);
-                        debug!(lines = count, bytes = batch_bytes, url = %config.url, "Sent batch");
+                        debug!(task = task_id, lines = count, bytes = batch_bytes, url = %config.url, "Sent batch");
                     }
                     Err(e) => {
-                        error!(lines = batch.len(), bytes = batch_bytes, error = %e, "Failed to send batch");
+                        error!(task = task_id, lines = batch.len(), bytes = batch_bytes, error = %e, "Failed to send batch");
                     }
                 }
                 batch.clear();
@@ -125,15 +139,15 @@ impl HttpResultWriter {
                 Ok(count) => {
                     total_sent += count;
                     lines_sent.fetch_add(count, Ordering::Relaxed);
-                    info!(lines = count, url = %config.url, "Sent final batch");
+                    info!(task = task_id, lines = count, url = %config.url, "Sent final batch");
                 }
                 Err(e) => {
-                    error!(lines = final_batch_lines, bytes = final_batch_bytes, error = %e, "Failed to send final batch");
+                    error!(task = task_id, lines = final_batch_lines, bytes = final_batch_bytes, error = %e, "Failed to send final batch");
                 }
             }
         }
 
-        info!(total_lines = total_sent, "HTTP writer finished");
+        info!(task = task_id, total_lines = total_sent, "HTTP writer task finished");
         Ok(total_sent)
     }
 
@@ -204,17 +218,35 @@ impl HttpResultWriter {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")))
     }
 
-    /// Finish writing and return the number of lines sent
-    pub async fn finish(mut self) -> Result<usize> {
-        // Close the channel to signal we're done
+    /// Finish writing and return the total number of lines sent across all tasks
+    pub async fn finish(self) -> Result<usize> {
+        // Close the channel to signal all writer tasks to drain and exit
         drop(self.write_tx);
 
-        // Wait for the writer task to complete
-        if let Some(handle) = self.write_handle.take() {
-            handle.await?
-        } else {
-            Ok(0)
+        let mut total = 0usize;
+        let mut first_error: Option<anyhow::Error> = None;
+
+        for handle in self.write_handles {
+            match handle.await {
+                Ok(Ok(count)) => total += count,
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!("Writer task panicked: {e}"));
+                    }
+                }
+            }
         }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        Ok(total)
     }
 
     /// Get the configured URL
@@ -226,12 +258,12 @@ impl HttpResultWriter {
 /// An exporter that streams results to an HTTP API instead of storing in memory.
 /// Implements SearchExporter trait for use with generic search functions.
 pub struct HttpStreamingExporter {
-    sender: mpsc::Sender<String>,
+    sender: flume::Sender<String>,
     match_count: usize,
 }
 
 impl HttpStreamingExporter {
-    pub fn new(sender: mpsc::Sender<String>) -> Self {
+    pub fn new(sender: flume::Sender<String>) -> Self {
         Self {
             sender,
             match_count: 0,
@@ -242,11 +274,11 @@ impl HttpStreamingExporter {
 impl SearchExporter for HttpStreamingExporter {
     fn add_match(&mut self, line: &str) -> Result<()> {
         match self.sender.try_send(line.to_string()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+            Ok(()) | Err(flume::TrySendError::Full(_)) => {
                 self.match_count += 1;
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(flume::TrySendError::Disconnected(_)) => {
                 Err(anyhow::anyhow!("HTTP consumer gone, channel closed"))
             }
         }

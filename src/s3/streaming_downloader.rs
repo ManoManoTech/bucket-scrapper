@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, BufReader};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info, warn};
 
@@ -113,7 +113,7 @@ impl StreamingDownloader {
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
-        http_sender: mpsc::Sender<String>,
+        http_sender: flume::Sender<String>,
     ) -> Result<(usize, usize)> {
         self.search_objects(objects, searcher, move |_obj: &S3ObjectInfo| {
             HttpStreamingExporter::new(http_sender.clone())

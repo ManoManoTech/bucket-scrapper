@@ -122,6 +122,10 @@ enum Commands {
         #[arg(long, default_value = "30")]
         http_timeout: u64,
 
+        /// Number of concurrent HTTP upload tasks (default: cpu_count / 8, minimum 1)
+        #[arg(long)]
+        http_upload_tasks: Option<usize>,
+
     },
 }
 
@@ -201,6 +205,7 @@ async fn main() -> Result<()> {
             http_api_key,
             http_batch_max_mb,
             http_timeout,
+            http_upload_tasks,
         } => {
             let end_date = if let Some(end) = end {
                 end.parse::<DateTime<Utc>>()
@@ -277,7 +282,14 @@ async fn main() -> Result<()> {
 
                 let batch_max_bytes = http_batch_max_mb * 1024 * 1024;
 
-                info!(url = %api_url, batch_max_mb = http_batch_max_mb, "HTTP streaming mode enabled");
+                let num_upload_tasks = http_upload_tasks.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() / 8)
+                        .unwrap_or(1)
+                        .max(1)
+                });
+
+                info!(url = %api_url, batch_max_mb = http_batch_max_mb, upload_tasks = num_upload_tasks, "HTTP streaming mode enabled");
 
                 let http_config = HttpWriterConfig {
                     url: api_url,
@@ -286,6 +298,7 @@ async fn main() -> Result<()> {
                     timeout_secs,
                     max_retries,
                     channel_buffer_size: channel_buffer,
+                    num_upload_tasks,
                 };
 
                 Some(HttpResultWriter::new(http_config)?)
