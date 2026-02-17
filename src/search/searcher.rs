@@ -5,7 +5,7 @@ use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
 use std::io::BufRead;
 use tracing::debug;
 
-use super::result_collector::{SearchCollector, SearchResultCollector};
+use super::result_collector::SearchCollector;
 
 /// Configuration for the stream searcher
 #[derive(Clone)]
@@ -121,14 +121,4 @@ impl StreamSearcher {
         Ok(())
     }
 
-    /// Search through a byte slice (for testing or small data)
-    pub fn search_bytes(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: &[u8],
-        collector: &mut SearchResultCollector,
-    ) -> Result<()> {
-        self.search_stream(bucket, key, std::io::Cursor::new(data), collector)
-    }
 }

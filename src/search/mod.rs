@@ -6,7 +6,7 @@ pub mod streaming_collector;
 pub mod streaming_writer;
 
 pub use http_writer::{HttpMatchToSend, HttpResultWriter, HttpStreamingCollector, HttpWriterConfig};
-pub use result_collector::{SearchCollector, SearchResult, SearchResultCollector};
+pub use result_collector::SearchCollector;
 pub use searcher::{SearchConfig, StreamSearcher};
 pub use streaming_collector::DirectFileCollector;
 pub use streaming_writer::{FileWriterStats, SharedFileWriter};
