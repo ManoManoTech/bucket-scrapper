@@ -1,13 +1,7 @@
 // src/main.rs
-mod config;
-mod s3;
-mod search;
-mod utils;
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use s3::{StreamingDownloader, StreamingDownloaderConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,15 +10,16 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::config::loader::load_config;
-use crate::config::types::{BucketConfig, S3ObjectInfo};
-use crate::s3::client::WrappedS3Client;
-use crate::s3::dns_cache;
-use crate::search::{
+use bucket_scrapper::config::loader::load_config;
+use bucket_scrapper::config::types::{BucketConfig, S3ObjectInfo};
+use bucket_scrapper::s3::client::WrappedS3Client;
+use bucket_scrapper::s3::dns_cache;
+use bucket_scrapper::s3::{StreamingDownloader, StreamingDownloaderConfig};
+use bucket_scrapper::search::{
     HttpResultWriter, HttpWriterConfig, SearchConfig, SharedFileWriter, StreamSearcher,
 };
-use crate::utils::date::date_range_to_date_hour_list;
-use crate::utils::path_formatter::generate_path_formatter;
+use bucket_scrapper::utils::date::date_range_to_date_hour_list;
+use bucket_scrapper::utils::path_formatter::generate_path_formatter;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]

@@ -50,8 +50,8 @@ fn extract_single_format_date_and_prefix(
 /// # Examples
 ///
 /// ```
-/// use log_consolidator_checker_rust::config::types::{BucketConfig, PathSchema};
-/// use log_consolidator_checker_rust::utils::path_formatter::generate_path_formatter;
+/// use bucket_scrapper::config::types::{BucketConfig, PathSchema};
+/// use bucket_scrapper::utils::path_formatter::generate_path_formatter;
 /// use std::collections::HashMap;
 ///
 /// let bucket = BucketConfig {

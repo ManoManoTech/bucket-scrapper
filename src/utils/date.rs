@@ -15,7 +15,7 @@ pub struct DateHour {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::format_date;
+/// use bucket_scrapper::utils::date::format_date;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// assert_eq!(format_date(&date), "20231225");
@@ -30,7 +30,7 @@ pub fn format_date(date: &DateTime<Utc>) -> DateString {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::format_hour;
+/// use bucket_scrapper::utils::date::format_hour;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// assert_eq!(format_hour(&date), "14");
@@ -48,7 +48,7 @@ pub fn format_hour(date: &DateTime<Utc>) -> HourString {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::date_to_date_hour;
+/// use bucket_scrapper::utils::date::date_to_date_hour;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// let date_hour = date_to_date_hour(&date);
@@ -68,7 +68,7 @@ pub fn date_to_date_hour(date: &DateTime<Utc>) -> DateHour {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::date_range_to_date_hour_list;
+/// use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 ///
 /// let start = Utc.with_ymd_and_hms(2023, 12, 25, 14, 0, 0).unwrap();
 /// let end = Utc.with_ymd_and_hms(2023, 12, 25, 16, 0, 0).unwrap();
@@ -116,7 +116,7 @@ pub fn date_range_to_date_hour_list(
 /// # Examples
 ///
 /// ```
-/// use log_consolidator_checker_rust::utils::date::common_date_format;
+/// use bucket_scrapper::utils::date::common_date_format;
 ///
 /// let date = "20231225".to_string();
 /// let hour = "14".to_string();
@@ -131,7 +131,7 @@ pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
 /// # Examples
 ///
 /// ```
-/// use log_consolidator_checker_rust::utils::date::raw_logs_date_format;
+/// use bucket_scrapper::utils::date::raw_logs_date_format;
 ///
 /// let date = "20231225".to_string();
 /// let hour = "14".to_string();
