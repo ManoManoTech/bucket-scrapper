@@ -18,6 +18,7 @@ type PrefixEncoder = ZstdEncoder<'static, File>;
 pub struct SharedFileWriter {
     encoders: Arc<RwLock<HashMap<String, Arc<Mutex<PrefixEncoder>>>>>,
     output_dir: String,
+    compression_level: i32,
     lines_written: Arc<AtomicUsize>,
     bytes_written: Arc<AtomicUsize>,
     files_created: Arc<AtomicUsize>,
@@ -28,6 +29,7 @@ impl Clone for SharedFileWriter {
         Self {
             encoders: Arc::clone(&self.encoders),
             output_dir: self.output_dir.clone(),
+            compression_level: self.compression_level,
             lines_written: Arc::clone(&self.lines_written),
             bytes_written: Arc::clone(&self.bytes_written),
             files_created: Arc::clone(&self.files_created),
@@ -36,11 +38,12 @@ impl Clone for SharedFileWriter {
 }
 
 impl SharedFileWriter {
-    pub fn new(output_dir: String) -> Result<Self> {
+    pub fn new(output_dir: String, compression_level: i32) -> Result<Self> {
         fs::create_dir_all(&output_dir)?;
         Ok(Self {
             encoders: Arc::new(RwLock::new(HashMap::new())),
             output_dir,
+            compression_level,
             lines_written: Arc::new(AtomicUsize::new(0)),
             bytes_written: Arc::new(AtomicUsize::new(0)),
             files_created: Arc::new(AtomicUsize::new(0)),
@@ -87,7 +90,7 @@ impl SharedFileWriter {
 
         let output_file = format!("{}/{}.zst", self.output_dir, prefix);
         let file = File::create(&output_file)?;
-        let encoder = ZstdEncoder::new(file, 3)?;
+        let encoder = ZstdEncoder::new(file, self.compression_level)?;
         let arc = Arc::new(Mutex::new(encoder));
         map.insert(prefix.to_string(), Arc::clone(&arc));
         self.files_created.fetch_add(1, Ordering::Relaxed);

@@ -98,6 +98,10 @@ enum Commands {
         #[arg(long, default_value = "60")]
         client_max_age: u64,
 
+        /// Zstd compression level for file output (1-22, higher = smaller but slower)
+        #[arg(long, default_value = "3")]
+        compression_level: i32,
+
         /// Output format (json, text, or quiet)
         #[arg(long, default_value = "text")]
         output: OutputFormat,
@@ -209,6 +213,7 @@ async fn main() -> Result<()> {
             max_retries,
             retry_delay,
             client_max_age,
+            compression_level,
             output,
             http_output,
             http_url,
@@ -452,7 +457,7 @@ async fn main() -> Result<()> {
                         .and_then(|c| c.output_dir.clone())
                         .unwrap_or_else(|| "./scrapper-output".to_string());
 
-                    let file_writer = SharedFileWriter::new(output_dir.clone())?;
+                    let file_writer = SharedFileWriter::new(output_dir.clone(), compression_level)?;
 
                     let (files, matches) = downloader
                         .search_objects_to_file(
