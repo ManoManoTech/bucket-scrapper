@@ -66,9 +66,19 @@ pub struct HttpResultWriter {
 impl HttpResultWriter {
     /// Create a new HTTP writer with N concurrent upload tasks
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs));
+
+        if let Some(path) = crate::utils::proxy::resolve_ca_bundle_path() {
+            let pem = std::fs::read(&path)
+                .with_context(|| format!("Failed to read CA bundle: {path}"))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("Failed to parse CA certificate: {path}"))?;
+            builder = builder.add_root_certificate(cert);
+            info!(path = %path, "Loaded custom CA bundle for HTTP writer");
+        }
+
+        let client = builder.build()
             .context("Failed to create HTTP client")?;
 
         let (write_tx, write_rx) = flume::bounded::<String>(config.channel_buffer_size);

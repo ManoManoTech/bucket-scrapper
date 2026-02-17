@@ -332,10 +332,10 @@ impl WrappedS3Client {
 fn build_tls_context() -> Result<TlsContext> {
     let mut trust_store = TrustStore::default();
 
-    if let Some(path) = resolve_ca_bundle_path() {
+    if let Some(path) = crate::utils::proxy::resolve_ca_bundle_path() {
         let pem = std::fs::read(&path)
             .with_context(|| format!("Failed to read CA bundle: {path}"))?;
-        info!(path = %path, "Loaded custom CA bundle");
+        info!(path = %path, "Loaded custom CA bundle for S3 client");
         trust_store = trust_store.with_pem_certificate(pem);
     }
 
@@ -343,33 +343,6 @@ fn build_tls_context() -> Result<TlsContext> {
         .with_trust_store(trust_store)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build TLS context: {e}"))
-}
-
-/// Resolve CA bundle: `AWS_CA_BUNDLE` wins, then auto-detect mitmproxy CA when proxy is set.
-fn resolve_ca_bundle_path() -> Option<String> {
-    if let Ok(path) = std::env::var("AWS_CA_BUNDLE") {
-        return Some(path);
-    }
-
-    let has_proxy = std::env::var_os("HTTPS_PROXY").is_some()
-        || std::env::var_os("https_proxy").is_some()
-        || std::env::var_os("HTTP_PROXY").is_some()
-        || std::env::var_os("http_proxy").is_some()
-        || std::env::var_os("ALL_PROXY").is_some()
-        || std::env::var_os("all_proxy").is_some();
-
-    if !has_proxy {
-        return None;
-    }
-
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{home}/.mitmproxy/mitmproxy-ca-cert.pem");
-    if std::path::Path::new(&path).exists() {
-        info!(path = %path, "Auto-detected mitmproxy CA");
-        Some(path)
-    } else {
-        None
-    }
 }
 
 /// Check if an S3 error is recoverable (can be skipped/retried) or fatal (should crash).
