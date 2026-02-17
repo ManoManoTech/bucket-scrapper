@@ -46,8 +46,6 @@ impl SharedFileWriter {
 
     /// Write a single match to the appropriate zstd file.
     /// Called from spawn_blocking search tasks — fully synchronous.
-    /// `#[inline(never)]` gives the profiler a distinct frame for this hot path.
-    #[inline(never)]
     pub fn write_match(&self, prefix: &str, content: &str) -> Result<()> {
         let encoder_arc = self.get_or_create_encoder(prefix)?;
 
@@ -60,7 +58,6 @@ impl SharedFileWriter {
     }
 
     /// Look up the encoder for a prefix, creating one if needed.
-    #[inline(never)]
     fn get_or_create_encoder(&self, prefix: &str) -> Result<Arc<Mutex<PrefixEncoder>>> {
         // Fast path: read-lock to find existing encoder
         {

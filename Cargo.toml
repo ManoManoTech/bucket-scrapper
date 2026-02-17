@@ -64,3 +64,9 @@ panic = "abort"
 strip = false
 incremental = true
 debug = true
+
+# Profiling profile: release optimizations + frame pointers for accurate stack traces.
+# Build with: cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+force-frame-pointers = true
