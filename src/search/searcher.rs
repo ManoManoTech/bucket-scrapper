@@ -9,19 +9,12 @@ use super::result_collector::{SearchCollector, SearchResultCollector};
 
 /// Configuration for the stream searcher
 #[derive(Clone)]
+#[derive(Default)]
 pub struct SearchConfig {
     pub pattern: Option<String>,
     pub ignore_case: bool,
 }
 
-impl Default for SearchConfig {
-    fn default() -> Self {
-        Self {
-            pattern: None,
-            ignore_case: false,
-        }
-    }
-}
 
 /// A searcher that can process streams of data using ripgrep's engine.
 /// When no pattern is provided, all lines are returned without regex overhead.
@@ -40,7 +33,7 @@ impl StreamSearcher {
             Some(
                 matcher_builder
                     .build(pattern)
-                    .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {e}"))?,
             )
         } else {
             None

@@ -189,7 +189,7 @@ impl StreamingDownloader {
         // Wait for all tasks
         for handle in handles {
             if let Err(e) = handle.await {
-                errors.push(format!("Task panic: {}", e));
+                errors.push(format!("Task panic: {e}"));
             }
         }
 
@@ -271,7 +271,7 @@ impl StreamingDownloader {
             .key(&obj.key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {e}"))?;
 
         // Get content length if available
         let content_length = resp.content_length.unwrap_or(0) as usize;
@@ -361,7 +361,7 @@ impl StreamingDownloader {
                 .clone()
                 .acquire_owned()
                 .await
-                .map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
 
             // Drain any completed tasks to free memory
             while let Some(result) = join_set.try_join_next() {
@@ -381,7 +381,7 @@ impl StreamingDownloader {
                         warn!(error = %e, "Task error");
                     }
                     Err(e) => {
-                        errors.push(format!("Task panic: {}", e));
+                        errors.push(format!("Task panic: {e}"));
                         warn!(error = %e, "Task panic");
                     }
                 }
@@ -432,7 +432,7 @@ impl StreamingDownloader {
                     warn!(error = %e, "Task error");
                 }
                 Err(e) => {
-                    errors.push(format!("Task panic: {}", e));
+                    errors.push(format!("Task panic: {e}"));
                     warn!(error = %e, "Task panic");
                 }
             }
@@ -517,7 +517,7 @@ impl StreamingDownloader {
             .key(&obj.key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {e}"))?;
 
         let content_length = resp.content_length.unwrap_or(0) as usize;
         debug!(

@@ -50,7 +50,7 @@ impl SearchResultCollector {
 
     /// Add a match from a specific file
     pub fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) {
-        let file_key = format!("{}/{}", bucket, key);
+        let file_key = format!("{bucket}/{key}");
 
         self.matches.push(SearchMatch {
             bucket: bucket.to_string(),
@@ -79,7 +79,7 @@ impl SearchResultCollector {
             let prefix = extract_date_hour_prefix(&match_item.key);
             matches_by_prefix
                 .entry(prefix)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(match_item.clone());
         }
 
@@ -117,7 +117,7 @@ impl SearchResultCollector {
 
 impl SearchCollector for SearchResultCollector {
     fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> bool {
-        let file_key = format!("{}/{}", bucket, key);
+        let file_key = format!("{bucket}/{key}");
 
         self.matches.push(SearchMatch {
             bucket: bucket.to_string(),
@@ -155,7 +155,7 @@ fn extract_date_hour_prefix(key: &str) -> String {
         // Fallback: use the directory structure
         let parts: Vec<&str> = key.split('/').collect();
         if parts.len() >= 2 {
-            format!("{}", parts[..parts.len() - 1].join("_"))
+            parts[..parts.len() - 1].join("_").to_string()
         } else {
             "unknown".to_string()
         }

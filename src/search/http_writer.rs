@@ -230,9 +230,7 @@ impl HttpResultWriter {
                         return Ok(count);
                     } else {
                         last_error = Some(anyhow::anyhow!(
-                            "HTTP {} from API: {}",
-                            status,
-                            response_body
+                            "HTTP {status} from API: {response_body}"
                         ));
 
                         // Don't retry on 4xx errors (client errors)
@@ -242,7 +240,7 @@ impl HttpResultWriter {
                     }
                 }
                 Err(e) => {
-                    last_error = Some(anyhow::anyhow!("HTTP request failed: {}", e));
+                    last_error = Some(anyhow::anyhow!("HTTP request failed: {e}"));
                 }
             }
         }
@@ -255,7 +253,7 @@ impl HttpResultWriter {
         self.write_tx
             .send(match_item)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to send match for HTTP writing: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to send match for HTTP writing: {e}"))
     }
 
     /// Finish writing and return the number of lines sent

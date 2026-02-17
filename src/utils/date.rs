@@ -97,7 +97,7 @@ pub fn date_range_to_date_hour_list(
 
     while current_date <= *end {
         date_hour_list.push(date_to_date_hour(&current_date));
-        current_date = current_date + Duration::hours(1);
+        current_date += Duration::hours(1);
     }
 
     if date_hour_list.is_empty() {
@@ -123,7 +123,7 @@ pub fn date_range_to_date_hour_list(
 /// assert_eq!(common_date_format(&date, &hour), "dt=20231225/hour=14");
 /// ```
 pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
-    format!("dt={}/hour={}", date, hour)
+    format!("dt={date}/hour={hour}")
 }
 
 /// Formats date and hour as YYYY/MM/DD/HH
@@ -144,8 +144,7 @@ pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
 pub fn raw_logs_date_format(date: &DateString, hour: &HourString) -> Result<String> {
     if date.len() != 8 {
         return Err(anyhow::anyhow!(
-            "Invalid date: {}. Should be YYYYMMDD, 8 characters.",
-            date
+            "Invalid date: {date}. Should be YYYYMMDD, 8 characters."
         ));
     }
 

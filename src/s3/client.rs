@@ -240,8 +240,8 @@ impl WrappedS3Client {
             .send()
             .await
             .map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
+                let err_msg = format!("{e:#}"); // Use alternate format for full error chain
+                let err_debug = format!("{e:?}"); // Debug format for maximum details
 
                 // Log detailed error information for debugging
                 warn!(
@@ -254,16 +254,12 @@ impl WrappedS3Client {
 
                 if err_msg.contains("dispatch failure") {
                     anyhow::anyhow!(
-                        "S3 download failed: {}. This often indicates expired AWS credentials. \
-                         Try running 'aws sso login' or check your AWS_* environment variables.",
-                        err_msg
+                        "S3 download failed: {err_msg}. This often indicates expired AWS credentials. \
+                         Try running 'aws sso login' or check your AWS_* environment variables."
                     )
                 } else {
                     anyhow::anyhow!(
-                        "S3 get_object from bucket '{}' key '{}' failed: {}",
-                        bucket,
-                        key,
-                        err_msg
+                        "S3 get_object from bucket '{bucket}' key '{key}' failed: {err_msg}"
                     )
                 }
             })?;
@@ -308,8 +304,8 @@ impl WrappedS3Client {
             .send()
             .await
             .map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
+                let err_msg = format!("{e:#}"); // Use alternate format for full error chain
+                let err_debug = format!("{e:?}"); // Debug format for maximum details
 
                 // Log detailed error information for debugging
                 warn!(
@@ -321,10 +317,7 @@ impl WrappedS3Client {
                 );
 
                 anyhow::anyhow!(
-                    "S3 put_object to bucket '{}' key '{}' failed: {}",
-                    bucket,
-                    key,
-                    err_msg
+                    "S3 put_object to bucket '{bucket}' key '{key}' failed: {err_msg}"
                 )
             })?;
 
@@ -341,7 +334,7 @@ fn build_tls_context() -> Result<TlsContext> {
 
     if let Some(path) = resolve_ca_bundle_path() {
         let pem = std::fs::read(&path)
-            .with_context(|| format!("Failed to read CA bundle: {}", path))?;
+            .with_context(|| format!("Failed to read CA bundle: {path}"))?;
         info!(path = %path, "Loaded custom CA bundle");
         trust_store = trust_store.with_pem_certificate(pem);
     }
@@ -349,7 +342,7 @@ fn build_tls_context() -> Result<TlsContext> {
     TlsContext::builder()
         .with_trust_store(trust_store)
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build TLS context: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to build TLS context: {e}"))
 }
 
 /// Resolve CA bundle: `AWS_CA_BUNDLE` wins, then auto-detect mitmproxy CA when proxy is set.
@@ -370,7 +363,7 @@ fn resolve_ca_bundle_path() -> Option<String> {
     }
 
     let home = std::env::var("HOME").ok()?;
-    let path = format!("{}/.mitmproxy/mitmproxy-ca-cert.pem", home);
+    let path = format!("{home}/.mitmproxy/mitmproxy-ca-cert.pem");
     if std::path::Path::new(&path).exists() {
         info!(path = %path, "Auto-detected mitmproxy CA");
         Some(path)

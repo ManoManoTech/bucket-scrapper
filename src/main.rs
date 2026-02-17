@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
 
                         join_set.spawn(async move {
                             let _permit = sem.acquire().await
-                                .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
+                                .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
                             debug!(bucket = %bucket, prefix = %prefix, "Listing");
                             let result = client
@@ -368,7 +368,7 @@ async fn main() -> Result<()> {
                             errors.push(e.to_string());
                         }
                         Err(e) => {
-                            errors.push(format!("task panicked: {}", e));
+                            errors.push(format!("task panicked: {e}"));
                         }
                     }
 

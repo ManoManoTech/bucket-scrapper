@@ -6,10 +6,10 @@ use anyhow::Result;
 use regex::Regex;
 use tracing::warn;
 
+type PathFormatter = Box<dyn Fn(&DateString, &HourString) -> Result<String> + Send + Sync>;
+
 /// Extracts a formatter function for a date format string
-fn extract_single_format_date_and_prefix(
-    prefix: String,
-) -> Box<dyn Fn(&DateString, &HourString) -> Result<String> + Send + Sync> {
+fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
     if prefix.contains("dt=") && (prefix.contains("/hour=") || prefix.contains("/h=")) {
         let use_hour_format = prefix.contains("/hour=");
         let regex = if use_hour_format {
@@ -19,21 +19,21 @@ fn extract_single_format_date_and_prefix(
         };
         let key_prefix = regex.replace_all(&prefix, "").to_string();
 
-        return Box::new(move |date: &DateString, hour: &HourString| {
+        Box::new(move |date: &DateString, hour: &HourString| {
             if use_hour_format {
                 Ok(format!("{}{}", key_prefix, common_date_format(date, hour)))
             } else {
                 // Use h= format instead of hour=
-                Ok(format!("{}dt={}/h={}", key_prefix, date, hour))
+                Ok(format!("{key_prefix}dt={date}/h={hour}"))
             }
-        });
+        })
     } else if prefix.contains("2006/01/02/15") {
         let regex = Regex::new(r"2006\/01\/02\/15").unwrap();
         let key_prefix = regex.replace_all(&prefix, "").to_string();
 
         return Box::new(move |date: &DateString, hour: &HourString| {
             let formatted = raw_logs_date_format(date, hour)?;
-            Ok(format!("{}{}", key_prefix, formatted))
+            Ok(format!("{key_prefix}{formatted}"))
         });
     } else {
         warn!(prefix = %prefix, "No date formatter found for prefix");
@@ -68,9 +68,7 @@ fn extract_single_format_date_and_prefix(
 /// let result = formatter(&"20231225".to_string(), &"14".to_string()).unwrap();
 /// assert_eq!(result, "logs/dt=20231225/hour=14");
 /// ```
-pub fn generate_path_formatter(
-    bucket: &BucketConfig,
-) -> Box<dyn Fn(&DateString, &HourString) -> Result<String> + Send + Sync> {
+pub fn generate_path_formatter(bucket: &BucketConfig) -> PathFormatter {
     let path_components = bucket.path.clone();
 
     Box::new(

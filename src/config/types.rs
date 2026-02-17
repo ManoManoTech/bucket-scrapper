@@ -58,6 +58,7 @@ fn default_timeout_secs() -> u64 {
 
 /// Simplified config schema for bucket scrapper
 #[derive(Debug, Deserialize, Clone)]
+#[derive(Default)]
 pub struct ConfigSchema {
     /// List of buckets to search
     #[serde(default)]
@@ -80,17 +81,6 @@ pub struct ConfigSchema {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-impl Default for ConfigSchema {
-    fn default() -> Self {
-        Self {
-            buckets: Vec::new(),
-            region: None,
-            output_dir: None,
-            http_output: None,
-            extra: HashMap::new(),
-        }
-    }
-}
 
 /// Information about an S3 object
 #[derive(Debug, Clone, Serialize)]
