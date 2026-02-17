@@ -1,4 +1,5 @@
 // src/search/result_collector.rs
+use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,8 +7,8 @@ use std::collections::HashMap;
 /// Trait for collecting search results
 /// Implemented by both SearchResultCollector (file output) and HttpStreamingCollector (HTTP output)
 pub trait SearchCollector {
-    /// Add a match. Returns false if the consumer is gone (channel closed) and searching should stop.
-    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> bool;
+    /// Add a match. Returns Err if writing failed and searching must stop.
+    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> Result<()>;
     fn mark_file_searched(&mut self);
     fn match_count(&self) -> usize;
 }
@@ -116,7 +117,7 @@ impl SearchResultCollector {
 }
 
 impl SearchCollector for SearchResultCollector {
-    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> bool {
+    fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> Result<()> {
         let file_key = format!("{bucket}/{key}");
 
         self.matches.push(SearchMatch {
@@ -127,7 +128,7 @@ impl SearchCollector for SearchResultCollector {
         });
 
         *self.file_counts.entry(file_key).or_insert(0) += 1;
-        true
+        Ok(())
     }
 
     fn mark_file_searched(&mut self) {

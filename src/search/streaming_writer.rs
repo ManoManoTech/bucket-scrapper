@@ -89,6 +89,9 @@ impl SharedFileWriter {
         }
 
         let output_file = format!("{}/{}.zst", self.output_dir, prefix);
+        if let Some(parent) = std::path::Path::new(&output_file).parent() {
+            fs::create_dir_all(parent)?;
+        }
         let file = File::create(&output_file)?;
         let encoder = ZstdEncoder::new(file, self.compression_level)?;
         let arc = Arc::new(Mutex::new(encoder));

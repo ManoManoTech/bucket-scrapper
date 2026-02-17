@@ -346,11 +346,37 @@ impl StreamingDownloader {
 
         let mut total_matches = 0usize;
         let mut files_searched = 0usize;
-        let mut errors = Vec::new();
         let mut spawned = 0usize;
 
         // Use JoinSet to drain completed tasks as we go
         let mut join_set: tokio::task::JoinSet<Result<(usize, usize)>> = tokio::task::JoinSet::new();
+
+        // Helper: drain completed tasks, abort on first error
+        macro_rules! drain_completed {
+            ($join_set:expr, $progress:expr, $files_searched:expr, $total_matches:expr) => {
+                while let Some(result) = $join_set.try_join_next() {
+                    match result {
+                        Ok(Ok((bytes, matches))) => {
+                            $files_searched += 1;
+                            $total_matches += matches;
+                            let mut prog = $progress.lock().await;
+                            prog.update(bytes, matches);
+                            if prog.should_report() {
+                                prog.report();
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            $join_set.abort_all();
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            $join_set.abort_all();
+                            return Err(anyhow::anyhow!("Task panic: {e}"));
+                        }
+                    }
+                }
+            };
+        }
 
         for obj in objects {
             // Acquire semaphore BEFORE spawn — this is the key to lazy spawning.
@@ -364,28 +390,7 @@ impl StreamingDownloader {
                 .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
 
             // Drain any completed tasks to free memory
-            while let Some(result) = join_set.try_join_next() {
-                match result {
-                    Ok(Ok((bytes, matches))) => {
-                        files_searched += 1;
-                        total_matches += matches;
-                        let mut prog = progress.lock().await;
-                        prog.update(bytes, matches);
-                        if prog.should_report() {
-                            prog.report();
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        files_searched += 1;
-                        errors.push(e.to_string());
-                        warn!(error = %e, "Task error");
-                    }
-                    Err(e) => {
-                        errors.push(format!("Task panic: {e}"));
-                        warn!(error = %e, "Task panic");
-                    }
-                }
-            }
+            drain_completed!(join_set, progress, files_searched, total_matches);
 
             let obj_clone = obj.clone();
             let client = self.client.clone();
@@ -427,23 +432,14 @@ impl StreamingDownloader {
                     }
                 }
                 Ok(Err(e)) => {
-                    files_searched += 1;
-                    errors.push(e.to_string());
-                    warn!(error = %e, "Task error");
+                    join_set.abort_all();
+                    return Err(e);
                 }
                 Err(e) => {
-                    errors.push(format!("Task panic: {e}"));
-                    warn!(error = %e, "Task panic");
+                    join_set.abort_all();
+                    return Err(anyhow::anyhow!("Task panic: {e}"));
                 }
             }
-        }
-
-        if !errors.is_empty() {
-            return Err(anyhow::anyhow!(
-                "{} downloads failed: {}",
-                errors.len(),
-                errors.first().unwrap_or(&"unknown".to_string())
-            ));
         }
 
         Ok((files_searched, total_matches))

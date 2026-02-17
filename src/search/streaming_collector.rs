@@ -1,7 +1,7 @@
 // src/search/streaming_collector.rs
 use super::result_collector::SearchCollector;
 use super::streaming_writer::SharedFileWriter;
-use tracing::warn;
+use anyhow::Result;
 
 /// A sync SearchCollector that writes matches directly to SharedFileWriter.
 /// Used inside spawn_blocking grep context — writes go straight to per-prefix
@@ -25,20 +25,10 @@ impl DirectFileCollector {
 }
 
 impl SearchCollector for DirectFileCollector {
-    fn add_match(&mut self, _bucket: &str, _key: &str, _line_number: u64, line: &str) -> bool {
+    fn add_match(&mut self, _bucket: &str, _key: &str, _line_number: u64, line: &str) -> Result<()> {
+        self.writer.write_match(&self.prefix, line)?;
         self.match_count += 1;
-
-        match self.writer.write_match(&self.prefix, line) {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    matches_written = self.match_count,
-                    error = %e,
-                    "Failed to write match, stopping search"
-                );
-                false
-            }
-        }
+        Ok(())
     }
 
     fn mark_file_searched(&mut self) {

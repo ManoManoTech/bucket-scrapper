@@ -296,20 +296,21 @@ impl HttpStreamingCollector {
 }
 
 impl SearchCollector for HttpStreamingCollector {
-    fn add_match(&mut self, bucket: &str, key: &str, _line_number: u64, line: &str) -> bool {
-        self.match_count += 1;
-
+    fn add_match(&mut self, bucket: &str, key: &str, _line_number: u64, line: &str) -> Result<()> {
         // Try to send - use try_send to avoid blocking in sync context
         // If channel is full, we'll drop this match (backpressure)
-        // Returns false if channel is closed (receiver dropped)
         match self.sender.try_send(HttpMatchToSend {
             bucket: bucket.to_string(),
             key: key.to_string(),
             content: line.to_string(),
         }) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => true, // channel full but still alive
-            Err(mpsc::error::TrySendError::Closed(_)) => false, // consumer gone
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                self.match_count += 1;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow::anyhow!("HTTP consumer gone, channel closed"))
+            }
         }
     }
 
