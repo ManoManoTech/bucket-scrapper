@@ -1,6 +1,6 @@
 // src/s3/client.rs
 // Location: src/s3/client.rs
-use crate::config::types::{extract_prefix, S3ObjectInfo};
+use crate::config::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use anyhow::{Context, Result};
 use aws_config::retry::RetryConfig;
@@ -163,7 +163,6 @@ impl WrappedS3Client {
                     if let (Some(key), Some(size), Some(last_modified)) =
                         (obj.key, obj.size, obj.last_modified)
                     {
-                        let prefix = extract_prefix(&key);
                         let obj_info = S3ObjectInfo {
                             bucket: bucket.to_string(),
                             key,
@@ -171,7 +170,7 @@ impl WrappedS3Client {
                             last_modified: chrono::DateTime::from_timestamp_nanos(
                                 last_modified.as_nanos() as i64,
                             ),
-                            prefix,
+                            prefix: prefix.to_string(),
                         };
 
                         // Apply regex filter if provided

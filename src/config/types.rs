@@ -103,34 +103,6 @@ pub struct S3ObjectInfo {
     pub prefix: String,
 }
 
-/// Extract date/hour prefix from an S3 key for output file grouping.
-///
-/// Looks for `dt=YYYYMMDD/hour=HH`; falls back to directory structure.
-pub(crate) fn extract_prefix(key: &str) -> String {
-    if let Some(dt_pos) = key.find("dt=") {
-        if let Some(hour_pos) = key.find("hour=") {
-            if dt_pos < hour_pos {
-                let dt_start = dt_pos + 3;
-                let dt_end = dt_start + 8; // YYYYMMDD
-                let hour_start = hour_pos + 5;
-                let hour_end = hour_start + 2; // HH
-
-                if dt_end <= key.len() && hour_end <= key.len() {
-                    let date = &key[dt_start..dt_end];
-                    let hour = &key[hour_start..hour_end];
-                    return format!("{}H{}", date, hour);
-                }
-            }
-        }
-    }
-
-    let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() >= 2 {
-        parts[..parts.len() - 1].join("_")
-    } else {
-        "unknown".to_string()
-    }
-}
 
 // Type aliases for date/hour strings
 pub type DateString = String; // YYYYMMDD format
