@@ -46,41 +46,51 @@ impl SharedFileWriter {
 
     /// Write a single match to the appropriate zstd file.
     /// Called from spawn_blocking search tasks — fully synchronous.
+    /// `#[inline(never)]` gives the profiler a distinct frame for this hot path.
+    #[inline(never)]
     pub fn write_match(&self, prefix: &str, content: &str) -> Result<()> {
-        // Fast path: read-lock to find existing encoder
-        let encoder_arc = {
-            let map = self.encoders.read().unwrap_or_else(|e| e.into_inner());
-            map.get(prefix).cloned()
-        };
+        let encoder_arc = self.get_or_create_encoder(prefix)?;
 
-        let encoder_arc = match encoder_arc {
-            Some(arc) => arc,
-            None => {
-                // Slow path: write-lock to insert new encoder
-                let mut map = self.encoders.write().unwrap_or_else(|e| e.into_inner());
-                // Double-check after acquiring write lock
-                if let Some(arc) = map.get(prefix) {
-                    arc.clone()
-                } else {
-                    let output_file = format!("{}/{}.zst", self.output_dir, prefix);
-                    let file = File::create(&output_file)?;
-                    let encoder = ZstdEncoder::new(file, 3)?;
-                    let arc = Arc::new(Mutex::new(encoder));
-                    map.insert(prefix.to_string(), Arc::clone(&arc));
-                    self.files_created.fetch_add(1, Ordering::Relaxed);
-                    arc
-                }
-            }
-        };
-
-        // Lock only this prefix's encoder
         let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
-
         encoder.write_all(content.as_bytes())?;
 
         self.matches_written.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Look up the encoder for a prefix, creating one if needed.
+    #[inline(never)]
+    fn get_or_create_encoder(&self, prefix: &str) -> Result<Arc<Mutex<PrefixEncoder>>> {
+        // Fast path: read-lock to find existing encoder
+        {
+            let map = self.encoders.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(arc) = map.get(prefix) {
+                return Ok(arc.clone());
+            }
+        }
+
+        // Slow path
+        self.create_encoder(prefix)
+    }
+
+    /// Create a new zstd encoder for a prefix.
+    /// Cold path: write-locks the map, creates the output file and encoder.
+    #[cold]
+    fn create_encoder(&self, prefix: &str) -> Result<Arc<Mutex<PrefixEncoder>>> {
+        let mut map = self.encoders.write().unwrap_or_else(|e| e.into_inner());
+        // Double-check after acquiring write lock
+        if let Some(arc) = map.get(prefix) {
+            return Ok(arc.clone());
+        }
+
+        let output_file = format!("{}/{}.zst", self.output_dir, prefix);
+        let file = File::create(&output_file)?;
+        let encoder = ZstdEncoder::new(file, 3)?;
+        let arc = Arc::new(Mutex::new(encoder));
+        map.insert(prefix.to_string(), Arc::clone(&arc));
+        self.files_created.fetch_add(1, Ordering::Relaxed);
+        Ok(arc)
     }
 
     /// Finalize all encoders. Must be called after all search tasks have completed.
