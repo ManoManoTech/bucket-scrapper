@@ -102,10 +102,6 @@ enum Commands {
         #[arg(long, default_value = "3")]
         compression_level: i32,
 
-        /// Output format (json, text, or quiet)
-        #[arg(long, default_value = "text")]
-        output: OutputFormat,
-
         /// Send results to HTTP API instead of writing to files
         #[arg(long)]
         http_output: bool,
@@ -134,13 +130,6 @@ enum Commands {
         #[arg(long, env = "HTTP_SERVICE", default_value = "bucket-scrapper")]
         http_service: String,
     },
-}
-
-#[derive(Clone, Debug, clap::ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
-    Quiet,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -214,7 +203,6 @@ async fn main() -> Result<()> {
             retry_delay,
             client_max_age,
             compression_level,
-            output,
             http_output,
             http_url,
             http_api_key,
@@ -319,10 +307,6 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-
-            // Track stats for both modes
-            let mut total_files_searched = 0usize;
-            let mut total_matches = 0usize;
 
             // List all objects in parallel across all buckets × hourly prefixes
             let all_bucket_objects = {
@@ -433,25 +417,35 @@ async fn main() -> Result<()> {
             if all_bucket_objects.is_empty() {
                 info!("No objects found to search");
             } else {
-                let total_size: usize = all_bucket_objects.iter().map(|o| o.size).sum();
+                let total_compressed_input: usize = all_bucket_objects.iter().map(|o| o.size).sum();
                 info!(
                     objects = all_bucket_objects.len(),
-                    mb = total_size / 1_000_000,
+                    mb = total_compressed_input / 1_000_000,
                     "Processing objects"
                 );
 
                 let batch_start = std::time::Instant::now();
 
-                if let Some(ref http_writer) = http_streaming {
-                    // HTTP streaming mode - stream results directly to API
+                if let Some(http_writer) = http_streaming {
                     let http_sender = http_writer.get_sender();
-                    let (files, matches) = downloader
+                    let (files_searched, matched_lines) = downloader
                         .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender)
                         .await?;
-                    total_files_searched = files;
-                    total_matches = matches;
+
+                    let api_url = http_writer.url().to_string();
+                    let lines_sent = http_writer.finish().await?;
+
+                    let elapsed = batch_start.elapsed().as_secs_f64();
+                    info!(
+                        elapsed_s = elapsed,
+                        files = files_searched,
+                        matched_lines = matched_lines,
+                        lines_sent = lines_sent,
+                        pattern = line_pattern_regex.as_deref().unwrap_or("(all lines)"),
+                        url = %api_url,
+                        "Search completed"
+                    );
                 } else {
-                    // File output mode - direct writes to per-prefix gzip encoders
                     let output_dir = config
                         .as_ref()
                         .and_then(|c| c.output_dir.clone())
@@ -459,87 +453,33 @@ async fn main() -> Result<()> {
 
                     let file_writer = SharedFileWriter::new(output_dir.clone(), compression_level)?;
 
-                    let (files, matches) = downloader
+                    let (files_searched, matched_lines) = downloader
                         .search_objects_to_file(
                             &all_bucket_objects,
                             searcher.clone(),
                             file_writer.clone(),
                         )
                         .await?;
-                    total_files_searched = files;
-                    total_matches = matches;
 
-                    // Finish writer — flushes and finalizes all gzip files
-                    let files_written = file_writer.finish()?;
+                    let stats = file_writer.finish()?;
+                    let elapsed = batch_start.elapsed().as_secs_f64();
+                    let plaintext_mb = stats.plaintext_bytes as f64 / 1_000_000.0;
+                    let compressed_mb = stats.compressed_bytes as f64 / 1_000_000.0;
+
                     info!(
-                        files = files_written,
+                        elapsed_s = elapsed,
+                        files = files_searched,
+                        matched_lines = matched_lines,
+                        output_files = stats.files_written,
+                        plaintext_mb = plaintext_mb,
+                        compressed_mb = compressed_mb,
+                        plaintext_mbps = plaintext_mb / elapsed,
+                        compressed_mbps = compressed_mb / elapsed,
+                        compression_ratio = if compressed_mb > 0.0 { plaintext_mb / compressed_mb } else { 0.0 },
+                        pattern = line_pattern_regex.as_deref().unwrap_or("(all lines)"),
                         output_dir = %output_dir,
-                        "File output complete"
+                        "Search completed"
                     );
-                }
-
-                info!(
-                    elapsed_s = batch_start.elapsed().as_secs_f32(),
-                    "Search completed"
-                );
-            }
-
-            // Determine output mode and finalize
-            let (output_count, output_destination) = if let Some(http_writer) = http_streaming {
-                // Finish HTTP writer and get final count
-                let api_url = http_writer.url().to_string();
-                let lines_sent = http_writer.finish().await?;
-                info!(lines = lines_sent, url = %api_url, "HTTP streaming complete");
-
-                (lines_sent, api_url)
-            } else {
-                // File output mode - results already written by file_writer_task
-                let output_dir = config
-                    .as_ref()
-                    .and_then(|c| c.output_dir.clone())
-                    .unwrap_or_else(|| "./scrapper-output".to_string());
-
-                (total_matches, output_dir)
-            };
-
-            // Print summary
-            let pattern_display = line_pattern_regex
-                .as_deref()
-                .unwrap_or("(all lines)");
-
-            match output {
-                OutputFormat::Json => {
-                    let summary = if http_output {
-                        serde_json::json!({
-                            "pattern": pattern_display,
-                            "files_searched": total_files_searched,
-                            "total_matches": total_matches,
-                            "lines_sent": output_count,
-                            "http_url": output_destination
-                        })
-                    } else {
-                        serde_json::json!({
-                            "pattern": pattern_display,
-                            "files_searched": total_files_searched,
-                            "total_matches": total_matches,
-                            "output_files_written": output_count,
-                            "output_directory": output_destination
-                        })
-                    };
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                }
-                OutputFormat::Text | OutputFormat::Quiet => {
-                    println!("\n=== Search Complete ===");
-                    println!("Pattern: {}", pattern_display);
-                    println!("Files searched: {}", total_files_searched);
-                    println!("Total matches: {}", total_matches);
-                    if http_output {
-                        println!("Lines sent: {}", output_count);
-                        println!("HTTP URL: {}", output_destination);
-                    } else {
-                        println!("Output files written: {}", output_count);
-                        println!("Output directory: {}", output_destination);
-                    }
                 }
             }
         }

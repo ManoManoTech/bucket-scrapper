@@ -9,4 +9,4 @@ pub use http_writer::{HttpMatchToSend, HttpResultWriter, HttpStreamingCollector,
 pub use result_collector::{SearchCollector, SearchResult, SearchResultCollector};
 pub use searcher::{SearchConfig, StreamSearcher};
 pub use streaming_collector::DirectFileCollector;
-pub use streaming_writer::SharedFileWriter;
+pub use streaming_writer::{FileWriterStats, SharedFileWriter};

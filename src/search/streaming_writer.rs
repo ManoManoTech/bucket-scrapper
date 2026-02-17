@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::warn;
 use zstd::Encoder as ZstdEncoder;
 
 type PrefixEncoder = ZstdEncoder<'static, File>;
@@ -98,12 +98,9 @@ impl SharedFileWriter {
     }
 
     /// Finalize all encoders. Must be called after all search tasks have completed.
-    /// Returns the number of files written.
-    pub fn finish(self) -> Result<usize> {
+    pub fn finish(self) -> Result<FileWriterStats> {
         let rwlock = Arc::try_unwrap(self.encoders)
             .unwrap_or_else(|arc| {
-                // Fallback: shouldn't happen if called after all tasks complete.
-                // Clone the inner map into a fresh RwLock.
                 let guard = arc.read().unwrap_or_else(|e| e.into_inner());
                 RwLock::new(guard.clone())
             });
@@ -134,20 +131,19 @@ impl SharedFileWriter {
             }
         }
 
-        let total_lines = self.lines_written.load(Ordering::Relaxed);
-        let plaintext_bytes = self.bytes_written.load(Ordering::Relaxed) as f64;
-        let compressed = compressed_bytes as f64;
-        let ratio = if compressed > 0.0 { plaintext_bytes / compressed } else { 0.0 };
-        info!(
-            lines = total_lines,
-            files = files_written,
-            plaintext_mb = plaintext_bytes / 1_000_000.0,
-            compressed_mb = compressed / 1_000_000.0,
-            compression_ratio = ratio,
-            "File output summary"
-        );
-
-        Ok(files_written)
+        Ok(FileWriterStats {
+            files_written,
+            lines_written: self.lines_written.load(Ordering::Relaxed),
+            plaintext_bytes: self.bytes_written.load(Ordering::Relaxed) as u64,
+            compressed_bytes,
+        })
     }
+}
+
+pub struct FileWriterStats {
+    pub files_written: usize,
+    pub lines_written: usize,
+    pub plaintext_bytes: u64,
+    pub compressed_bytes: u64,
 }
 
