@@ -315,10 +315,6 @@ impl SearchCollector for HttpStreamingCollector {
         }
     }
 
-    fn add_count(&mut self, _bucket: &str, _key: &str, _count: u64) {
-        // Count-only mode doesn't send to HTTP
-    }
-
     fn mark_file_searched(&mut self) {
         self.files_searched += 1;
     }

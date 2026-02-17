@@ -8,7 +8,6 @@ use std::collections::HashMap;
 pub trait SearchCollector {
     /// Add a match. Returns false if the consumer is gone (channel closed) and searching should stop.
     fn add_match(&mut self, bucket: &str, key: &str, line_number: u64, line: &str) -> bool;
-    fn add_count(&mut self, bucket: &str, key: &str, count: u64);
     fn mark_file_searched(&mut self);
     fn match_count(&self) -> usize;
 }
@@ -61,14 +60,6 @@ impl SearchResultCollector {
         });
 
         *self.file_counts.entry(file_key).or_insert(0) += 1;
-    }
-
-    /// Add just a count for a file (when in count-only mode)
-    pub fn add_count(&mut self, bucket: &str, key: &str, count: u64) {
-        if count > 0 {
-            let file_key = format!("{}/{}", bucket, key);
-            self.file_counts.insert(file_key, count);
-        }
     }
 
     /// Mark that a file was searched (even if no matches found)
@@ -137,13 +128,6 @@ impl SearchCollector for SearchResultCollector {
 
         *self.file_counts.entry(file_key).or_insert(0) += 1;
         true
-    }
-
-    fn add_count(&mut self, bucket: &str, key: &str, count: u64) {
-        if count > 0 {
-            let file_key = format!("{}/{}", bucket, key);
-            self.file_counts.insert(file_key, count);
-        }
     }
 
     fn mark_file_searched(&mut self) {

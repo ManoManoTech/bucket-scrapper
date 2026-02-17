@@ -74,10 +74,6 @@ enum Commands {
         #[arg(short, long)]
         ignore_case: bool,
 
-        /// Only show match counts per file
-        #[arg(short = 'c', long)]
-        count: bool,
-
         /// Maximum parallel downloads
         #[arg(long, default_value = "32")]
         max_parallel: usize,
@@ -207,7 +203,6 @@ async fn main() -> Result<()> {
             end,
             context: _,
             ignore_case,
-            count,
             max_parallel,
             buffer_size_kb,
             channel_buffer,
@@ -241,7 +236,6 @@ async fn main() -> Result<()> {
             let search_config = SearchConfig {
                 pattern: line_pattern_regex.clone(),
                 ignore_case,
-                count_only: count,
             };
 
             // Get buckets from config

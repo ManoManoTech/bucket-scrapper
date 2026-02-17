@@ -7,7 +7,6 @@ fn test_regex_matcher_cached() {
     let config = SearchConfig {
         pattern: Some("ERROR".to_string()),
         ignore_case: false,
-        count_only: false,
     };
 
     let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
@@ -45,7 +44,6 @@ fn test_no_line_numbers() {
     let config = SearchConfig {
         pattern: Some("test".to_string()),
         ignore_case: true,
-        count_only: false,
     };
 
     let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
@@ -59,43 +57,7 @@ fn test_no_line_numbers() {
 
     let result = collector.into_result();
 
-    // We don't care about line numbers anymore - they're kept for API compatibility
-    // but we're not using context lines which was the main performance issue
-
     assert_eq!(result.total_matches, 2, "Should find 2 matches");
-}
-
-#[test]
-fn test_count_only_mode() {
-    // Create searcher in count-only mode
-    let config = SearchConfig {
-        pattern: Some("\\d+".to_string()), // Match numbers
-        ignore_case: false,
-        count_only: true,
-    };
-
-    let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
-
-    let test_data = b"123 errors\n456 warnings\n789 info messages";
-    let mut collector = SearchResultCollector::new();
-
-    searcher
-        .search_stream("bucket", "key", Cursor::new(test_data), &mut collector)
-        .expect("Failed to search");
-
-    let result = collector.into_result();
-
-    // In count-only mode, we don't store actual matches
-    assert_eq!(
-        result.matches.len(),
-        0,
-        "Should not store matches in count-only mode"
-    );
-    assert_eq!(
-        result.file_counts.get("bucket/key"),
-        Some(&3),
-        "Should count 3 matches"
-    );
 }
 
 #[test]
@@ -104,7 +66,6 @@ fn test_all_lines_mode() {
     let config = SearchConfig {
         pattern: None,
         ignore_case: false,
-        count_only: false,
     };
 
     let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
@@ -120,36 +81,4 @@ fn test_all_lines_mode() {
 
     assert_eq!(result.total_matches, 3, "Should yield all 3 lines");
     assert_eq!(result.matches.len(), 3, "Should store all 3 matches");
-}
-
-#[test]
-fn test_all_lines_count_only() {
-    // No pattern + count_only = count all lines
-    let config = SearchConfig {
-        pattern: None,
-        ignore_case: false,
-        count_only: true,
-    };
-
-    let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
-
-    let test_data = b"Line 1\nLine 2\nLine 3";
-    let mut collector = SearchResultCollector::new();
-
-    searcher
-        .search_stream("bucket", "key", Cursor::new(test_data), &mut collector)
-        .expect("Failed to search");
-
-    let result = collector.into_result();
-
-    assert_eq!(
-        result.matches.len(),
-        0,
-        "Should not store matches in count-only mode"
-    );
-    assert_eq!(
-        result.file_counts.get("bucket/key"),
-        Some(&3),
-        "Should count 3 lines"
-    );
 }

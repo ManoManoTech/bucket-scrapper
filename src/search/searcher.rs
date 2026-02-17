@@ -12,7 +12,6 @@ use super::result_collector::{SearchCollector, SearchResultCollector};
 pub struct SearchConfig {
     pub pattern: Option<String>,
     pub ignore_case: bool,
-    pub count_only: bool,
 }
 
 impl Default for SearchConfig {
@@ -20,7 +19,6 @@ impl Default for SearchConfig {
         Self {
             pattern: None,
             ignore_case: false,
-            count_only: false,
         }
     }
 }
@@ -28,7 +26,6 @@ impl Default for SearchConfig {
 /// A searcher that can process streams of data using ripgrep's engine.
 /// When no pattern is provided, all lines are returned without regex overhead.
 pub struct StreamSearcher {
-    config: SearchConfig,
     matcher: Option<RegexMatcher>,
 }
 
@@ -49,7 +46,7 @@ impl StreamSearcher {
             None
         };
 
-        Ok(Self { config, matcher })
+        Ok(Self { matcher })
     }
 
     /// Search through a readable stream and collect results using any SearchCollector.
@@ -85,37 +82,20 @@ impl StreamSearcher {
 
         let mut searcher = searcher_builder.build();
 
-        if self.config.count_only {
-            let mut count = 0u64;
-            searcher.search_reader(
-                matcher,
-                &mut reader,
-                grep_searcher::sinks::UTF8(|_line_num, _line| {
-                    count += 1;
-                    Ok(true)
-                }),
-            )?;
+        let mut match_count = 0u64;
 
-            collector.add_count(bucket, key, count);
-            if count > 0 {
-                debug!(matches = count, bucket = %bucket, key = %key, "Found matches");
-            }
-        } else {
-            let mut match_count = 0u64;
+        searcher.search_reader(
+            matcher,
+            &mut reader,
+            grep_searcher::sinks::UTF8(|_line_num, line| {
+                let keep_going = collector.add_match(bucket, key, 0, line);
+                match_count += 1;
+                Ok(keep_going)
+            }),
+        )?;
 
-            searcher.search_reader(
-                matcher,
-                &mut reader,
-                grep_searcher::sinks::UTF8(|_line_num, line| {
-                    let keep_going = collector.add_match(bucket, key, 0, line);
-                    match_count += 1;
-                    Ok(keep_going)
-                }),
-            )?;
-
-            if match_count > 0 {
-                debug!(matches = match_count, bucket = %bucket, key = %key, "Found matches");
-            }
+        if match_count > 0 {
+            debug!(matches = match_count, bucket = %bucket, key = %key, "Found matches");
         }
 
         Ok(())
@@ -129,35 +109,20 @@ impl StreamSearcher {
         collector: &mut C,
     ) -> Result<()> {
         let mut buf = String::new();
+        let mut line_count = 0u64;
 
-        if self.config.count_only {
-            let mut count = 0u64;
-            loop {
-                buf.clear();
-                if reader.read_line(&mut buf)? == 0 {
-                    break;
-                }
-                count += 1;
+        loop {
+            buf.clear();
+            if reader.read_line(&mut buf)? == 0 {
+                break;
             }
-            collector.add_count(bucket, key, count);
-            if count > 0 {
-                debug!(lines = count, bucket = %bucket, key = %key, "Counted all lines");
+            if !collector.add_match(bucket, key, 0, &buf) {
+                break;
             }
-        } else {
-            let mut line_count = 0u64;
-            loop {
-                buf.clear();
-                if reader.read_line(&mut buf)? == 0 {
-                    break;
-                }
-                if !collector.add_match(bucket, key, 0, &buf) {
-                    break;
-                }
-                line_count += 1;
-            }
-            if line_count > 0 {
-                debug!(lines = line_count, bucket = %bucket, key = %key, "Read all lines");
-            }
+            line_count += 1;
+        }
+        if line_count > 0 {
+            debug!(lines = line_count, bucket = %bucket, key = %key, "Read all lines");
         }
 
         Ok(())
