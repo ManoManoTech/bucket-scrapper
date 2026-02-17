@@ -1,8 +1,6 @@
 // src/search/http_writer.rs
 use anyhow::{Context, Result};
-use chrono::Utc;
 use reqwest::Client;
-use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,14 +8,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 use super::result_collector::SearchCollector;
-
-/// A match to be sent to the HTTP API
-#[derive(Debug, Clone)]
-pub struct HttpMatchToSend {
-    pub bucket: String,
-    pub key: String,
-    pub content: String,
-}
 
 /// Configuration for the HTTP writer
 #[derive(Debug, Clone)]
@@ -32,10 +22,6 @@ pub struct HttpWriterConfig {
     pub timeout_secs: u64,
     /// Maximum retry attempts for failed requests
     pub max_retries: u32,
-    /// Hostname to include in log entries (defaults to machine hostname)
-    pub hostname: String,
-    /// Service name to include in log entries
-    pub service: String,
     /// Channel buffer size for backpressure control
     pub channel_buffer_size: usize,
 }
@@ -48,10 +34,6 @@ impl Default for HttpWriterConfig {
             batch_max_bytes: 2 * 1024 * 1024, // 2MB default
             timeout_secs: 30,
             max_retries: 3,
-            hostname: gethostname::gethostname()
-                .to_string_lossy()
-                .to_string(),
-            service: "bucket-scrapper".to_string(),
             channel_buffer_size: 1000,
         }
     }
@@ -59,12 +41,10 @@ impl Default for HttpWriterConfig {
 
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
-    write_tx: mpsc::Sender<HttpMatchToSend>,
+    write_tx: mpsc::Sender<String>,
     write_handle: Option<tokio::task::JoinHandle<Result<usize>>>,
     /// Tracks total lines sent (shared with writer task)
     lines_sent: Arc<AtomicUsize>,
-    /// Tracks files searched
-    files_searched: Arc<AtomicUsize>,
     /// URL for display purposes
     url: String,
 }
@@ -72,7 +52,7 @@ pub struct HttpResultWriter {
 impl HttpResultWriter {
     /// Create a new HTTP writer
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
-        let (write_tx, write_rx) = mpsc::channel::<HttpMatchToSend>(config.channel_buffer_size);
+        let (write_tx, write_rx) = mpsc::channel::<String>(config.channel_buffer_size);
         let lines_sent = Arc::new(AtomicUsize::new(0));
         let lines_sent_clone = lines_sent.clone();
         let url = config.url.clone();
@@ -85,13 +65,12 @@ impl HttpResultWriter {
             write_tx,
             write_handle: Some(write_handle),
             lines_sent,
-            files_searched: Arc::new(AtomicUsize::new(0)),
             url,
         })
     }
 
     /// Get a sender that can be cloned for use in multiple tasks
-    pub fn get_sender(&self) -> mpsc::Sender<HttpMatchToSend> {
+    pub fn get_sender(&self) -> mpsc::Sender<String> {
         self.write_tx.clone()
     }
 
@@ -100,19 +79,9 @@ impl HttpResultWriter {
         self.lines_sent.load(Ordering::Relaxed)
     }
 
-    /// Increment files searched counter
-    pub fn mark_file_searched(&self) {
-        self.files_searched.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Get files searched count
-    pub fn files_searched(&self) -> usize {
-        self.files_searched.load(Ordering::Relaxed)
-    }
-
-    /// Background task that batches and sends matches to the HTTP API
+    /// Background task that batches and sends lines to the HTTP API
     async fn writer_task(
-        mut write_rx: mpsc::Receiver<HttpMatchToSend>,
+        mut write_rx: mpsc::Receiver<String>,
         config: HttpWriterConfig,
         lines_sent: Arc<AtomicUsize>,
     ) -> Result<usize> {
@@ -125,21 +94,8 @@ impl HttpResultWriter {
         let mut batch_bytes = 0usize;
         let mut total_sent = 0usize;
 
-        while let Some(match_item) = write_rx.recv().await {
-            // Format as JSON line per HTTP API spec
-            // Required: message, hostname, service
-            // Optional: level, custom attributes (file, bucket, key)
-            let log_line = json!({
-                "message": match_item.content.trim(),
-                "hostname": config.hostname,
-                "service": config.service,
-                "timestamp": Utc::now().to_rfc3339(),
-                "file": format!("{}/{}", match_item.bucket, match_item.key),
-                "bucket": match_item.bucket,
-                "key": match_item.key
-            });
-            let log_line_str = log_line.to_string();
-            let line_bytes = log_line_str.len() + 1; // +1 for newline
+        while let Some(line) = write_rx.recv().await {
+            let line_bytes = line.len() + 1; // +1 for newline
 
             // Flush if adding this line would exceed the byte limit
             if !batch.is_empty() && (batch_bytes + line_bytes > config.batch_max_bytes) {
@@ -157,7 +113,7 @@ impl HttpResultWriter {
                 batch_bytes = 0;
             }
 
-            batch.push(log_line_str);
+            batch.push(line);
             batch_bytes += line_bytes;
         }
 
@@ -248,14 +204,6 @@ impl HttpResultWriter {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")))
     }
 
-    /// Send a match to be written
-    pub async fn write_match(&self, match_item: HttpMatchToSend) -> Result<()> {
-        self.write_tx
-            .send(match_item)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send match for HTTP writing: {e}"))
-    }
-
     /// Finish writing and return the number of lines sent
     pub async fn finish(mut self) -> Result<usize> {
         // Close the channel to signal we're done
@@ -276,34 +224,24 @@ impl HttpResultWriter {
 }
 
 /// A collector that streams results to an HTTP API instead of storing in memory.
-/// This is used during the search phase to send matches as they're found.
 /// Implements SearchCollector trait for use with generic search functions.
 pub struct HttpStreamingCollector {
-    sender: mpsc::Sender<HttpMatchToSend>,
+    sender: mpsc::Sender<String>,
     match_count: usize,
-    files_searched: usize,
 }
 
 impl HttpStreamingCollector {
-    /// Create a new streaming collector
-    pub fn new(sender: mpsc::Sender<HttpMatchToSend>) -> Self {
+    pub fn new(sender: mpsc::Sender<String>) -> Self {
         Self {
             sender,
             match_count: 0,
-            files_searched: 0,
         }
     }
 }
 
 impl SearchCollector for HttpStreamingCollector {
-    fn add_match(&mut self, bucket: &str, key: &str, _line_number: u64, line: &str) -> Result<()> {
-        // Try to send - use try_send to avoid blocking in sync context
-        // If channel is full, we'll drop this match (backpressure)
-        match self.sender.try_send(HttpMatchToSend {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            content: line.to_string(),
-        }) {
+    fn add_match(&mut self, line: &str) -> Result<()> {
+        match self.sender.try_send(line.to_string()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
                 self.match_count += 1;
                 Ok(())
@@ -312,10 +250,6 @@ impl SearchCollector for HttpStreamingCollector {
                 Err(anyhow::anyhow!("HTTP consumer gone, channel closed"))
             }
         }
-    }
-
-    fn mark_file_searched(&mut self) {
-        self.files_searched += 1;
     }
 
     fn match_count(&self) -> usize {

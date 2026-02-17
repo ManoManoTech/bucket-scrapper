@@ -82,7 +82,7 @@ impl StreamSearcher {
             &mut reader,
             grep_searcher::sinks::UTF8(|_line_num, line| {
                 collector
-                    .add_match(bucket, key, 0, line)
+                    .add_match(line)
                     .map_err(std::io::Error::other)?;
                 match_count += 1;
                 Ok(true)
@@ -111,7 +111,7 @@ impl StreamSearcher {
             if reader.read_line(&mut buf)? == 0 {
                 break;
             }
-            collector.add_match(bucket, key, 0, &buf)?;
+            collector.add_match(&buf)?;
             line_count += 1;
         }
         if line_count > 0 {

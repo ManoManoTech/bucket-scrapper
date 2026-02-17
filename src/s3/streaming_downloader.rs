@@ -1,6 +1,6 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::search::{DirectFileCollector, HttpMatchToSend, HttpStreamingCollector, SearchCollector, StreamSearcher};
+use crate::search::{DirectFileCollector, HttpStreamingCollector, SearchCollector, StreamSearcher};
 use crate::search::SharedFileWriter;
 use anyhow::Result;
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
@@ -112,7 +112,7 @@ impl StreamingDownloader {
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
-        http_sender: mpsc::Sender<HttpMatchToSend>,
+        http_sender: mpsc::Sender<String>,
     ) -> Result<(usize, usize)> {
         if objects.is_empty() {
             return Ok((0, 0));
@@ -210,7 +210,7 @@ impl StreamingDownloader {
         client: Client,
         obj: S3ObjectInfo,
         searcher: Arc<StreamSearcher>,
-        http_sender: mpsc::Sender<HttpMatchToSend>,
+        http_sender: mpsc::Sender<String>,
         config: StreamingDownloaderConfig,
     ) -> Result<(usize, usize)> {
         let bucket = obj.bucket.clone();
@@ -255,7 +255,7 @@ impl StreamingDownloader {
         client: &Client,
         obj: &S3ObjectInfo,
         searcher: &Arc<StreamSearcher>,
-        http_sender: mpsc::Sender<HttpMatchToSend>,
+        http_sender: mpsc::Sender<String>,
         buffer_size: usize,
     ) -> Result<(usize, usize)> {
         debug!(
@@ -303,7 +303,6 @@ impl StreamingDownloader {
 
         // Create a streaming collector that sends to HTTP
         let mut http_collector = HttpStreamingCollector::new(http_sender);
-        http_collector.mark_file_searched();
 
         // Use spawn_blocking with SyncIoBridge for true streaming
         let matches_found = tokio::task::spawn_blocking(move || {
@@ -543,7 +542,6 @@ impl StreamingDownloader {
 
         // Create a direct file collector that writes to SharedFileWriter
         let mut file_collector = DirectFileCollector::new(writer, obj.prefix.clone());
-        file_collector.mark_file_searched();
 
         let matches_found = tokio::task::spawn_blocking(move || {
             let sync_reader = SyncIoBridge::new(decompressed);

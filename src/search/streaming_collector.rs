@@ -10,7 +10,6 @@ pub struct DirectFileCollector {
     writer: SharedFileWriter,
     prefix: String,
     match_count: usize,
-    files_searched: usize,
 }
 
 impl DirectFileCollector {
@@ -19,20 +18,15 @@ impl DirectFileCollector {
             writer,
             prefix,
             match_count: 0,
-            files_searched: 0,
         }
     }
 }
 
 impl SearchCollector for DirectFileCollector {
-    fn add_match(&mut self, _bucket: &str, _key: &str, _line_number: u64, line: &str) -> Result<()> {
+    fn add_match(&mut self, line: &str) -> Result<()> {
         self.writer.write_match(&self.prefix, line)?;
         self.match_count += 1;
         Ok(())
-    }
-
-    fn mark_file_searched(&mut self) {
-        self.files_searched += 1;
     }
 
     fn match_count(&self) -> usize {

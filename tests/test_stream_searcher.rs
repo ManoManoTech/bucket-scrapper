@@ -5,11 +5,10 @@ use std::io::Cursor;
 struct CountingCollector(usize);
 
 impl SearchCollector for CountingCollector {
-    fn add_match(&mut self, _: &str, _: &str, _: u64, _: &str) -> anyhow::Result<()> {
+    fn add_match(&mut self, _: &str) -> anyhow::Result<()> {
         self.0 += 1;
         Ok(())
     }
-    fn mark_file_searched(&mut self) {}
     fn match_count(&self) -> usize {
         self.0
     }

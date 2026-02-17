@@ -122,13 +122,6 @@ enum Commands {
         #[arg(long, default_value = "30")]
         http_timeout: u64,
 
-        /// Hostname to include in log entries (defaults to machine hostname)
-        #[arg(long, env = "HTTP_HOSTNAME")]
-        http_hostname: Option<String>,
-
-        /// Service name to include in log entries
-        #[arg(long, env = "HTTP_SERVICE", default_value = "bucket-scrapper")]
-        http_service: String,
     },
 }
 
@@ -208,8 +201,6 @@ async fn main() -> Result<()> {
             http_api_key,
             http_batch_max_mb,
             http_timeout,
-            http_hostname,
-            http_service,
         } => {
             let end_date = if let Some(end) = end {
                 end.parse::<DateTime<Utc>>()
@@ -288,18 +279,12 @@ async fn main() -> Result<()> {
 
                 info!(url = %api_url, batch_max_mb = http_batch_max_mb, "HTTP streaming mode enabled");
 
-                let hostname = http_hostname.clone().unwrap_or_else(|| {
-                    gethostname::gethostname().to_string_lossy().to_string()
-                });
-
                 let http_config = HttpWriterConfig {
                     url: api_url,
                     api_key,
                     batch_max_bytes,
                     timeout_secs,
                     max_retries,
-                    hostname,
-                    service: http_service.clone(),
                     channel_buffer_size: channel_buffer,
                 };
 
