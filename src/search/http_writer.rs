@@ -44,12 +44,21 @@ impl Default for HttpWriterConfig {
     }
 }
 
+/// Stats returned by `HttpResultWriter::finish()`
+#[derive(Debug, Clone)]
+pub struct HttpWriterStats {
+    pub lines_sent: usize,
+    pub lines_dropped: usize,
+}
+
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
     write_tx: flume::Sender<String>,
-    write_handles: Vec<tokio::task::JoinHandle<Result<usize>>>,
+    write_handles: Vec<tokio::task::JoinHandle<usize>>,
     /// Tracks total lines sent (shared with writer tasks)
     lines_sent: Arc<AtomicUsize>,
+    /// Tracks total lines dropped on batch failures (shared with writer tasks)
+    lines_dropped: Arc<AtomicUsize>,
     /// URL for display purposes
     url: String,
 }
@@ -57,18 +66,26 @@ pub struct HttpResultWriter {
 impl HttpResultWriter {
     /// Create a new HTTP writer with N concurrent upload tasks
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .context("Failed to create HTTP client")?;
+
         let (write_tx, write_rx) = flume::bounded::<String>(config.channel_buffer_size);
         let lines_sent = Arc::new(AtomicUsize::new(0));
+        let lines_dropped = Arc::new(AtomicUsize::new(0));
         let url = config.url.clone();
         let num_tasks = config.num_upload_tasks;
 
         let mut write_handles = Vec::with_capacity(num_tasks);
         for task_id in 0..num_tasks {
             let rx = write_rx.clone();
+            let client = client.clone();
             let cfg = config.clone();
             let ls = lines_sent.clone();
+            let ld = lines_dropped.clone();
             let handle = tokio::spawn(async move {
-                Self::writer_task(task_id, rx, cfg, ls).await
+                Self::writer_task(task_id, rx, client, cfg, ls, ld).await
             });
             write_handles.push(handle);
         }
@@ -77,6 +94,7 @@ impl HttpResultWriter {
             write_tx,
             write_handles,
             lines_sent,
+            lines_dropped,
             url,
         })
     }
@@ -96,20 +114,17 @@ impl HttpResultWriter {
     async fn writer_task(
         task_id: usize,
         write_rx: flume::Receiver<String>,
+        client: Client,
         config: HttpWriterConfig,
         lines_sent: Arc<AtomicUsize>,
-    ) -> Result<usize> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()
-            .context("Failed to create HTTP client")?;
-
+        lines_dropped: Arc<AtomicUsize>,
+    ) -> usize {
         let mut batch: Vec<String> = Vec::new();
         let mut batch_bytes = 0usize;
         let mut total_sent = 0usize;
 
         while let Ok(line) = write_rx.recv_async().await {
-            let line_bytes = line.len() + 1; // +1 for newline
+            let line_bytes = line.len();
 
             // Flush if adding this line would exceed the byte limit
             if !batch.is_empty() && (batch_bytes + line_bytes > config.batch_max_bytes) {
@@ -120,6 +135,7 @@ impl HttpResultWriter {
                         debug!(task = task_id, lines = count, bytes = batch_bytes, url = %config.url, "Sent batch");
                     }
                     Err(e) => {
+                        lines_dropped.fetch_add(batch.len(), Ordering::Relaxed);
                         error!(task = task_id, lines = batch.len(), bytes = batch_bytes, error = %e, "Failed to send batch");
                     }
                 }
@@ -142,13 +158,14 @@ impl HttpResultWriter {
                     info!(task = task_id, lines = count, url = %config.url, "Sent final batch");
                 }
                 Err(e) => {
+                    lines_dropped.fetch_add(final_batch_lines, Ordering::Relaxed);
                     error!(task = task_id, lines = final_batch_lines, bytes = final_batch_bytes, error = %e, "Failed to send final batch");
                 }
             }
         }
 
         info!(task = task_id, total_lines = total_sent, "HTTP writer task finished");
-        Ok(total_sent)
+        total_sent
     }
 
     /// Send a batch of log lines to the HTTP API
@@ -158,8 +175,8 @@ impl HttpResultWriter {
         batch: &[String],
     ) -> Result<usize> {
         let count = batch.len();
-        // Join with newlines for newline-delimited format
-        let body = batch.join("\n");
+        // Lines are \n-terminated by the searcher, so empty-join produces valid NDJSON.
+        let body = batch.join("");
 
         let mut last_error = None;
 
@@ -218,35 +235,26 @@ impl HttpResultWriter {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")))
     }
 
-    /// Finish writing and return the total number of lines sent across all tasks
-    pub async fn finish(self) -> Result<usize> {
+    /// Finish writing and return stats for all tasks
+    pub async fn finish(self) -> Result<HttpWriterStats> {
         // Close the channel to signal all writer tasks to drain and exit
         drop(self.write_tx);
 
         let mut total = 0usize;
-        let mut first_error: Option<anyhow::Error> = None;
 
         for handle in self.write_handles {
             match handle.await {
-                Ok(Ok(count)) => total += count,
-                Ok(Err(e)) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
+                Ok(count) => total += count,
                 Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(anyhow::anyhow!("Writer task panicked: {e}"));
-                    }
+                    return Err(anyhow::anyhow!("Writer task panicked: {e}"));
                 }
             }
         }
 
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-
-        Ok(total)
+        Ok(HttpWriterStats {
+            lines_sent: total,
+            lines_dropped: self.lines_dropped.load(Ordering::Relaxed),
+        })
     }
 
     /// Get the configured URL
@@ -273,12 +281,12 @@ impl HttpStreamingExporter {
 
 impl SearchExporter for HttpStreamingExporter {
     fn add_match(&mut self, line: &str) -> Result<()> {
-        match self.sender.try_send(line.to_string()) {
-            Ok(()) | Err(flume::TrySendError::Full(_)) => {
+        match self.sender.send(line.to_string()) {
+            Ok(()) => {
                 self.match_count += 1;
                 Ok(())
             }
-            Err(flume::TrySendError::Disconnected(_)) => {
+            Err(_) => {
                 Err(anyhow::anyhow!("HTTP consumer gone, channel closed"))
             }
         }

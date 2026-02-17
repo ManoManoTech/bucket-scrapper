@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
                     api_key,
                     batch_max_bytes,
                     timeout_secs,
-                    max_retries,
+                    max_retries: max_retries.min(10),
                     channel_buffer_size: channel_buffer,
                     num_upload_tasks,
                 };
@@ -431,14 +431,22 @@ async fn main() -> Result<()> {
                         .await?;
 
                     let api_url = http_writer.url().to_string();
-                    let lines_sent = http_writer.finish().await?;
+                    let stats = http_writer.finish().await?;
+
+                    if stats.lines_dropped > 0 {
+                        warn!(
+                            lines_dropped = stats.lines_dropped,
+                            "Some lines were dropped due to HTTP send failures"
+                        );
+                    }
 
                     let elapsed = batch_start.elapsed().as_secs_f64();
                     info!(
                         elapsed_s = elapsed,
                         files = files_searched,
                         matched_lines = matched_lines,
-                        lines_sent = lines_sent,
+                        lines_sent = stats.lines_sent,
+                        lines_dropped = stats.lines_dropped,
                         pattern = line_pattern_regex.as_deref().unwrap_or("(all lines)"),
                         url = %api_url,
                         "Search completed"
