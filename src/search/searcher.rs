@@ -2,7 +2,7 @@
 use anyhow::Result;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
-use std::io::Read;
+use std::io::BufRead;
 use tracing::debug;
 
 use super::result_collector::{SearchCollector, SearchResultCollector};
@@ -10,7 +10,7 @@ use super::result_collector::{SearchCollector, SearchResultCollector};
 /// Configuration for the stream searcher
 #[derive(Clone)]
 pub struct SearchConfig {
-    pub pattern: String,
+    pub pattern: Option<String>,
     pub ignore_case: bool,
     pub count_only: bool,
 }
@@ -18,17 +18,18 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            pattern: String::new(),
+            pattern: None,
             ignore_case: false,
             count_only: false,
         }
     }
 }
 
-/// A searcher that can process streams of data using ripgrep's engine
+/// A searcher that can process streams of data using ripgrep's engine.
+/// When no pattern is provided, all lines are returned without regex overhead.
 pub struct StreamSearcher {
     config: SearchConfig,
-    matcher: RegexMatcher,
+    matcher: Option<RegexMatcher>,
 }
 
 // We can't derive Clone because RegexMatcher doesn't implement it
@@ -36,42 +37,58 @@ pub struct StreamSearcher {
 
 impl StreamSearcher {
     pub fn new(config: SearchConfig) -> Result<Self> {
-        // Build the regex matcher once at initialization
-        let mut matcher_builder = RegexMatcherBuilder::new();
-        matcher_builder.case_insensitive(config.ignore_case);
-
-        let matcher = matcher_builder
-            .build(&config.pattern)
-            .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?;
+        let matcher = if let Some(ref pattern) = config.pattern {
+            let mut matcher_builder = RegexMatcherBuilder::new();
+            matcher_builder.case_insensitive(config.ignore_case);
+            Some(
+                matcher_builder
+                    .build(pattern)
+                    .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self { config, matcher })
     }
 
-    /// Search through a readable stream and collect results using any SearchCollector
-    pub fn search_stream<R: Read, C: SearchCollector>(
+    /// Search through a readable stream and collect results using any SearchCollector.
+    /// When no pattern is configured, all lines are yielded via a fast BufRead loop.
+    pub fn search_stream<R: BufRead, C: SearchCollector>(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: R,
+        collector: &mut C,
+    ) -> Result<()> {
+        debug!(bucket = %bucket, key = %key, "Starting search");
+
+        match self.matcher {
+            Some(ref matcher) => self.search_stream_regex(bucket, key, reader, collector, matcher),
+            None => self.search_stream_all_lines(bucket, key, reader, collector),
+        }
+    }
+
+    fn search_stream_regex<R: BufRead, C: SearchCollector>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
         collector: &mut C,
+        matcher: &RegexMatcher,
     ) -> Result<()> {
-        debug!(bucket = %bucket, key = %key, "Starting search");
-
-        // Configure the searcher (no context lines needed, but keep line numbers for the sink API)
         let mut searcher_builder = SearcherBuilder::new();
         searcher_builder
             .binary_detection(BinaryDetection::quit(b'\x00'))
-            .line_number(true) // Keep enabled for the sink API (we'll ignore the values)
-            .memory_map(MmapChoice::never()); // Never mmap since we're streaming
+            .line_number(true)
+            .memory_map(MmapChoice::never());
 
         let mut searcher = searcher_builder.build();
 
-        // Create a sink that will collect results
         if self.config.count_only {
-            // Just count matches without storing them
             let mut count = 0u64;
             searcher.search_reader(
-                &self.matcher,
+                matcher,
                 &mut reader,
                 grep_searcher::sinks::UTF8(|_line_num, _line| {
                     count += 1;
@@ -84,14 +101,12 @@ impl StreamSearcher {
                 debug!(matches = count, bucket = %bucket, key = %key, "Found matches");
             }
         } else {
-            // Collect full match information (no line numbers)
             let mut match_count = 0u64;
 
             searcher.search_reader(
-                &self.matcher,
+                matcher,
                 &mut reader,
                 grep_searcher::sinks::UTF8(|_line_num, line| {
-                    // Line number is always 0 since we disabled line tracking
                     let keep_going = collector.add_match(bucket, key, 0, line);
                     match_count += 1;
                     Ok(keep_going)
@@ -100,6 +115,48 @@ impl StreamSearcher {
 
             if match_count > 0 {
                 debug!(matches = match_count, bucket = %bucket, key = %key, "Found matches");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn search_stream_all_lines<R: BufRead, C: SearchCollector>(
+        &self,
+        bucket: &str,
+        key: &str,
+        mut reader: R,
+        collector: &mut C,
+    ) -> Result<()> {
+        let mut buf = String::new();
+
+        if self.config.count_only {
+            let mut count = 0u64;
+            loop {
+                buf.clear();
+                if reader.read_line(&mut buf)? == 0 {
+                    break;
+                }
+                count += 1;
+            }
+            collector.add_count(bucket, key, count);
+            if count > 0 {
+                debug!(lines = count, bucket = %bucket, key = %key, "Counted all lines");
+            }
+        } else {
+            let mut line_count = 0u64;
+            loop {
+                buf.clear();
+                if reader.read_line(&mut buf)? == 0 {
+                    break;
+                }
+                if !collector.add_match(bucket, key, 0, &buf) {
+                    break;
+                }
+                line_count += 1;
+            }
+            if line_count > 0 {
+                debug!(lines = line_count, bucket = %bucket, key = %key, "Read all lines");
             }
         }
 

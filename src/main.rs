@@ -50,9 +50,9 @@ struct Cli {
 enum Commands {
     /// Search through S3 bucket contents
     Search {
-        /// Regex pattern to search for
-        #[arg(short, long)]
-        pattern: String,
+        /// Regex pattern to filter lines (omit to extract all lines)
+        #[arg(long)]
+        line_pattern_regex: Option<String>,
 
         /// Regex filter pattern applied to S3 object keys (e.g., "\\.log$", "service-a")
         #[arg(short, long)]
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Search {
-            pattern,
+            line_pattern_regex,
             filter,
             start,
             end,
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
 
             // Configure search
             let search_config = SearchConfig {
-                pattern: pattern.clone(),
+                pattern: line_pattern_regex.clone(),
                 ignore_case,
                 count_only: count,
             };
@@ -504,11 +504,15 @@ async fn main() -> Result<()> {
             };
 
             // Print summary
+            let pattern_display = line_pattern_regex
+                .as_deref()
+                .unwrap_or("(all lines)");
+
             match output {
                 OutputFormat::Json => {
                     let summary = if http_output {
                         serde_json::json!({
-                            "pattern": pattern,
+                            "pattern": pattern_display,
                             "files_searched": total_files_searched,
                             "total_matches": total_matches,
                             "lines_sent": output_count,
@@ -516,7 +520,7 @@ async fn main() -> Result<()> {
                         })
                     } else {
                         serde_json::json!({
-                            "pattern": pattern,
+                            "pattern": pattern_display,
                             "files_searched": total_files_searched,
                             "total_matches": total_matches,
                             "output_files_written": output_count,
@@ -527,7 +531,7 @@ async fn main() -> Result<()> {
                 }
                 OutputFormat::Text | OutputFormat::Quiet => {
                     println!("\n=== Search Complete ===");
-                    println!("Pattern: {}", pattern);
+                    println!("Pattern: {}", pattern_display);
                     println!("Files searched: {}", total_files_searched);
                     println!("Total matches: {}", total_matches);
                     if http_output {

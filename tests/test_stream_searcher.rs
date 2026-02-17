@@ -5,7 +5,7 @@ use std::io::Cursor;
 fn test_regex_matcher_cached() {
     // Create searcher with a pattern
     let config = SearchConfig {
-        pattern: "ERROR".to_string(),
+        pattern: Some("ERROR".to_string()),
         ignore_case: false,
         count_only: false,
     };
@@ -43,7 +43,7 @@ fn test_regex_matcher_cached() {
 fn test_no_line_numbers() {
     // Create searcher
     let config = SearchConfig {
-        pattern: "test".to_string(),
+        pattern: Some("test".to_string()),
         ignore_case: true,
         count_only: false,
     };
@@ -69,7 +69,7 @@ fn test_no_line_numbers() {
 fn test_count_only_mode() {
     // Create searcher in count-only mode
     let config = SearchConfig {
-        pattern: "\\d+".to_string(), // Match numbers
+        pattern: Some("\\d+".to_string()), // Match numbers
         ignore_case: false,
         count_only: true,
     };
@@ -95,5 +95,61 @@ fn test_count_only_mode() {
         result.file_counts.get("bucket/key"),
         Some(&3),
         "Should count 3 matches"
+    );
+}
+
+#[test]
+fn test_all_lines_mode() {
+    // No pattern = all lines
+    let config = SearchConfig {
+        pattern: None,
+        ignore_case: false,
+        count_only: false,
+    };
+
+    let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
+
+    let test_data = b"Line 1\nLine 2\nLine 3";
+    let mut collector = SearchResultCollector::new();
+
+    searcher
+        .search_stream("bucket", "key", Cursor::new(test_data), &mut collector)
+        .expect("Failed to search");
+
+    let result = collector.into_result();
+
+    assert_eq!(result.total_matches, 3, "Should yield all 3 lines");
+    assert_eq!(result.matches.len(), 3, "Should store all 3 matches");
+}
+
+#[test]
+fn test_all_lines_count_only() {
+    // No pattern + count_only = count all lines
+    let config = SearchConfig {
+        pattern: None,
+        ignore_case: false,
+        count_only: true,
+    };
+
+    let searcher = StreamSearcher::new(config).expect("Failed to create searcher");
+
+    let test_data = b"Line 1\nLine 2\nLine 3";
+    let mut collector = SearchResultCollector::new();
+
+    searcher
+        .search_stream("bucket", "key", Cursor::new(test_data), &mut collector)
+        .expect("Failed to search");
+
+    let result = collector.into_result();
+
+    assert_eq!(
+        result.matches.len(),
+        0,
+        "Should not store matches in count-only mode"
+    );
+    assert_eq!(
+        result.file_counts.get("bucket/key"),
+        Some(&3),
+        "Should count 3 lines"
     );
 }
