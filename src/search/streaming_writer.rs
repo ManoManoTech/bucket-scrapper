@@ -1,129 +1,131 @@
 // src/search/streaming_writer.rs
 use anyhow::Result;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use tokio::sync::mpsc;
-use tracing::info;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use tracing::{info, warn};
+use zstd::Encoder as ZstdEncoder;
 
-/// A match to be written to the output
-#[derive(Debug, Clone)]
-pub struct MatchToWrite {
-    pub bucket: String,
-    pub key: String,
-    pub content: String,
-    pub prefix: String, // e.g., "20240115H10"
+type PrefixEncoder = ZstdEncoder<'static, File>;
+
+/// Shared file writer using per-prefix locking.
+///
+/// Two-level locking:
+/// 1. Outer RwLock<HashMap> — read-locked for lookups (concurrent), write-locked only to insert a new prefix (rare).
+/// 2. Inner Mutex<ZstdEncoder<File>> per prefix — only tasks writing to the *same* date/hour file contend.
+pub struct SharedFileWriter {
+    encoders: Arc<RwLock<HashMap<String, Arc<Mutex<PrefixEncoder>>>>>,
+    output_dir: String,
+    matches_written: Arc<AtomicUsize>,
+    files_created: Arc<AtomicUsize>,
 }
 
-/// Manages streaming writes of search results to compressed files
-pub struct StreamingResultWriter {
-    write_tx: mpsc::Sender<MatchToWrite>,
-    write_handle: Option<tokio::task::JoinHandle<Result<usize>>>,
+impl Clone for SharedFileWriter {
+    fn clone(&self) -> Self {
+        Self {
+            encoders: Arc::clone(&self.encoders),
+            output_dir: self.output_dir.clone(),
+            matches_written: Arc::clone(&self.matches_written),
+            files_created: Arc::clone(&self.files_created),
+        }
+    }
 }
 
-impl StreamingResultWriter {
-    /// Create a new streaming writer
+impl SharedFileWriter {
     pub fn new(output_dir: String) -> Result<Self> {
-        // Create output directory if it doesn't exist
         fs::create_dir_all(&output_dir)?;
-
-        let (write_tx, mut write_rx) = mpsc::channel::<MatchToWrite>(1000);
-        let output_dir_clone = output_dir;
-
-        // Spawn a blocking thread for the writer — pure sync I/O (gzip file writes).
-        // Using blocking_recv() in spawn_blocking avoids async scheduling overhead
-        // per item, which matters when match volume is high (e.g., `.*` pattern).
-        let write_handle = tokio::task::spawn_blocking(move || {
-            let mut files_written = 0usize;
-            let mut matches_written = 0usize;
-            let mut local_encoders: HashMap<String, GzEncoder<File>> = HashMap::new();
-
-            while let Some(match_item) = write_rx.blocking_recv() {
-                // Get or create encoder for this prefix
-                let encoder = match local_encoders.get_mut(&match_item.prefix) {
-                    Some(enc) => enc,
-                    None => {
-                        // Create new file and encoder
-                        let output_file = format!("{}/{}.gz", output_dir_clone, match_item.prefix);
-                        info!("Creating output file: {}", output_file);
-
-                        let file = match File::create(&output_file) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                eprintln!("Failed to create output file {}: {}", output_file, e);
-                                continue;
-                            }
-                        };
-
-                        let encoder = GzEncoder::new(file, Compression::default());
-                        local_encoders.insert(match_item.prefix.clone(), encoder);
-                        files_written += 1;
-
-                        local_encoders.get_mut(&match_item.prefix).unwrap()
-                    }
-                };
-
-                // Write the match as JSON
-                let output_line = json!({
-                    "file": format!("{}/{}", match_item.bucket, match_item.key),
-                    "content": match_item.content.trim()
-                });
-
-                if let Err(e) = writeln!(encoder, "{}", output_line) {
-                    eprintln!("Failed to write match: {}", e);
-                }
-
-                matches_written += 1;
-                if matches_written == 1 || matches_written % 10000 == 0 {
-                    info!("Writer: {} matches written to {} files", matches_written, files_written);
-                }
-            }
-
-            // Finish all encoders
-            for (prefix, encoder) in local_encoders {
-                if let Err(e) = encoder.finish() {
-                    eprintln!("Failed to finish encoder for {}: {}", prefix, e);
-                } else {
-                    info!("Finished writing {}.gz", prefix);
-                }
-            }
-
-            Ok(files_written)
-        });
-
         Ok(Self {
-            write_tx,
-            write_handle: Some(write_handle),
+            encoders: Arc::new(RwLock::new(HashMap::new())),
+            output_dir,
+            matches_written: Arc::new(AtomicUsize::new(0)),
+            files_created: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    /// Get a sender that can be cloned for use in multiple tasks
-    pub fn get_sender(&self) -> mpsc::Sender<MatchToWrite> {
-        self.write_tx.clone()
+    /// Write a single match to the appropriate zstd file.
+    /// Called from spawn_blocking search tasks — fully synchronous.
+    pub fn write_match(&self, prefix: &str, bucket: &str, key: &str, content: &str) -> Result<()> {
+        // Fast path: read-lock to find existing encoder
+        let encoder_arc = {
+            let map = self.encoders.read().unwrap_or_else(|e| e.into_inner());
+            map.get(prefix).cloned()
+        };
+
+        let encoder_arc = match encoder_arc {
+            Some(arc) => arc,
+            None => {
+                // Slow path: write-lock to insert new encoder
+                let mut map = self.encoders.write().unwrap_or_else(|e| e.into_inner());
+                // Double-check after acquiring write lock
+                if let Some(arc) = map.get(prefix) {
+                    arc.clone()
+                } else {
+                    let output_file = format!("{}/{}.zst", self.output_dir, prefix);
+                    let file = File::create(&output_file)?;
+                    let encoder = ZstdEncoder::new(file, 3)?;
+                    let arc = Arc::new(Mutex::new(encoder));
+                    map.insert(prefix.to_string(), Arc::clone(&arc));
+                    self.files_created.fetch_add(1, Ordering::Relaxed);
+                    arc
+                }
+            }
+        };
+
+        // Lock only this prefix's encoder
+        let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
+
+        let output_line = json!({
+            "file": format!("{}/{}", bucket, key),
+            "content": content.trim()
+        });
+
+        writeln!(encoder, "{}", output_line)?;
+
+        self.matches_written.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
     }
 
-    /// Send a match to be written
-    pub async fn write_match(&self, match_item: MatchToWrite) -> Result<()> {
-        self.write_tx
-            .send(match_item)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send match for writing: {}", e))
-    }
+    /// Finalize all encoders. Must be called after all search tasks have completed.
+    /// Returns the number of files written.
+    pub fn finish(self) -> Result<usize> {
+        let rwlock = Arc::try_unwrap(self.encoders)
+            .unwrap_or_else(|arc| {
+                // Fallback: shouldn't happen if called after all tasks complete.
+                // Clone the inner map into a fresh RwLock.
+                let guard = arc.read().unwrap_or_else(|e| e.into_inner());
+                RwLock::new(guard.clone())
+            });
 
-    /// Finish writing and return the number of files written
-    pub async fn finish(mut self) -> Result<usize> {
-        // Close the channel to signal we're done
-        drop(self.write_tx);
+        let map = rwlock.into_inner().unwrap_or_else(|e| e.into_inner());
 
-        // Wait for the writer task to complete
-        if let Some(handle) = self.write_handle.take() {
-            handle.await?
-        } else {
-            Ok(0)
+        let mut files_written = 0usize;
+        for (prefix, encoder_arc) in map {
+            match Arc::try_unwrap(encoder_arc) {
+                Ok(mutex) => {
+                    let encoder = mutex.into_inner().unwrap_or_else(|e| e.into_inner());
+                    if let Err(e) = encoder.finish() {
+                        warn!("Failed to finish encoder for {}: {}", prefix, e);
+                    } else {
+                        files_written += 1;
+                    }
+                }
+                Err(_) => {
+                    warn!("Could not unwrap encoder Arc for {} — still referenced", prefix);
+                }
+            }
         }
+
+        let total_matches = self.matches_written.load(Ordering::Relaxed);
+        info!(
+            "File output complete: {} matches written to {} files",
+            total_matches, files_written
+        );
+
+        Ok(files_written)
     }
 }
 

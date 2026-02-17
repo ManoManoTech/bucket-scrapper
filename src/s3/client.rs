@@ -2,13 +2,14 @@
 // Location: src/s3/client.rs
 use crate::config::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::ResponseChecksumValidation;
 use aws_sdk_s3::Client;
-use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
-use aws_smithy_http_client::Builder as HttpClientBuilder;
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
+use aws_smithy_http_client::{Builder as HttpClientBuilder, Connector};
 use aws_smithy_types::timeout::TimeoutConfig;
 use aws_types::region::Region;
 use regex::Regex;
@@ -54,20 +55,33 @@ impl WrappedS3Client {
             .operation_attempt_timeout(Duration::from_secs(60))
             .build();
 
-        // Build custom HTTP client with our cached DNS resolver if available
-        // This is the KEY integration - it ensures all S3 requests use our
-        // hickory-resolver + moka cache instead of hyper's default system resolver
+        // Build custom HTTP client with proxy support, custom CA, and cached DNS resolver
+        let proxy_config = ProxyConfig::from_env();
+        if !proxy_config.is_disabled() {
+            info!("Proxy configured from environment variables");
+        }
+
+        let tls_context = build_tls_context()?;
+
         let http_client = if let Some(dns_cache) = dns_cache::get_global_dns_cache() {
             info!("Creating S3 client with cached DNS resolver");
             let resolver = AwsDnsResolverAdapter::new(dns_cache.clone());
-            HttpClientBuilder::new()
-                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
-                .build_with_resolver(resolver)
+            HttpClientBuilder::new().build_with_connector_fn(move |_, _| {
+                Connector::builder()
+                    .proxy_config(proxy_config.clone())
+                    .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                    .tls_context(tls_context.clone())
+                    .build_with_resolver(resolver.clone())
+            })
         } else {
-            warn!("DNS cache not available, using default resolver (will cause more DNS queries)");
-            HttpClientBuilder::new()
-                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
-                .build_https()
+            warn!("DNS cache not available, using default resolver");
+            HttpClientBuilder::new().build_with_connector_fn(move |_, _| {
+                Connector::builder()
+                    .proxy_config(proxy_config.clone())
+                    .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                    .tls_context(tls_context.clone())
+                    .build()
+            })
         };
 
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
@@ -130,9 +144,13 @@ impl WrappedS3Client {
         let mut all_objects = Vec::new();
         let mut result = Vec::new();
         let mut continuation_token = None;
+        let mut pages = 0u32;
 
         loop {
-            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+            let mut request = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix);
 
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
@@ -167,8 +185,14 @@ impl WrappedS3Client {
                 }
             }
 
+            pages += 1;
+
             if response.is_truncated.unwrap_or(false) {
                 continuation_token = response.next_continuation_token;
+                debug!(
+                    "s3://{}/{} page {} returned {} keys, continuing...",
+                    bucket, prefix, pages, result.len()
+                );
             } else {
                 break;
             }
@@ -176,19 +200,13 @@ impl WrappedS3Client {
 
         if let Some(pattern) = filter_pattern {
             info!(
-                "Filter '{}': {} objects matched out of {} total in s3://{}/{}",
-                pattern,
-                result.len(),
-                all_objects.len(),
-                bucket,
-                prefix
+                "Listed s3://{}/{}: {} matched / {} total ({} pages)",
+                bucket, prefix, result.len(), all_objects.len(), pages
             );
         } else {
-            debug!(
-                "Found {} objects in s3://{}/{}",
-                result.len(),
-                bucket,
-                prefix
+            info!(
+                "Listed s3://{}/{}: {} objects ({} pages)",
+                bucket, prefix, result.len(), pages
             );
         }
         Ok(result)
@@ -302,6 +320,51 @@ impl WrappedS3Client {
         info!("Uploaded check result to s3://{}/{}", bucket, key);
 
         Ok(())
+    }
+}
+
+/// Build TLS context, adding a custom CA cert if `AWS_CA_BUNDLE` is set
+/// or auto-detecting `~/.mitmproxy/mitmproxy-ca-cert.pem` when a proxy env var is present.
+fn build_tls_context() -> Result<TlsContext> {
+    let mut trust_store = TrustStore::default();
+
+    if let Some(path) = resolve_ca_bundle_path() {
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("Failed to read CA bundle: {}", path))?;
+        info!("Loaded custom CA bundle from {}", path);
+        trust_store = trust_store.with_pem_certificate(pem);
+    }
+
+    TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build TLS context: {}", e))
+}
+
+/// Resolve CA bundle: `AWS_CA_BUNDLE` wins, then auto-detect mitmproxy CA when proxy is set.
+fn resolve_ca_bundle_path() -> Option<String> {
+    if let Ok(path) = std::env::var("AWS_CA_BUNDLE") {
+        return Some(path);
+    }
+
+    let has_proxy = std::env::var_os("HTTPS_PROXY").is_some()
+        || std::env::var_os("https_proxy").is_some()
+        || std::env::var_os("HTTP_PROXY").is_some()
+        || std::env::var_os("http_proxy").is_some()
+        || std::env::var_os("ALL_PROXY").is_some()
+        || std::env::var_os("all_proxy").is_some();
+
+    if !has_proxy {
+        return None;
+    }
+
+    let home = std::env::var("HOME").ok()?;
+    let path = format!("{}/.mitmproxy/mitmproxy-ca-cert.pem", home);
+    if std::path::Path::new(&path).exists() {
+        info!("Auto-detected mitmproxy CA at {}", path);
+        Some(path)
+    } else {
+        None
     }
 }
 

@@ -23,6 +23,22 @@ pub struct BucketConfig {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
+impl BucketConfig {
+    /// Validate that the bucket config has at least one DateFormat path component.
+    /// Without it, the prefix never narrows by date/hour and we'd list the entire bucket.
+    pub fn validate(&self) -> Result<(), String> {
+        let has_datefmt = self.path.iter().any(|p| matches!(p, PathSchema::DateFormat { .. }));
+        if !has_datefmt {
+            return Err(format!(
+                "Bucket '{}' has no datefmt in path — this would list the entire bucket prefix. \
+                 Add a datefmt component like: datefmt: \"dt=20240101/hour=00\"",
+                self.bucket
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// HTTP output configuration for sending logs to a REST API (e.g., HTTP)
 #[derive(Debug, Deserialize, Clone)]
 pub struct HttpOutputConfig {

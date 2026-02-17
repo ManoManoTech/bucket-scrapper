@@ -11,18 +11,20 @@ use s3::{StreamingDownloader, StreamingDownloaderConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::config::loader::load_config;
-use crate::config::types::BucketConfig;
+use crate::config::types::{BucketConfig, S3ObjectInfo};
 use crate::s3::client::WrappedS3Client;
 use crate::s3::dns_cache;
-use crate::s3::ParallelLister;
 use crate::search::{
-    HttpResultWriter, HttpWriterConfig, SearchConfig, StreamSearcher, StreamingResultWriter,
+    HttpResultWriter, HttpWriterConfig, SearchConfig, SharedFileWriter, StreamSearcher,
 };
 use crate::utils::date::date_range_to_date_hour_list;
+use crate::utils::path_formatter::generate_path_formatter;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]
@@ -59,7 +61,7 @@ enum Commands {
 
         /// Start date in ISO 8601 format (e.g., 2023-01-01T00:00:00Z)
         #[arg(short, long)]
-        start: Option<String>,
+        start: String,
 
         /// End date in ISO 8601 format (defaults to now)
         #[arg(short, long)]
@@ -132,21 +134,6 @@ enum Commands {
         /// Service name to include in log entries
         #[arg(long, env = "HTTP_SERVICE", default_value = "bucket-scrapper")]
         http_service: String,
-    },
-
-    /// List objects in buckets matching the filter
-    List {
-        /// Regex filter pattern applied to S3 object keys (e.g., "\\.log$", "service-a")
-        #[arg(short, long)]
-        filter: Option<String>,
-
-        /// Start date in ISO 8601 format
-        #[arg(short, long)]
-        start: Option<String>,
-
-        /// End date in ISO 8601 format (defaults to now)
-        #[arg(short, long)]
-        end: Option<String>,
     },
 }
 
@@ -235,18 +222,12 @@ async fn main() -> Result<()> {
                 Utc::now()
             };
 
-            let start_date = if let Some(start) = start {
-                Some(
-                    start
-                        .parse::<DateTime<Utc>>()
-                        .context("Invalid start date format")?,
-                )
-            } else {
-                None
-            };
+            let start_date = start
+                .parse::<DateTime<Utc>>()
+                .context("Invalid start date format")?;
 
-            // Create S3 client
-            let mut s3_client = WrappedS3Client::new(&cli.region, client_max_age, None).await?;
+            // Create S3 client (Arc for sharing across spawned listing tasks)
+            let s3_client = Arc::new(WrappedS3Client::new(&cli.region, client_max_age, None).await?);
 
             // Configure search
             let search_config = SearchConfig {
@@ -268,6 +249,13 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
+            for bucket_cfg in &config_buckets {
+                if let Err(e) = bucket_cfg.validate() {
+                    error!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+
             let searcher = Arc::new(StreamSearcher::new(search_config)?);
 
             // Configure downloader
@@ -281,9 +269,6 @@ async fn main() -> Result<()> {
 
             let downloader =
                 StreamingDownloader::new(s3_client.get_client().await?, download_config);
-
-            // Create parallel lister for efficient prefix listing
-            let parallel_lister = ParallelLister::new(max_parallel);
 
             // Check if we're using HTTP streaming output
             let http_streaming = if http_output {
@@ -332,39 +317,99 @@ async fn main() -> Result<()> {
             let mut total_files_searched = 0usize;
             let mut total_matches = 0usize;
 
-            use crate::utils::path_formatter::generate_path_formatter;
-
-            // Process all buckets
+            // List all objects in parallel across all buckets × hourly prefixes
             let all_bucket_objects = {
-                let mut all_objects = Vec::new();
+                let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
+                let semaphore = Arc::new(Semaphore::new(max_parallel));
+                let mut join_set: JoinSet<Result<Vec<S3ObjectInfo>>> = JoinSet::new();
+                let mut total_tasks = 0usize;
 
                 for bucket_cfg in &config_buckets {
-                    info!("Listing bucket: {}", bucket_cfg.bucket);
+                    let formatter = generate_path_formatter(bucket_cfg);
+                    for dh in &date_hours {
+                        let prefix = formatter(&dh.date, &dh.hour)?;
+                        let bucket = bucket_cfg.bucket.clone();
+                        let filter = filter.clone();
+                        let client = Arc::clone(&s3_client);
+                        let sem = Arc::clone(&semaphore);
 
-                    let objects = if let Some(start) = start_date {
-                        let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
-                        let formatter = generate_path_formatter(bucket_cfg);
-                        let mut prefixes = Vec::new();
-                        for dh in &date_hours {
-                            prefixes.push(formatter(&dh.date, &dh.hour)?);
-                        }
-                        parallel_lister
-                            .list_prefixes_parallel(&s3_client, &bucket_cfg.bucket, prefixes, filter.as_deref())
-                            .await?
-                    } else {
-                        let prefix = if bucket_cfg.path.is_empty() {
-                            String::new()
-                        } else {
-                            let formatter = generate_path_formatter(bucket_cfg);
-                            formatter(&String::new(), &String::new())?
-                        };
-                        s3_client
-                            .get_matching_filenames_from_s3(&bucket_cfg.bucket, &prefix, filter.as_deref())
-                            .await?
-                    };
+                        join_set.spawn(async move {
+                            let _permit = sem.acquire().await
+                                .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
 
-                    all_objects.extend(objects);
+                            debug!("Listing {}/{}", bucket, prefix);
+                            let result = client
+                                .get_matching_filenames_from_s3(&bucket, &prefix, filter.as_deref())
+                                .await;
+
+                            match &result {
+                                Ok(objs) if !objs.is_empty() => {
+                                    debug!("Found {} objects in {}/{}", objs.len(), bucket, prefix);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    warn!("Failed to list {}/{}: {}", bucket, prefix, e);
+                                }
+                            }
+                            result
+                        });
+                        total_tasks += 1;
+                    }
                 }
+
+                info!("Spawned {} listing tasks across {} buckets", total_tasks, config_buckets.len());
+
+                // Drain results, preserving "fail if ALL fail, warn if SOME fail"
+                let mut all_objects = Vec::new();
+                let mut errors = Vec::new();
+                let mut successful = 0usize;
+
+                let listing_start = std::time::Instant::now();
+                let report_every = (total_tasks / 10).max(1);
+
+                while let Some(join_result) = join_set.join_next().await {
+                    match join_result {
+                        Ok(Ok(objects)) => {
+                            successful += 1;
+                            all_objects.extend(objects);
+                        }
+                        Ok(Err(e)) => {
+                            errors.push(e.to_string());
+                        }
+                        Err(e) => {
+                            errors.push(format!("task panicked: {}", e));
+                        }
+                    }
+
+                    let done = successful + errors.len();
+                    if done % report_every == 0 || done == total_tasks {
+                        info!(
+                            "Listing progress: {}/{} prefixes done ({:.1}s), {} objects found",
+                            done, total_tasks, listing_start.elapsed().as_secs_f32(), all_objects.len()
+                        );
+                    }
+                }
+
+                if !errors.is_empty() {
+                    if successful == 0 {
+                        return Err(anyhow::anyhow!(
+                            "All {} prefix listings failed (first error: {})",
+                            errors.len(),
+                            errors[0]
+                        ));
+                    }
+                    warn!(
+                        "{} of {} prefix listings failed (first error: {})",
+                        errors.len(),
+                        total_tasks,
+                        errors[0]
+                    );
+                }
+
+                info!(
+                    "Listing complete: {}/{} prefixes successful, {} objects found",
+                    successful, total_tasks, all_objects.len()
+                );
 
                 // Sort by size for better load balancing
                 all_objects.sort_by_key(|o| o.size);
@@ -392,27 +437,26 @@ async fn main() -> Result<()> {
                     total_files_searched = files;
                     total_matches = matches;
                 } else {
-                    // File output mode - stream results through bounded channel to file writer
+                    // File output mode - direct writes to per-prefix gzip encoders
                     let output_dir = config
                         .as_ref()
                         .and_then(|c| c.output_dir.clone())
                         .unwrap_or_else(|| "./scrapper-output".to_string());
 
-                    let file_writer = StreamingResultWriter::new(output_dir.clone())?;
-                    let file_sender = file_writer.get_sender();
+                    let file_writer = SharedFileWriter::new(output_dir.clone())?;
 
                     let (files, matches) = downloader
                         .search_objects_to_file(
                             &all_bucket_objects,
                             searcher.clone(),
-                            file_sender,
+                            file_writer.clone(),
                         )
                         .await?;
                     total_files_searched = files;
                     total_matches = matches;
 
                     // Finish writer — flushes and finalizes all gzip files
-                    let files_written = file_writer.finish().await?;
+                    let files_written = file_writer.finish()?;
                     info!(
                         "File output complete: {} files written to {}",
                         files_written, output_dir
@@ -476,116 +520,6 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Output files written: {}", output_count);
                         println!("Output directory: {}", output_destination);
-                    }
-                }
-            }
-        }
-        Commands::List {
-            filter,
-            start,
-            end,
-        } => {
-            let end_date = if let Some(end) = end {
-                end.parse::<DateTime<Utc>>()
-                    .context("Invalid end date format")?
-            } else {
-                Utc::now()
-            };
-
-            let start_date = if let Some(start) = start {
-                Some(
-                    start
-                        .parse::<DateTime<Utc>>()
-                        .context("Invalid start date format")?,
-                )
-            } else {
-                None
-            };
-
-            // Get buckets from config
-            let config_buckets: Vec<&BucketConfig> = if let Some(ref cfg) = config {
-                cfg.buckets.iter().collect()
-            } else {
-                eprintln!("Error: No buckets specified. Provide a config file with bucket definitions.");
-                std::process::exit(1);
-            };
-
-            if config_buckets.is_empty() {
-                eprintln!("Error: No buckets to list. Add buckets to your config file.");
-                std::process::exit(1);
-            }
-
-            // Create S3 client
-            let mut s3_client = WrappedS3Client::new(&cli.region, 60, None).await?;
-
-            // Create parallel lister for efficient prefix listing (use default max_parallel of 32)
-            let parallel_lister = ParallelLister::new(32);
-
-            use crate::utils::path_formatter::generate_path_formatter;
-            for bucket_cfg in &config_buckets {
-                println!("\nBucket: {}", bucket_cfg.bucket);
-
-                if let Some(start) = start_date {
-                    // Use path formatter for date-based paths
-                    let date_hours = date_range_to_date_hour_list(&start, &end_date)?;
-                    let formatter = generate_path_formatter(bucket_cfg);
-
-                    // Build all prefixes for parallel listing
-                    let mut prefixes = Vec::new();
-                    for dh in &date_hours {
-                        prefixes.push(formatter(&dh.date, &dh.hour)?);
-                    }
-
-                    // Use parallel listing
-                    let all_objects = parallel_lister
-                        .list_prefixes_parallel(
-                            &s3_client,
-                            &bucket_cfg.bucket,
-                            prefixes,
-                            filter.as_deref(),
-                        )
-                        .await?;
-
-                    if all_objects.is_empty() {
-                        println!("  No matching objects found");
-                    } else {
-                        println!("  Found {} objects:", all_objects.len());
-                        for obj in all_objects.iter().take(100) {
-                            println!("    {} ({} bytes)", obj.key, obj.size);
-                        }
-                        if all_objects.len() > 100 {
-                            println!("    ... and {} more", all_objects.len() - 100);
-                        }
-                    }
-                } else {
-                    // No date range, use static prefix or empty
-                    let prefix = if bucket_cfg.path.is_empty() {
-                        String::new()
-                    } else {
-                        let formatter = generate_path_formatter(bucket_cfg);
-                        let empty_date = String::new();
-                        let empty_hour = String::new();
-                        formatter(&empty_date, &empty_hour)?
-                    };
-
-                    let objects = s3_client
-                        .get_matching_filenames_from_s3(
-                            &bucket_cfg.bucket,
-                            &prefix,
-                            filter.as_deref(),
-                        )
-                        .await?;
-
-                    if objects.is_empty() {
-                        println!("  No matching objects found");
-                    } else {
-                        println!("  Found {} objects:", objects.len());
-                        for obj in objects.iter().take(100) {
-                            println!("    {} ({} bytes)", obj.key, obj.size);
-                        }
-                        if objects.len() > 100 {
-                            println!("    ... and {} more", objects.len() - 100);
-                        }
                     }
                 }
             }

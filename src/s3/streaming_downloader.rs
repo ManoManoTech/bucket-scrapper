@@ -1,47 +1,18 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::search::{FileStreamingCollector, HttpMatchToSend, HttpStreamingCollector, SearchCollector, StreamSearcher};
-use crate::search::streaming_writer::MatchToWrite;
+use crate::search::{DirectFileCollector, HttpMatchToSend, HttpStreamingCollector, SearchCollector, StreamSearcher};
+use crate::search::SharedFileWriter;
 use anyhow::Result;
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use aws_sdk_s3::Client;
 use backon::{ExponentialBuilder, Retryable};
-use std::io::{self, Read};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info, warn};
-
-/// A wrapper that counts bytes read from an underlying reader
-struct CountingReader<R> {
-    inner: R,
-    bytes_read: Arc<AtomicUsize>,
-}
-
-impl<R: Read> CountingReader<R> {
-    fn new(inner: R) -> (Self, Arc<AtomicUsize>) {
-        let bytes_read = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                inner,
-                bytes_read: bytes_read.clone(),
-            },
-            bytes_read,
-        )
-    }
-}
-
-impl<R: Read> Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.bytes_read.fetch_add(n, Ordering::Relaxed);
-        Ok(n)
-    }
-}
 
 /// Progress tracking for search operations
 struct SearchProgress {
@@ -326,6 +297,7 @@ impl StreamingDownloader {
         // Clone necessary data for the blocking task
         let bucket = obj.bucket.clone();
         let key = obj.key.clone();
+        let compressed_size = content_length;
         let searcher_clone = searcher.clone();
 
         // Create a streaming collector that sends to HTTP
@@ -333,28 +305,18 @@ impl StreamingDownloader {
         http_collector.mark_file_searched();
 
         // Use spawn_blocking with SyncIoBridge for true streaming
-        let (bytes_processed, matches_found) = tokio::task::spawn_blocking(move || {
-            // Create a sync bridge from the async reader
+        let matches_found = tokio::task::spawn_blocking(move || {
             let sync_reader = SyncIoBridge::new(decompressed);
-
-            // Use a buffered reader for better performance
             let buffered_sync = std::io::BufReader::with_capacity(buffer_size, sync_reader);
 
-            // Count bytes as we read
-            let (counting_reader, bytes_counter) = CountingReader::new(buffered_sync);
+            searcher_clone.search_stream(&bucket, &key, buffered_sync, &mut http_collector)?;
 
-            // Search the stream directly, streaming results to HTTP
-            searcher_clone.search_stream(&bucket, &key, counting_reader, &mut http_collector)?;
-
-            let bytes_processed = bytes_counter.load(Ordering::Relaxed);
-            let matches_found = http_collector.match_count();
-
-            Ok::<(usize, usize), anyhow::Error>((bytes_processed, matches_found))
+            Ok::<usize, anyhow::Error>(http_collector.match_count())
         })
         .await??;
 
         debug!("Completed HTTP streaming search in {}/{}", obj.bucket, obj.key);
-        Ok((bytes_processed, matches_found))
+        Ok((compressed_size, matches_found))
     }
 
     /// Process a batch of S3 objects, streaming results to file writer via bounded channel.
@@ -365,7 +327,7 @@ impl StreamingDownloader {
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
-        file_sender: mpsc::Sender<MatchToWrite>,
+        writer: SharedFileWriter,
     ) -> Result<(usize, usize)> {
         if objects.is_empty() {
             return Ok((0, 0));
@@ -427,12 +389,12 @@ impl StreamingDownloader {
             let obj_clone = obj.clone();
             let client = self.client.clone();
             let searcher = searcher.clone();
-            let file_sender = file_sender.clone();
+            let writer = writer.clone();
             let config = self.config.clone();
 
             join_set.spawn(async move {
                 let _permit = permit; // held until task completes
-                Self::download_and_search_to_file(client, obj_clone, searcher, file_sender, config)
+                Self::download_and_search_to_file(client, obj_clone, searcher, writer, config)
                     .await
             });
 
@@ -492,7 +454,7 @@ impl StreamingDownloader {
         client: Client,
         obj: S3ObjectInfo,
         searcher: Arc<StreamSearcher>,
-        file_sender: mpsc::Sender<MatchToWrite>,
+        writer: SharedFileWriter,
         config: StreamingDownloaderConfig,
     ) -> Result<(usize, usize)> {
         let bucket = obj.bucket.clone();
@@ -503,7 +465,7 @@ impl StreamingDownloader {
                 &client,
                 &obj,
                 &searcher,
-                file_sender.clone(),
+                writer.clone(),
                 config.buffer_size_bytes,
             )
             .await
@@ -537,7 +499,7 @@ impl StreamingDownloader {
         client: &Client,
         obj: &S3ObjectInfo,
         searcher: &Arc<StreamSearcher>,
-        file_sender: mpsc::Sender<MatchToWrite>,
+        writer: SharedFileWriter,
         buffer_size: usize,
     ) -> Result<(usize, usize)> {
         debug!(
@@ -575,28 +537,25 @@ impl StreamingDownloader {
 
         let bucket = obj.bucket.clone();
         let key = obj.key.clone();
+        let compressed_size = content_length;
         let searcher_clone = searcher.clone();
 
-        // Create a file streaming collector with blocking_send backpressure
-        let mut file_collector = FileStreamingCollector::new(file_sender);
+        // Create a direct file collector that writes to SharedFileWriter
+        let mut file_collector = DirectFileCollector::new(writer);
         file_collector.mark_file_searched();
 
-        let (bytes_processed, matches_found) = tokio::task::spawn_blocking(move || {
+        let matches_found = tokio::task::spawn_blocking(move || {
             let sync_reader = SyncIoBridge::new(decompressed);
             let buffered_sync = std::io::BufReader::with_capacity(buffer_size, sync_reader);
-            let (counting_reader, bytes_counter) = CountingReader::new(buffered_sync);
 
-            searcher_clone.search_stream(&bucket, &key, counting_reader, &mut file_collector)?;
+            searcher_clone.search_stream(&bucket, &key, buffered_sync, &mut file_collector)?;
 
-            let bytes_processed = bytes_counter.load(Ordering::Relaxed);
-            let matches_found = file_collector.match_count();
-
-            Ok::<(usize, usize), anyhow::Error>((bytes_processed, matches_found))
+            Ok::<usize, anyhow::Error>(file_collector.match_count())
         })
         .await??;
 
         debug!("Completed file streaming search in {}/{}", obj.bucket, obj.key);
-        Ok((bytes_processed, matches_found))
+        Ok((compressed_size, matches_found))
     }
 }
 
