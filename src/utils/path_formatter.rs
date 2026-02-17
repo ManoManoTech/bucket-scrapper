@@ -31,17 +31,17 @@ fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
         let regex = Regex::new(r"2006\/01\/02\/15").unwrap();
         let key_prefix = regex.replace_all(&prefix, "").to_string();
 
-        return Box::new(move |date: &DateString, hour: &HourString| {
+        Box::new(move |date: &DateString, hour: &HourString| {
             let formatted = raw_logs_date_format(date, hour)?;
             Ok(format!("{key_prefix}{formatted}"))
-        });
+        })
     } else {
         warn!(prefix = %prefix, "No date formatter found for prefix");
 
         let prefix_clone = prefix.clone();
-        return Box::new(move |date: &DateString, hour: &HourString| {
+        Box::new(move |date: &DateString, hour: &HourString| {
             Ok(format!("{}{}", prefix_clone, empty_date_format(date, hour)))
-        });
+        })
     }
 }
 
