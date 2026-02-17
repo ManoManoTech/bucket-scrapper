@@ -1,6 +1,5 @@
 // src/search/streaming_writer.rs
 use anyhow::Result;
-use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -47,7 +46,7 @@ impl SharedFileWriter {
 
     /// Write a single match to the appropriate zstd file.
     /// Called from spawn_blocking search tasks — fully synchronous.
-    pub fn write_match(&self, prefix: &str, bucket: &str, key: &str, content: &str) -> Result<()> {
+    pub fn write_match(&self, prefix: &str, content: &str) -> Result<()> {
         // Fast path: read-lock to find existing encoder
         let encoder_arc = {
             let map = self.encoders.read().unwrap_or_else(|e| e.into_inner());
@@ -77,12 +76,8 @@ impl SharedFileWriter {
         // Lock only this prefix's encoder
         let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
 
-        let output_line = json!({
-            "file": format!("{}/{}", bucket, key),
-            "content": content.trim()
-        });
-
-        writeln!(encoder, "{}", output_line)?;
+        encoder.write_all(content.trim().as_bytes())?;
+        encoder.write_all(b"\n")?;
 
         self.matches_written.fetch_add(1, Ordering::Relaxed);
 

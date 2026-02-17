@@ -23,12 +23,12 @@ impl DirectFileCollector {
 }
 
 impl SearchCollector for DirectFileCollector {
-    fn add_match(&mut self, bucket: &str, key: &str, _line_number: u64, line: &str) -> bool {
+    fn add_match(&mut self, _bucket: &str, key: &str, _line_number: u64, line: &str) -> bool {
         self.match_count += 1;
 
         let prefix = extract_prefix(key);
 
-        match self.writer.write_match(&prefix, bucket, key, line) {
+        match self.writer.write_match(&prefix, line) {
             Ok(()) => true,
             Err(e) => {
                 warn!(
