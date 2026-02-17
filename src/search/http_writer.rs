@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
-use super::result_collector::SearchCollector;
+use super::result_exporter::SearchExporter;
 
 /// Configuration for the HTTP writer
 #[derive(Debug, Clone)]
@@ -223,14 +223,14 @@ impl HttpResultWriter {
     }
 }
 
-/// A collector that streams results to an HTTP API instead of storing in memory.
-/// Implements SearchCollector trait for use with generic search functions.
-pub struct HttpStreamingCollector {
+/// An exporter that streams results to an HTTP API instead of storing in memory.
+/// Implements SearchExporter trait for use with generic search functions.
+pub struct HttpStreamingExporter {
     sender: mpsc::Sender<String>,
     match_count: usize,
 }
 
-impl HttpStreamingCollector {
+impl HttpStreamingExporter {
     pub fn new(sender: mpsc::Sender<String>) -> Self {
         Self {
             sender,
@@ -239,7 +239,7 @@ impl HttpStreamingCollector {
     }
 }
 
-impl SearchCollector for HttpStreamingCollector {
+impl SearchExporter for HttpStreamingExporter {
     fn add_match(&mut self, line: &str) -> Result<()> {
         match self.sender.try_send(line.to_string()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {

@@ -5,7 +5,7 @@ use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
 use std::io::BufRead;
 use tracing::debug;
 
-use super::result_collector::SearchCollector;
+use super::result_exporter::SearchExporter;
 
 /// Configuration for the stream searcher
 #[derive(Clone)]
@@ -42,29 +42,29 @@ impl StreamSearcher {
         Ok(Self { matcher })
     }
 
-    /// Search through a readable stream and collect results using any SearchCollector.
+    /// Search through a readable stream and export results using any SearchExporter.
     /// When no pattern is configured, all lines are yielded via a fast BufRead loop.
-    pub fn search_stream<R: BufRead, C: SearchCollector>(
+    pub fn search_stream<R: BufRead, E: SearchExporter>(
         &self,
         bucket: &str,
         key: &str,
         reader: R,
-        collector: &mut C,
+        exporter: &mut E,
     ) -> Result<()> {
         debug!(bucket = %bucket, key = %key, "Starting search");
 
         match self.matcher {
-            Some(ref matcher) => self.search_stream_regex(bucket, key, reader, collector, matcher),
-            None => self.search_stream_all_lines(bucket, key, reader, collector),
+            Some(ref matcher) => self.search_stream_regex(bucket, key, reader, exporter, matcher),
+            None => self.search_stream_all_lines(bucket, key, reader, exporter),
         }
     }
 
-    fn search_stream_regex<R: BufRead, C: SearchCollector>(
+    fn search_stream_regex<R: BufRead, E: SearchExporter>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
-        collector: &mut C,
+        exporter: &mut E,
         matcher: &RegexMatcher,
     ) -> Result<()> {
         let mut searcher_builder = SearcherBuilder::new();
@@ -81,7 +81,7 @@ impl StreamSearcher {
             matcher,
             &mut reader,
             grep_searcher::sinks::UTF8(|_line_num, line| {
-                collector
+                exporter
                     .add_match(line)
                     .map_err(std::io::Error::other)?;
                 match_count += 1;
@@ -96,12 +96,12 @@ impl StreamSearcher {
         Ok(())
     }
 
-    fn search_stream_all_lines<R: BufRead, C: SearchCollector>(
+    fn search_stream_all_lines<R: BufRead, E: SearchExporter>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
-        collector: &mut C,
+        exporter: &mut E,
     ) -> Result<()> {
         let mut buf = String::new();
         let mut line_count = 0u64;
@@ -111,7 +111,7 @@ impl StreamSearcher {
             if reader.read_line(&mut buf)? == 0 {
                 break;
             }
-            collector.add_match(&buf)?;
+            exporter.add_match(&buf)?;
             line_count += 1;
         }
         if line_count > 0 {

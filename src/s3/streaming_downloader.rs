@@ -1,6 +1,6 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::search::{DirectFileCollector, HttpStreamingCollector, SearchCollector, StreamSearcher};
+use crate::search::{DirectFileExporter, HttpStreamingExporter, SearchExporter, StreamSearcher};
 use crate::search::SharedFileWriter;
 use anyhow::Result;
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
@@ -116,7 +116,7 @@ impl StreamingDownloader {
         http_sender: mpsc::Sender<String>,
     ) -> Result<(usize, usize)> {
         self.search_objects(objects, searcher, move |_obj: &S3ObjectInfo| {
-            HttpStreamingCollector::new(http_sender.clone())
+            HttpStreamingExporter::new(http_sender.clone())
         })
         .await
     }
@@ -132,24 +132,24 @@ impl StreamingDownloader {
         writer: SharedFileWriter,
     ) -> Result<(usize, usize)> {
         self.search_objects(objects, searcher, move |obj: &S3ObjectInfo| {
-            DirectFileCollector::new(writer.clone(), obj.prefix.clone())
+            DirectFileExporter::new(writer.clone(), obj.prefix.clone())
         })
         .await
     }
 
     /// Generic batch processor: downloads S3 objects and searches them using the
-    /// collector produced by `collector_factory` for each object.
+    /// exporter produced by `exporter_factory` for each object.
     /// Uses lazy spawning (semaphore before spawn) + JoinSet, abort-on-first-error.
     /// Returns (files_searched, total_matches)
-    async fn search_objects<C, F>(
+    async fn search_objects<E, F>(
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
-        collector_factory: F,
+        exporter_factory: F,
     ) -> Result<(usize, usize)>
     where
-        C: SearchCollector + Send + 'static,
-        F: Fn(&S3ObjectInfo) -> C + Clone + Send + Sync + 'static,
+        E: SearchExporter + Send + 'static,
+        F: Fn(&S3ObjectInfo) -> E + Clone + Send + Sync + 'static,
     {
         if objects.is_empty() {
             return Ok((0, 0));
@@ -217,7 +217,7 @@ impl StreamingDownloader {
             let client = self.client.clone();
             let searcher = searcher.clone();
             let config = self.config.clone();
-            let factory = collector_factory.clone();
+            let factory = exporter_factory.clone();
 
             join_set.spawn(async move {
                 let _permit = permit; // held until task completes
@@ -266,26 +266,26 @@ impl StreamingDownloader {
     }
 
     /// Download a single object and search it with retries.
-    /// `make_collector` is called per retry attempt because `spawn_blocking` consumes
-    /// the collector. Collectors are cheap (Arc clone + counter reset).
+    /// `make_exporter` is called per retry attempt because `spawn_blocking` consumes
+    /// the exporter. Exporters are cheap (Arc clone + counter reset).
     /// Returns (bytes_processed, matches_found)
-    async fn download_and_search<C, F>(
+    async fn download_and_search<E, F>(
         client: Client,
         obj: S3ObjectInfo,
         searcher: Arc<StreamSearcher>,
-        make_collector: F,
+        make_exporter: F,
         config: StreamingDownloaderConfig,
     ) -> Result<(usize, usize)>
     where
-        C: SearchCollector + Send + 'static,
-        F: Fn(&S3ObjectInfo) -> C,
+        E: SearchExporter + Send + 'static,
+        F: Fn(&S3ObjectInfo) -> E,
     {
         let bucket = obj.bucket.clone();
         let key = obj.key.clone();
 
         let inner = || async {
-            let collector = make_collector(&obj);
-            Self::download_and_search_inner(&client, &obj, &searcher, collector, config.buffer_size_bytes)
+            let exporter = make_exporter(&obj);
+            Self::download_and_search_inner(&client, &obj, &searcher, exporter, config.buffer_size_bytes)
                 .await
         };
 
@@ -313,11 +313,11 @@ impl StreamingDownloader {
 
     /// Download and search a single S3 object (without retries).
     /// Returns (compressed_size, matches_found)
-    async fn download_and_search_inner<C: SearchCollector + Send + 'static>(
+    async fn download_and_search_inner<E: SearchExporter + Send + 'static>(
         client: &Client,
         obj: &S3ObjectInfo,
         searcher: &Arc<StreamSearcher>,
-        mut collector: C,
+        mut exporter: E,
         buffer_size: usize,
     ) -> Result<(usize, usize)> {
         debug!(
@@ -366,9 +366,9 @@ impl StreamingDownloader {
             let sync_reader = SyncIoBridge::new(decompressed);
             let buffered_sync = std::io::BufReader::with_capacity(buffer_size, sync_reader);
 
-            searcher_clone.search_stream(&bucket, &key, buffered_sync, &mut collector)?;
+            searcher_clone.search_stream(&bucket, &key, buffered_sync, &mut exporter)?;
 
-            Ok::<usize, anyhow::Error>(collector.match_count())
+            Ok::<usize, anyhow::Error>(exporter.match_count())
         })
         .await??;
 
