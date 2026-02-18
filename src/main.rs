@@ -347,9 +347,8 @@ async fn main() -> Result<()> {
 
                 info!(tasks = total_tasks, buckets = config_buckets.len(), "Spawned listing tasks");
 
-                // Drain results, preserving "fail if ALL fail, warn if SOME fail"
+                // Drain results — abort all remaining tasks on first failure
                 let mut all_objects = Vec::new();
-                let mut errors = Vec::new();
                 let mut successful = 0usize;
 
                 let listing_start = std::time::Instant::now();
@@ -362,40 +361,25 @@ async fn main() -> Result<()> {
                             all_objects.extend(objects);
                         }
                         Ok(Err(e)) => {
-                            errors.push(e.to_string());
+                            join_set.abort_all();
+                            return Err(e.context("Prefix listing failed, aborting"));
                         }
                         Err(e) => {
-                            errors.push(format!("task panicked: {e}"));
+                            join_set.abort_all();
+                            return Err(anyhow::anyhow!("Listing task panicked: {e}"));
                         }
                     }
 
-                    let done = successful + errors.len();
-                    if done < total_tasks && last_report.elapsed() >= std::time::Duration::from_secs(5) {
+                    if successful < total_tasks && last_report.elapsed() >= std::time::Duration::from_secs(5) {
                         last_report = std::time::Instant::now();
                         info!(
-                            prefixes_done = done,
+                            prefixes_done = successful,
                             prefixes_total = total_tasks,
                             elapsed_s = listing_start.elapsed().as_secs_f32(),
                             objects = all_objects.len(),
                             "Listing progress"
                         );
                     }
-                }
-
-                if !errors.is_empty() {
-                    if successful == 0 {
-                        return Err(anyhow::anyhow!(
-                            "All {} prefix listings failed (first error: {})",
-                            errors.len(),
-                            errors[0]
-                        ));
-                    }
-                    warn!(
-                        failed = errors.len(),
-                        total = total_tasks,
-                        first_error = %errors[0],
-                        "Some prefix listings failed"
-                    );
                 }
 
                 info!(
