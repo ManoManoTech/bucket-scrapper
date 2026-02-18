@@ -1,9 +1,10 @@
 // src/search/http_writer.rs
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use reqwest::Client;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 use super::result_exporter::SearchExporter;
@@ -129,64 +130,78 @@ impl HttpResultWriter {
         lines_sent: Arc<AtomicUsize>,
         lines_dropped: Arc<AtomicUsize>,
     ) -> usize {
-        let mut batch: Vec<String> = Vec::new();
-        let mut batch_bytes = 0usize;
+        let mut batch_body = String::with_capacity(config.batch_max_bytes);
+        let mut batch_lines = 0usize;
         let mut total_sent = 0usize;
+        let mut batches_sent: u64 = 0;
+        let mut last_stats_log = Instant::now();
 
         while let Ok(line) = write_rx.recv_async().await {
             let line_bytes = line.len();
 
             // Flush if adding this line would exceed the byte limit
-            if !batch.is_empty() && (batch_bytes + line_bytes > config.batch_max_bytes) {
-                match Self::send_batch(&client, &config, &batch).await {
+            if batch_lines > 0 && (batch_body.len() + line_bytes > config.batch_max_bytes) {
+                match Self::send_batch(&client, &config, &batch_body, batch_lines).await {
                     Ok(count) => {
                         total_sent += count;
+                        batches_sent += 1;
                         lines_sent.fetch_add(count, Ordering::Relaxed);
-                        debug!(task = task_id, lines = count, bytes = batch_bytes, url = %config.url, "Sent batch");
+                        debug!(task = task_id, lines = count, bytes = batch_body.len(), url = %config.url, "Sent batch");
                     }
                     Err(e) => {
-                        lines_dropped.fetch_add(batch.len(), Ordering::Relaxed);
-                        error!(task = task_id, lines = batch.len(), bytes = batch_bytes, error = %e, "Failed to send batch");
+                        lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
+                        error!(task = task_id, lines = batch_lines, bytes = batch_body.len(), error = %e, "Failed to send batch");
                     }
                 }
-                batch.clear();
-                batch_bytes = 0;
+                batch_body.clear();
+                batch_lines = 0;
             }
 
-            batch.push(line);
-            batch_bytes += line_bytes;
+            batch_body.push_str(&line);
+            batch_lines += 1;
+
+            if last_stats_log.elapsed() > Duration::from_secs(30) {
+                debug!(
+                    task = task_id,
+                    channel_len = write_rx.len(),
+                    channel_full = write_rx.is_full(),
+                    batches_sent = batches_sent,
+                    "Upload task stats"
+                );
+                last_stats_log = Instant::now();
+            }
         }
 
         // Send remaining items in the final batch
-        if !batch.is_empty() {
-            let final_batch_bytes = batch_bytes;
-            let final_batch_lines = batch.len();
-            match Self::send_batch(&client, &config, &batch).await {
+        if batch_lines > 0 {
+            match Self::send_batch(&client, &config, &batch_body, batch_lines).await {
                 Ok(count) => {
                     total_sent += count;
                     lines_sent.fetch_add(count, Ordering::Relaxed);
                     info!(task = task_id, lines = count, url = %config.url, "Sent final batch");
                 }
                 Err(e) => {
-                    lines_dropped.fetch_add(final_batch_lines, Ordering::Relaxed);
-                    error!(task = task_id, lines = final_batch_lines, bytes = final_batch_bytes, error = %e, "Failed to send final batch");
+                    lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
+                    error!(task = task_id, lines = batch_lines, bytes = batch_body.len(), error = %e, "Failed to send final batch");
                 }
             }
         }
 
-        info!(task = task_id, total_lines = total_sent, "HTTP writer task finished");
+        info!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "HTTP writer task finished");
         total_sent
     }
 
-    /// Send a batch of log lines to the HTTP API
+    /// Send a batch of log lines to the HTTP API.
+    /// `body` is a pre-built NDJSON string; `count` is the number of lines it contains.
     async fn send_batch(
         client: &Client,
         config: &HttpWriterConfig,
-        batch: &[String],
+        body: &str,
+        count: usize,
     ) -> Result<usize> {
-        let count = batch.len();
-        // Lines are \n-terminated by the searcher, so empty-join produces valid NDJSON.
-        let body = batch.join("");
+        // Convert to Bytes once — clone() is an O(1) Arc bump, not a full copy.
+        let body_bytes = Bytes::from(body.to_owned());
+        let body_len = body_bytes.len();
 
         let mut last_error = None;
 
@@ -206,7 +221,7 @@ impl HttpResultWriter {
                 .post(&config.url)
                 .header("Content-Type", "application/x-ndjson")
                 .header("Authorization", format!("Bearer {}", config.api_key))
-                .body(body.clone())
+                .body(body_bytes.clone())
                 .send()
                 .await;
 
@@ -218,12 +233,12 @@ impl HttpResultWriter {
                     if status.is_success() {
                         debug!(
                             lines = count,
-                            bytes = body.len(),
+                            bytes = body_len,
                             status = %status,
                             response = %response_body,
                             "HTTP batch sent"
                         );
-                        trace!(payload = %body, "HTTP batch payload");
+                        trace!(payload = %std::str::from_utf8(&body_bytes).unwrap_or("<invalid utf8>"), "HTTP batch payload");
                         return Ok(count);
                     } else {
                         last_error = Some(anyhow::anyhow!(

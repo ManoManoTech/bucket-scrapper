@@ -72,7 +72,6 @@ impl SearchProgress {
 pub struct StreamingDownloaderConfig {
     pub max_concurrent_downloads: usize,
     pub buffer_size_bytes: usize,
-    pub channel_buffer_size: usize,
     pub max_retries: u32,
     pub initial_retry_delay: Duration,
 }
@@ -82,7 +81,6 @@ impl Default for StreamingDownloaderConfig {
         Self {
             max_concurrent_downloads: 32,
             buffer_size_bytes: 64 * 1024, // 64KB chunks
-            channel_buffer_size: 100,
             max_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
         }

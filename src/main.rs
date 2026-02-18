@@ -253,7 +253,6 @@ async fn main() -> Result<()> {
             let download_config = StreamingDownloaderConfig {
                 max_concurrent_downloads: max_parallel,
                 buffer_size_bytes: buffer_size_kb * 1024,
-                channel_buffer_size: channel_buffer,
                 max_retries,
                 initial_retry_delay: Duration::from_secs(retry_delay),
             };
