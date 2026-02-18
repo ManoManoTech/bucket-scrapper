@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::Client;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -15,6 +15,16 @@ struct CompressedBatch {
     body: Bytes,
     lines: usize,
     plaintext_bytes: usize,
+}
+
+/// Result of a batch send attempt.
+enum SendResult {
+    /// Batch was accepted by the server.
+    Ok,
+    /// Retryable failure (server error, timeout) — log and continue with next batch.
+    Retryable(anyhow::Error),
+    /// Fatal failure (4xx client error) — stop the entire pipeline.
+    Fatal(anyhow::Error),
 }
 
 /// Configuration for the HTTP writer
@@ -85,6 +95,8 @@ pub struct HttpResultWriter {
     compressed_bytes_sent: Arc<AtomicUsize>,
     /// Tracks total plaintext bytes sent (shared with uploader tasks)
     plaintext_bytes_sent: Arc<AtomicUsize>,
+    /// Set on fatal (4xx) errors to stop the entire pipeline
+    fatal_error: Arc<AtomicBool>,
     /// URL for display purposes
     url: String,
 }
@@ -116,6 +128,7 @@ impl HttpResultWriter {
         let lines_dropped = Arc::new(AtomicUsize::new(0));
         let compressed_bytes_sent = Arc::new(AtomicUsize::new(0));
         let plaintext_bytes_sent = Arc::new(AtomicUsize::new(0));
+        let fatal_error = Arc::new(AtomicBool::new(false));
         let url = config.url.clone();
 
         // Spawn compressor tasks (CPU-bound: line_rx → batch_tx)
@@ -125,8 +138,9 @@ impl HttpResultWriter {
             let tx = batch_tx.clone();
             let cfg = config.clone();
             let ld = lines_dropped.clone();
+            let fe = fatal_error.clone();
             let handle = tokio::spawn(async move {
-                Self::compressor_task(task_id, rx, tx, cfg, ld).await;
+                Self::compressor_task(task_id, rx, tx, cfg, ld, fe).await;
             });
             compressor_handles.push(handle);
         }
@@ -141,8 +155,9 @@ impl HttpResultWriter {
             let ld = lines_dropped.clone();
             let cb = compressed_bytes_sent.clone();
             let pb = plaintext_bytes_sent.clone();
+            let fe = fatal_error.clone();
             let handle = tokio::spawn(async move {
-                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb).await
+                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, fe).await
             });
             upload_handles.push(handle);
         }
@@ -161,6 +176,7 @@ impl HttpResultWriter {
             lines_dropped,
             compressed_bytes_sent,
             plaintext_bytes_sent,
+            fatal_error,
             url,
         })
     }
@@ -183,11 +199,17 @@ impl HttpResultWriter {
         batch_tx: flume::Sender<CompressedBatch>,
         config: HttpWriterConfig,
         lines_dropped: Arc<AtomicUsize>,
+        fatal_error: Arc<AtomicBool>,
     ) {
         let mut batches_produced: u64 = 0;
         let mut channel_closed = false;
 
         'outer: loop {
+            // Stop immediately if an uploader hit a fatal error
+            if fatal_error.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+
             // 1. Wait for first line (or break if channel closed)
             let first_line = match line_rx.recv_async().await {
                 Ok(line) => line,
@@ -292,6 +314,7 @@ impl HttpResultWriter {
         lines_dropped: Arc<AtomicUsize>,
         compressed_bytes_sent: Arc<AtomicUsize>,
         plaintext_bytes_sent: Arc<AtomicUsize>,
+        fatal_error: Arc<AtomicBool>,
     ) -> usize {
         let mut total_sent = 0usize;
         let mut batches_sent: u64 = 0;
@@ -301,7 +324,7 @@ impl HttpResultWriter {
             let batch_compressed_bytes = batch.body.len();
 
             match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
-                Ok(()) => {
+                SendResult::Ok => {
                     total_sent += batch.lines;
                     batches_sent += 1;
                     lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
@@ -316,7 +339,7 @@ impl HttpResultWriter {
                         "Sent batch"
                     );
                 }
-                Err(e) => {
+                SendResult::Retryable(e) => {
                     lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
                     error!(
                         task = task_id,
@@ -325,6 +348,18 @@ impl HttpResultWriter {
                         error = %e,
                         "Failed to send batch"
                     );
+                }
+                SendResult::Fatal(e) => {
+                    lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                    error!(
+                        task = task_id,
+                        lines = batch.lines,
+                        compressed_bytes = batch_compressed_bytes,
+                        error = %e,
+                        "Fatal error, stopping pipeline"
+                    );
+                    fatal_error.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
 
@@ -345,12 +380,13 @@ impl HttpResultWriter {
 
     /// Send a zstd-compressed batch to the HTTP API with retries.
     /// `body` has a known length so reqwest sets Content-Length, enabling connection reuse.
+    /// Returns `Fatal` on 4xx client errors (caller should stop the pipeline).
     async fn send_batch(
         client: &Client,
         config: &HttpWriterConfig,
         body: &Bytes,
         count: usize,
-    ) -> Result<()> {
+    ) -> SendResult {
         let mut last_error = None;
 
         for attempt in 0..=config.max_retries {
@@ -387,16 +423,15 @@ impl HttpResultWriter {
                             response = %response_body,
                             "HTTP batch sent"
                         );
-                        return Ok(());
+                        return SendResult::Ok;
+                    } else if status.is_client_error() {
+                        return SendResult::Fatal(anyhow::anyhow!(
+                            "HTTP {status}: {response_body}"
+                        ));
                     } else {
                         last_error = Some(anyhow::anyhow!(
                             "HTTP {status} from API: {response_body}"
                         ));
-
-                        // Don't retry on 4xx errors (client errors)
-                        if status.is_client_error() {
-                            break;
-                        }
                     }
                 }
                 Err(e) => {
@@ -405,7 +440,9 @@ impl HttpResultWriter {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")))
+        SendResult::Retryable(
+            last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")),
+        )
     }
 
     /// Finish writing and return stats for all tasks.
@@ -438,12 +475,22 @@ impl HttpResultWriter {
             }
         }
 
-        Ok(HttpWriterStats {
+        let stats = HttpWriterStats {
             lines_sent: total,
             lines_dropped: self.lines_dropped.load(Ordering::Relaxed),
             compressed_bytes_sent: self.compressed_bytes_sent.load(Ordering::Relaxed),
             plaintext_bytes_sent: self.plaintext_bytes_sent.load(Ordering::Relaxed),
-        })
+        };
+
+        if self.fatal_error.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!(
+                "Pipeline aborted due to fatal HTTP error (lines_sent={}, lines_dropped={})",
+                stats.lines_sent,
+                stats.lines_dropped,
+            ));
+        }
+
+        Ok(stats)
     }
 
     /// Get the configured URL
