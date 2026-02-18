@@ -25,16 +25,16 @@ output_dir: ./scrapper-output
 
 # Example usage:
 # Search for errors in today's logs:
-# bucket-scrapper search -p "ERROR.*timeout" 
+# bucket-scrapper -p "ERROR.*timeout" 
 #
 # Search specific date range:
-# bucket-scrapper search -p "exception" --start 2024-01-01T00:00:00Z --end 2024-01-02T00:00:00Z
+# bucket-scrapper -p "exception" --start 2024-01-01T00:00:00Z --end 2024-01-02T00:00:00Z
 #
 # List files for a specific date/hour:
 # bucket-scrapper list --start 2024-01-15T10:00:00Z --end 2024-01-15T11:00:00Z
 #
 # Search with case-insensitive and context:
-# bucket-scrapper search -p "failed.*auth" -i -C 3
+# bucket-scrapper -p "failed.*auth" -i -C 3
 #
 # Count matches per file:
-# bucket-scrapper search -p "WARNING" --count
+# bucket-scrapper -p "WARNING" --count

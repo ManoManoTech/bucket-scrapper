@@ -53,23 +53,23 @@ Results are automatically saved to compressed files in the output directory, org
 
 ```bash
 # Search using config file buckets
-bucket-scrapper search -p "ERROR.*timeout"
+bucket-scrapper -p "ERROR.*timeout"
 # Creates: ./scrapper-output/20240115H10.gz, ./scrapper-output/20240115H11.gz, etc.
 
 # Search specific date range
-bucket-scrapper search -p "exception" \
+bucket-scrapper -p "exception" \
   --start 2024-01-15T10:00:00Z \
   --end 2024-01-15T12:00:00Z
 # Creates: ./scrapper-output/20240115H10.gz, ./scrapper-output/20240115H11.gz
 
 # Case insensitive search
-bucket-scrapper search -p "failed" -i
+bucket-scrapper -p "failed" -i
 
 # Count matches only (still saves to files)
-bucket-scrapper search -p "WARNING" --count
+bucket-scrapper -p "WARNING" --count
 
 # JSON summary output
-bucket-scrapper search -p "error" --output json
+bucket-scrapper -p "error" --output json
 ```
 
 #### HTTP Output (HTTP/REST API)
@@ -78,7 +78,7 @@ Send results directly to an HTTP API instead of writing to files. Results are se
 
 ```bash
 # Send results to HTTP API
-bucket-scrapper search -p "ERROR" \
+bucket-scrapper -p "ERROR" \
   --http-output \
   --http-url "https://intake.handy-mango.http.com/api/v1/logs" \
   --http-api-key "your-api-key"
@@ -86,10 +86,10 @@ bucket-scrapper search -p "ERROR" \
 # Using environment variables
 export HTTP_URL="https://intake.handy-mango.http.com/api/v1/logs"
 export HTTP_BEARER_AUTH="your-api-key"
-bucket-scrapper search -p "ERROR" --http-output
+bucket-scrapper -p "ERROR" --http-output
 
 # With custom batch size (in MB) and timeout
-bucket-scrapper search -p "ERROR" \
+bucket-scrapper -p "ERROR" \
   --http-output \
   --http-batch-max-mb 5 \
   --http-timeout 60
@@ -104,24 +104,9 @@ Each output file (e.g., `20240115H10.gz`) contains JSON lines with matching entr
 {"file":"support-infra-log-consolidator-archives/log-archives/dt=20240115/hour=10/api.json.zst","line":89,"content":"ERROR: Authentication failed for user"}
 ```
 
-### List objects in buckets
-
-```bash
-# List all objects
-bucket-scrapper list -b my-logs
-
-# Filter by pattern
-bucket-scrapper list -b my-logs -f "*.gz"
-
-# List with date range
-bucket-scrapper list -b my-archive \
-  --start 2024-01-01T00:00:00Z \
-  --end 2024-01-31T23:59:59Z
-```
-
 ## Command Line Options
 
-### Global Options
+### General Options
 - `-c, --config` - Config file path (default: config-scrapper.yml)
 - `-r, --region` - AWS region (default: eu-west-3)
 - `-v, --log-level` - Log level: trace, debug, info, warn, error
@@ -166,17 +151,17 @@ The tool uses standard AWS authentication methods:
 
 ### Finding errors in application logs
 ```bash
-bucket-scrapper search -p "ERROR|FATAL" -b app-logs --ignore-case
+bucket-scrapper -p "ERROR|FATAL" -b app-logs --ignore-case
 ```
 
 ### Searching for specific user activity
 ```bash
-bucket-scrapper search -p "userId=12345" -b api-logs,app-logs -C 5
+bucket-scrapper -p "userId=12345" -b api-logs,app-logs -C 5
 ```
 
 ### Analyzing log patterns over time
 ```bash
-bucket-scrapper search -p "timeout|deadline" -b prod-logs \
+bucket-scrapper -p "timeout|deadline" -b prod-logs \
   --start 2024-01-01T00:00:00Z \
   --count \
   --output json
@@ -184,7 +169,7 @@ bucket-scrapper search -p "timeout|deadline" -b prod-logs \
 
 ### Finding large response payloads
 ```bash
-bucket-scrapper search -p '"size":\s*[0-9]{7,}' -b api-responses
+bucket-scrapper -p '"size":\s*[0-9]{7,}' -b api-responses
 ```
 
 ## Performance Considerations
