@@ -1,58 +1,20 @@
 // src/search/http_writer.rs
 use anyhow::{Context, Result};
-use async_compression::tokio::write::ZstdEncoder;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use reqwest::Client;
-use std::pin::Pin;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, warn};
 
 use super::result_exporter::SearchExporter;
 
-/// Wraps a `DuplexStream` write-half, counting bytes written through it.
-struct CountedWriter {
-    inner: DuplexStream,
-    counter: Arc<AtomicUsize>,
-}
-
-impl CountedWriter {
-    fn new(inner: DuplexStream, counter: Arc<AtomicUsize>) -> Self {
-        Self { inner, counter }
-    }
-}
-
-impl AsyncWrite for CountedWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let pin = Pin::new(&mut self.inner);
-        match pin.poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => {
-                self.counter.fetch_add(n, Ordering::Relaxed);
-                Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
+/// A zstd-compressed batch ready for HTTP upload.
+struct CompressedBatch {
+    body: Bytes,
+    lines: usize,
+    plaintext_bytes: usize,
 }
 
 /// Configuration for the HTTP writer
@@ -68,16 +30,24 @@ pub struct HttpWriterConfig {
     pub timeout_secs: u64,
     /// Maximum retry attempts for failed requests
     pub max_retries: u32,
-    /// Channel buffer size for backpressure control
+    /// Channel buffer size for backpressure control (line channel)
     pub channel_buffer_size: usize,
-    /// Number of concurrent upload tasks consuming from the shared channel
+    /// Number of CPU-bound compressor tasks
+    pub num_compressor_tasks: usize,
+    /// Number of IO-bound upload tasks (default: 4× compressor tasks)
     pub num_upload_tasks: usize,
+    /// Batch channel capacity between compressors and uploaders (RAM ≈ this × batch_max_bytes)
+    pub upload_channel_size: usize,
     /// Zstd compression level (1-22)
     pub compression_level: i32,
 }
 
 impl Default for HttpWriterConfig {
     fn default() -> Self {
+        let num_compressor_tasks = std::thread::available_parallelism()
+            .map(|n| n.get() / 8)
+            .unwrap_or(1)
+            .max(1);
         Self {
             url: String::new(),
             api_key: String::new(),
@@ -85,10 +55,9 @@ impl Default for HttpWriterConfig {
             timeout_secs: 30,
             max_retries: 3,
             channel_buffer_size: 1000,
-            num_upload_tasks: std::thread::available_parallelism()
-                .map(|n| n.get() / 8)
-                .unwrap_or(1)
-                .max(1),
+            num_compressor_tasks,
+            num_upload_tasks: 4 * num_compressor_tasks,
+            upload_channel_size: 4,
             compression_level: 3,
         }
     }
@@ -106,21 +75,22 @@ pub struct HttpWriterStats {
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
     write_tx: flume::Sender<String>,
-    write_handles: Vec<tokio::task::JoinHandle<usize>>,
-    /// Tracks total lines sent (shared with writer tasks)
+    compressor_handles: Vec<tokio::task::JoinHandle<()>>,
+    upload_handles: Vec<tokio::task::JoinHandle<usize>>,
+    /// Tracks total lines sent (shared with uploader tasks)
     lines_sent: Arc<AtomicUsize>,
-    /// Tracks total lines dropped on batch failures (shared with writer tasks)
+    /// Tracks total lines dropped on batch failures (shared with tasks)
     lines_dropped: Arc<AtomicUsize>,
-    /// Tracks total compressed bytes sent (shared with writer tasks)
+    /// Tracks total compressed bytes sent (shared with uploader tasks)
     compressed_bytes_sent: Arc<AtomicUsize>,
-    /// Tracks total plaintext bytes sent (shared with writer tasks)
+    /// Tracks total plaintext bytes sent (shared with uploader tasks)
     plaintext_bytes_sent: Arc<AtomicUsize>,
     /// URL for display purposes
     url: String,
 }
 
 impl HttpResultWriter {
-    /// Create a new HTTP writer with N concurrent upload tasks
+    /// Create a new HTTP writer with separate compressor and uploader pools
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs));
@@ -137,17 +107,34 @@ impl HttpResultWriter {
         let client = builder.build()
             .context("Failed to create HTTP client")?;
 
-        let (write_tx, write_rx) = flume::bounded::<String>(config.channel_buffer_size);
+        // Line channel: searchers → compressors
+        let (write_tx, line_rx) = flume::bounded::<String>(config.channel_buffer_size);
+        // Batch channel: compressors → uploaders
+        let (batch_tx, batch_rx) = flume::bounded::<CompressedBatch>(config.upload_channel_size);
+
         let lines_sent = Arc::new(AtomicUsize::new(0));
         let lines_dropped = Arc::new(AtomicUsize::new(0));
         let compressed_bytes_sent = Arc::new(AtomicUsize::new(0));
         let plaintext_bytes_sent = Arc::new(AtomicUsize::new(0));
         let url = config.url.clone();
-        let num_tasks = config.num_upload_tasks;
 
-        let mut write_handles = Vec::with_capacity(num_tasks);
-        for task_id in 0..num_tasks {
-            let rx = write_rx.clone();
+        // Spawn compressor tasks (CPU-bound: line_rx → batch_tx)
+        let mut compressor_handles = Vec::with_capacity(config.num_compressor_tasks);
+        for task_id in 0..config.num_compressor_tasks {
+            let rx = line_rx.clone();
+            let tx = batch_tx.clone();
+            let cfg = config.clone();
+            let ld = lines_dropped.clone();
+            let handle = tokio::spawn(async move {
+                Self::compressor_task(task_id, rx, tx, cfg, ld).await;
+            });
+            compressor_handles.push(handle);
+        }
+
+        // Spawn uploader tasks (IO-bound: batch_rx → HTTP)
+        let mut upload_handles = Vec::with_capacity(config.num_upload_tasks);
+        for task_id in 0..config.num_upload_tasks {
+            let rx = batch_rx.clone();
             let client = client.clone();
             let cfg = config.clone();
             let ls = lines_sent.clone();
@@ -155,14 +142,21 @@ impl HttpResultWriter {
             let cb = compressed_bytes_sent.clone();
             let pb = plaintext_bytes_sent.clone();
             let handle = tokio::spawn(async move {
-                Self::writer_task(task_id, rx, client, cfg, ls, ld, cb, pb).await
+                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb).await
             });
-            write_handles.push(handle);
+            upload_handles.push(handle);
         }
+
+        // Drop original receiver/sender — only task clones hold them,
+        // so channel closure propagates automatically when tasks exit
+        drop(line_rx);
+        drop(batch_tx);
+        drop(batch_rx);
 
         Ok(Self {
             write_tx,
-            write_handles,
+            compressor_handles,
+            upload_handles,
             lines_sent,
             lines_dropped,
             compressed_bytes_sent,
@@ -181,20 +175,117 @@ impl HttpResultWriter {
         self.lines_sent.load(Ordering::Relaxed)
     }
 
-    /// Background task that batches and sends lines to the HTTP API with zstd compression.
-    /// Multiple instances run concurrently, each pulling from the shared channel.
-    ///
-    /// Each batch cycle:
-    /// 1. Wait for first line (or exit if channel closed)
-    /// 2. Set up pipeline: duplex → CountedWriter → ZstdEncoder
-    ///    Tee stream from read-half captures data into retry_buffer; spawn POST task
-    /// 3. Write lines to encoder until compressed_counter >= batch_max_bytes or channel closed
-    /// 4. Finalize zstd frame (encoder.shutdown()), close write-half → POST sees EOF
-    /// 5. Await POST response; on failure, retry from buffered bytes
-    #[allow(clippy::too_many_arguments)]
-    async fn writer_task(
+    /// CPU-bound task that reads lines from the line channel, compresses them into
+    /// zstd batches, and sends CompressedBatch to the batch channel for uploaders.
+    async fn compressor_task(
         task_id: usize,
-        write_rx: flume::Receiver<String>,
+        line_rx: flume::Receiver<String>,
+        batch_tx: flume::Sender<CompressedBatch>,
+        config: HttpWriterConfig,
+        lines_dropped: Arc<AtomicUsize>,
+    ) {
+        let mut batches_produced: u64 = 0;
+        let mut channel_closed = false;
+
+        'outer: loop {
+            // 1. Wait for first line (or break if channel closed)
+            let first_line = match line_rx.recv_async().await {
+                Ok(line) => line,
+                Err(_) => break 'outer,
+            };
+
+            // 2. Compress lines into buffer
+            let mut encoder = match zstd::Encoder::new(Vec::new(), config.compression_level) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!(task = task_id, error = %e, "Failed to create zstd encoder");
+                    break 'outer;
+                }
+            };
+
+            let mut batch_lines = 0usize;
+            let mut batch_plaintext_bytes = 0usize;
+
+            // Write first line (Vec<u8> writes are infallible barring OOM)
+            encoder.write_all(first_line.as_bytes()).expect("write to Vec");
+            batch_lines += 1;
+            batch_plaintext_bytes += first_line.len();
+
+            // Fill batch until compressed output reaches batch_max_bytes or channel closes
+            loop {
+                if encoder.get_ref().len() >= config.batch_max_bytes {
+                    break;
+                }
+
+                let line = match line_rx.try_recv() {
+                    Ok(line) => line,
+                    Err(flume::TryRecvError::Empty) => {
+                        match tokio::time::timeout(
+                            Duration::from_millis(50),
+                            line_rx.recv_async(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(line)) => line,
+                            Ok(Err(_)) => {
+                                channel_closed = true;
+                                break;
+                            }
+                            Err(_) => continue, // timeout, re-check compressed size
+                        }
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        channel_closed = true;
+                        break;
+                    }
+                };
+
+                encoder.write_all(line.as_bytes()).expect("write to Vec");
+                batch_lines += 1;
+                batch_plaintext_bytes += line.len();
+            }
+
+            // 3. Finalize zstd frame → CompressedBatch
+            let compressed = match encoder.finish() {
+                Ok(buf) => buf,
+                Err(e) => {
+                    error!(task = task_id, error = %e, lines = batch_lines, "Failed to finalize zstd frame");
+                    lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
+                    if channel_closed { break 'outer; }
+                    continue 'outer;
+                }
+            };
+            let body = Bytes::from(compressed);
+
+            let batch = CompressedBatch {
+                body,
+                lines: batch_lines,
+                plaintext_bytes: batch_plaintext_bytes,
+            };
+
+            // Send to uploader pool — backpressure if uploaders fall behind
+            if batch_tx.send_async(batch).await.is_err() {
+                // All uploaders gone
+                error!(task = task_id, lines = batch_lines, "Batch channel closed, uploaders gone");
+                lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
+                break 'outer;
+            }
+
+            batches_produced += 1;
+
+            if channel_closed {
+                break 'outer;
+            }
+        }
+
+        info!(task = task_id, batches_produced = batches_produced, "Compressor task finished");
+    }
+
+    /// IO-bound task that receives compressed batches and uploads them via HTTP.
+    #[allow(clippy::too_many_arguments)]
+    async fn uploader_task(
+        task_id: usize,
+        batch_rx: flume::Receiver<CompressedBatch>,
         client: Client,
         config: HttpWriterConfig,
         lines_sent: Arc<AtomicUsize>,
@@ -205,346 +296,144 @@ impl HttpResultWriter {
         let mut total_sent = 0usize;
         let mut batches_sent: u64 = 0;
         let mut last_stats_log = Instant::now();
-        let mut channel_closed = false;
 
-        'outer: loop {
-            // 1. Wait for first line (or break if channel closed)
-            let first_line = match write_rx.recv_async().await {
-                Ok(line) => line,
-                Err(_) => break 'outer,
-            };
+        while let Ok(batch) = batch_rx.recv_async().await {
+            let batch_compressed_bytes = batch.body.len();
 
-            // 2. Set up pipeline: duplex → CountedWriter → ZstdEncoder
-            //    read-half → ReaderStream → tee → reqwest Body
-            let compressed_counter = Arc::new(AtomicUsize::new(0));
-            let (write_half, read_half) = tokio::io::duplex(128 * 1024);
-            let counted = CountedWriter::new(write_half, compressed_counter.clone());
-            let mut encoder = ZstdEncoder::with_quality(counted, async_compression::Level::Precise(config.compression_level));
-
-            let retry_buffer = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-            let tee_buf = retry_buffer.clone();
-            let tee_stream = ReaderStream::new(read_half).map(move |chunk_result| {
-                match chunk_result {
-                    Ok(chunk) => {
-                        // Tee: copy chunk into retry buffer (best-effort, non-blocking lock)
-                        let buf = tee_buf.clone();
-                        let bytes = chunk.clone();
-                        tokio::spawn(async move {
-                            buf.lock().await.extend_from_slice(&bytes);
-                        });
-                        Ok(chunk)
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-
-            let body = reqwest::Body::wrap_stream(tee_stream);
-            let send_future = client
-                .post(&config.url)
-                .header("Content-Type", "application/x-ndjson")
-                .header("Content-Encoding", "zstd")
-                .header("Authorization", format!("Bearer {}", config.api_key))
-                .body(body)
-                .send();
-            let send_handle = tokio::spawn(send_future);
-
-            // 3. Write first line to encoder
-            let mut batch_lines = 0usize;
-            let mut batch_plaintext_bytes = 0usize;
-
-            let first_bytes = first_line.as_bytes();
-            batch_plaintext_bytes += first_bytes.len();
-            if let Err(e) = encoder.write_all(first_bytes).await {
-                error!(task = task_id, error = %e, "Failed to write to zstd encoder");
-                // Encoder write failed — POST task will see broken pipe
-                let _ = encoder.shutdown().await;
-                drop(encoder);
-                let _ = send_handle.await;
-                lines_dropped.fetch_add(1, Ordering::Relaxed);
-                continue 'outer;
-            }
-            batch_lines += 1;
-
-            // 4. Inner loop: recv line, write to encoder, check compressed_counter
-            loop {
-                // Check if batch is full (compressed bytes)
-                if compressed_counter.load(Ordering::Relaxed) >= config.batch_max_bytes {
-                    break;
-                }
-
-                // Non-blocking try first for throughput, then async recv with a small timeout
-                // to allow checking compressed counter periodically
-                let line = match write_rx.try_recv() {
-                    Ok(line) => line,
-                    Err(flume::TryRecvError::Empty) => {
-                        // Brief async wait — allows checking compressed size regularly
-                        match tokio::time::timeout(
-                            Duration::from_millis(50),
-                            write_rx.recv_async(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(line)) => line,
-                            Ok(Err(_)) => {
-                                channel_closed = true;
-                                break;
-                            }
-                            Err(_) => continue, // timeout, re-check compressed counter
-                        }
-                    }
-                    Err(flume::TryRecvError::Disconnected) => {
-                        channel_closed = true;
-                        break;
-                    }
-                };
-
-                let line_bytes = line.as_bytes();
-                batch_plaintext_bytes += line_bytes.len();
-                if let Err(e) = encoder.write_all(line_bytes).await {
-                    // BrokenPipe means POST task failed mid-stream
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        warn!(task = task_id, "POST connection closed mid-stream (broken pipe)");
-                    } else {
-                        error!(task = task_id, error = %e, "Failed to write to zstd encoder");
-                    }
-                    // Lines already written are in the pipe; this line is lost
-                    lines_dropped.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                batch_lines += 1;
-            }
-
-            // 5. Finalize zstd frame — encoder.shutdown() flushes and writes end marker
-            if let Err(e) = encoder.shutdown().await {
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    warn!(task = task_id, error = %e, "Failed to finalize zstd frame");
-                }
-            }
-            // 6. Drop encoder to close the write-half of the duplex → POST sees EOF
-            drop(encoder);
-
-            // 7. Await POST response
-            let batch_compressed_bytes = compressed_counter.load(Ordering::Relaxed);
-            match send_handle.await {
-                Ok(Ok(response)) => {
-                    let status = response.status();
-                    let response_body = response.text().await.unwrap_or_default();
-
-                    if status.is_success() {
-                        total_sent += batch_lines;
-                        batches_sent += 1;
-                        lines_sent.fetch_add(batch_lines, Ordering::Relaxed);
-                        compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
-                        plaintext_bytes_sent.fetch_add(batch_plaintext_bytes, Ordering::Relaxed);
-                        debug!(
-                            task = task_id,
-                            lines = batch_lines,
-                            compressed_bytes = batch_compressed_bytes,
-                            plaintext_bytes = batch_plaintext_bytes,
-                            status = %status,
-                            response = %response_body,
-                            url = %config.url,
-                            "Sent batch"
-                        );
-                    } else if status.is_client_error() {
-                        // 4xx — don't retry, log and drop
-                        lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-                        error!(
-                            task = task_id,
-                            lines = batch_lines,
-                            status = %status,
-                            response = %response_body,
-                            "Batch rejected (client error, not retrying)"
-                        );
-                    } else {
-                        // 5xx — retry from buffer
-                        Self::retry_from_buffer(
-                            task_id,
-                            &client,
-                            &config,
-                            &retry_buffer,
-                            batch_compressed_bytes,
-                            batch_lines,
-                            batch_plaintext_bytes,
-                            &mut total_sent,
-                            &mut batches_sent,
-                            &lines_sent,
-                            &lines_dropped,
-                            &compressed_bytes_sent,
-                            &plaintext_bytes_sent,
-                            status,
-                            &response_body,
-                        )
-                        .await;
-                    }
-                }
-                Ok(Err(e)) => {
-                    // Network error — retry from buffer
-                    Self::retry_from_buffer(
-                        task_id,
-                        &client,
-                        &config,
-                        &retry_buffer,
-                        batch_compressed_bytes,
-                        batch_lines,
-                        batch_plaintext_bytes,
-                        &mut total_sent,
-                        &mut batches_sent,
-                        &lines_sent,
-                        &lines_dropped,
-                        &compressed_bytes_sent,
-                        &plaintext_bytes_sent,
-                        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("HTTP request failed: {e}"),
-                    )
-                    .await;
+            match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
+                Ok(()) => {
+                    total_sent += batch.lines;
+                    batches_sent += 1;
+                    lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
+                    compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
+                    plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
+                    debug!(
+                        task = task_id,
+                        lines = batch.lines,
+                        compressed_bytes = batch_compressed_bytes,
+                        plaintext_bytes = batch.plaintext_bytes,
+                        url = %config.url,
+                        "Sent batch"
+                    );
                 }
                 Err(e) => {
-                    // JoinError — task panicked
-                    lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-                    error!(task = task_id, error = %e, "HTTP send task panicked");
+                    lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                    error!(
+                        task = task_id,
+                        lines = batch.lines,
+                        compressed_bytes = batch_compressed_bytes,
+                        error = %e,
+                        "Failed to send batch"
+                    );
                 }
             }
 
             if last_stats_log.elapsed() > Duration::from_secs(30) {
                 debug!(
                     task = task_id,
-                    channel_len = write_rx.len(),
-                    channel_full = write_rx.is_full(),
+                    batch_channel_len = batch_rx.len(),
                     batches_sent = batches_sent,
-                    "Upload task stats"
+                    "Uploader task stats"
                 );
                 last_stats_log = Instant::now();
             }
-
-            if channel_closed {
-                break 'outer;
-            }
         }
 
-        info!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "HTTP writer task finished");
+        info!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "Uploader task finished");
         total_sent
     }
 
-    /// Retry a failed batch from the tee buffer.
-    #[allow(clippy::too_many_arguments)]
-    async fn retry_from_buffer(
-        task_id: usize,
+    /// Send a zstd-compressed batch to the HTTP API with retries.
+    /// `body` has a known length so reqwest sets Content-Length, enabling connection reuse.
+    async fn send_batch(
         client: &Client,
         config: &HttpWriterConfig,
-        retry_buffer: &tokio::sync::Mutex<Vec<u8>>,
-        batch_compressed_bytes: usize,
-        batch_lines: usize,
-        batch_plaintext_bytes: usize,
-        total_sent: &mut usize,
-        batches_sent: &mut u64,
-        lines_sent: &Arc<AtomicUsize>,
-        lines_dropped: &Arc<AtomicUsize>,
-        compressed_bytes_sent: &Arc<AtomicUsize>,
-        plaintext_bytes_sent: &Arc<AtomicUsize>,
-        original_status: reqwest::StatusCode,
-        original_error: &str,
-    ) {
-        let buffer = retry_buffer.lock().await;
-        if buffer.len() < batch_compressed_bytes {
-            // Incomplete buffer — can't retry safely
-            lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-            error!(
-                task = task_id,
-                lines = batch_lines,
-                buffer_len = buffer.len(),
-                expected = batch_compressed_bytes,
-                status = %original_status,
-                error = %original_error,
-                "Batch failed, retry buffer incomplete — dropping"
-            );
-            return;
-        }
+        body: &Bytes,
+        count: usize,
+    ) -> Result<()> {
+        let mut last_error = None;
 
-        let body_bytes = Bytes::from(buffer.clone());
-        drop(buffer);
-
-        for attempt in 1..=config.max_retries {
-            let delay = Duration::from_millis(100 * 2u64.pow(attempt - 1));
-            warn!(
-                task = task_id,
-                attempt = attempt,
-                max_attempts = config.max_retries,
-                delay_ms = delay.as_millis() as u64,
-                "Retrying batch from buffer"
-            );
-            tokio::time::sleep(delay).await;
+        for attempt in 0..=config.max_retries {
+            if attempt > 0 {
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt - 1));
+                warn!(
+                    attempt = attempt + 1,
+                    max_attempts = config.max_retries + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    "Retrying HTTP request"
+                );
+                tokio::time::sleep(delay).await;
+            }
 
             let result = client
                 .post(&config.url)
                 .header("Content-Type", "application/x-ndjson")
                 .header("Content-Encoding", "zstd")
                 .header("Authorization", format!("Bearer {}", config.api_key))
-                .body(body_bytes.clone())
+                .body(body.clone()) // O(1) Arc bump
                 .send()
                 .await;
 
             match result {
                 Ok(response) => {
                     let status = response.status();
-                    let resp_body = response.text().await.unwrap_or_default();
+                    let response_body = response.text().await.unwrap_or_default();
 
                     if status.is_success() {
-                        *total_sent += batch_lines;
-                        *batches_sent += 1;
-                        lines_sent.fetch_add(batch_lines, Ordering::Relaxed);
-                        compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
-                        plaintext_bytes_sent.fetch_add(batch_plaintext_bytes, Ordering::Relaxed);
                         debug!(
-                            task = task_id,
-                            lines = batch_lines,
-                            attempt = attempt,
-                            "Retry succeeded"
-                        );
-                        return;
-                    }
-                    if status.is_client_error() {
-                        // 4xx on retry — stop retrying
-                        lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-                        error!(
-                            task = task_id,
-                            lines = batch_lines,
+                            lines = count,
+                            bytes = body.len(),
                             status = %status,
-                            response = %resp_body,
-                            "Retry got client error, giving up"
+                            response = %response_body,
+                            "HTTP batch sent"
                         );
-                        return;
+                        return Ok(());
+                    } else {
+                        last_error = Some(anyhow::anyhow!(
+                            "HTTP {status} from API: {response_body}"
+                        ));
+
+                        // Don't retry on 4xx errors (client errors)
+                        if status.is_client_error() {
+                            break;
+                        }
                     }
-                    // 5xx — continue retrying
                 }
-                Err(_) => {
-                    // Network error — continue retrying
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("HTTP request failed: {e}"));
                 }
             }
         }
 
-        // All retries exhausted
-        lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-        error!(
-            task = task_id,
-            lines = batch_lines,
-            attempts = config.max_retries,
-            "All retries exhausted, dropping batch"
-        );
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error sending batch")))
     }
 
-    /// Finish writing and return stats for all tasks
+    /// Finish writing and return stats for all tasks.
+    ///
+    /// Ordered shutdown:
+    /// 1. Close line channel → compressors drain and exit
+    /// 2. Join compressors → their batch_tx clones drop → batch channel closes
+    /// 3. Join uploaders → they drain remaining batches and exit
     pub async fn finish(self) -> Result<HttpWriterStats> {
-        // Close the channel to signal all writer tasks to drain and exit
+        // 1. Close the line channel to signal compressors to drain and exit
         drop(self.write_tx);
 
-        let mut total = 0usize;
+        // 2. Join all compressor handles — they drain lines, produce final batches, then exit
+        //    Their batch_tx clones are dropped on exit, closing the batch channel
+        for handle in self.compressor_handles {
+            if let Err(e) = handle.await {
+                return Err(anyhow::anyhow!("Compressor task panicked: {e}"));
+            }
+        }
 
-        for handle in self.write_handles {
+        // 3. Batch channel is now closed (all senders gone).
+        //    Join all uploader handles — they drain remaining batches and exit
+        let mut total = 0usize;
+        for handle in self.upload_handles {
             match handle.await {
                 Ok(count) => total += count,
                 Err(e) => {
-                    return Err(anyhow::anyhow!("Writer task panicked: {e}"));
+                    return Err(anyhow::anyhow!("Uploader task panicked: {e}"));
                 }
             }
         }

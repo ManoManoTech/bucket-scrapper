@@ -7,3 +7,4 @@ infra/k8s/jobs/
 report.html
 
 scrapper-output/
+profile.json.gz

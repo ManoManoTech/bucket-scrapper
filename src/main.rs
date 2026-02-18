@@ -114,9 +114,17 @@ struct Cli {
     #[arg(long, default_value = "30")]
     http_timeout: u64,
 
-    /// Number of concurrent HTTP upload tasks (default: cpu_count / 8, minimum 1)
+    /// Number of concurrent HTTP upload tasks (default: 4× compressor tasks)
     #[arg(long)]
     http_upload_tasks: Option<usize>,
+
+    /// Number of concurrent HTTP compressor tasks (default: cpu_count / 8, minimum 1)
+    #[arg(long)]
+    http_compressor_tasks: Option<usize>,
+
+    /// Batch channel buffer between compressors and uploaders (RAM ≈ this × batch_max_bytes)
+    #[arg(long, default_value = "4")]
+    http_upload_channel_size: usize,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -250,14 +258,22 @@ async fn main() -> Result<()> {
 
         let batch_max_bytes = cli.http_batch_max_mb * 1024 * 1024;
 
-        let num_upload_tasks = cli.http_upload_tasks.unwrap_or_else(|| {
+        let num_compressor_tasks = cli.http_compressor_tasks.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get() / 8)
                 .unwrap_or(1)
                 .max(1)
         });
+        let num_upload_tasks = cli.http_upload_tasks.unwrap_or(4 * num_compressor_tasks);
 
-        info!(url = %api_url, batch_max_mb = cli.http_batch_max_mb, upload_tasks = num_upload_tasks, "HTTP streaming mode enabled");
+        info!(
+            url = %api_url,
+            batch_max_mb = cli.http_batch_max_mb,
+            compressor_tasks = num_compressor_tasks,
+            upload_tasks = num_upload_tasks,
+            upload_channel_size = cli.http_upload_channel_size,
+            "HTTP streaming mode enabled"
+        );
 
         let http_config = HttpWriterConfig {
             url: api_url,
@@ -266,7 +282,9 @@ async fn main() -> Result<()> {
             timeout_secs,
             max_retries: cli.max_retries.min(10),
             channel_buffer_size: cli.channel_buffer,
+            num_compressor_tasks,
             num_upload_tasks,
+            upload_channel_size: cli.http_upload_channel_size,
             compression_level: cli.compression_level,
         };
 
