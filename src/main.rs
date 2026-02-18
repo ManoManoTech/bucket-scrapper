@@ -90,7 +90,7 @@ struct Cli {
     #[arg(long, default_value = "60")]
     client_max_age: u64,
 
-    /// Zstd compression level for file output (1-22, higher = smaller but slower)
+    /// Zstd compression level (1-22, higher = smaller but slower)
     #[arg(long, default_value = "3")]
     compression_level: i32,
 
@@ -267,6 +267,7 @@ async fn main() -> Result<()> {
             max_retries: cli.max_retries.min(10),
             channel_buffer_size: cli.channel_buffer,
             num_upload_tasks,
+            compression_level: cli.compression_level,
         };
 
         Some(HttpResultWriter::new(http_config)?)
@@ -393,12 +394,17 @@ async fn main() -> Result<()> {
             }
 
             let elapsed = batch_start.elapsed().as_secs_f64();
+            let compressed_mb = stats.compressed_bytes_sent as f64 / 1_000_000.0;
+            let plaintext_mb = stats.plaintext_bytes_sent as f64 / 1_000_000.0;
             info!(
                 elapsed_s = elapsed,
                 files = files_searched,
                 matched_lines = matched_lines,
                 lines_sent = stats.lines_sent,
                 lines_dropped = stats.lines_dropped,
+                compressed_mb = compressed_mb,
+                plaintext_mb = plaintext_mb,
+                compression_ratio = if compressed_mb > 0.0 { plaintext_mb / compressed_mb } else { 0.0 },
                 pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
                 url = %api_url,
                 "Search completed"

@@ -74,7 +74,7 @@ bucket-scrapper -p "error" --output json
 
 #### HTTP Output (HTTP/REST API)
 
-Send results directly to an HTTP API instead of writing to files. Results are sent as newline-delimited JSON (NDJSON) without compression.
+Send results directly to an HTTP API instead of writing to files. Results are sent as zstd-compressed newline-delimited JSON (NDJSON) with `Content-Encoding: zstd`. The `--compression-level` flag controls the compression level for both file and HTTP output.
 
 ```bash
 # Send results to HTTP API

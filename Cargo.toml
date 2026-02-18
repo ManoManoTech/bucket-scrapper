@@ -26,7 +26,8 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 
 # HTTP client for REST API integration (using rustls to avoid OpenSSL dependency)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
 
 # DNS caching to reduce CoreDNS load
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
