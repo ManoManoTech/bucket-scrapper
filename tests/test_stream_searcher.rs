@@ -1,18 +1,4 @@
-use bucket_scrapper::pipeline::{SearchExporter, SearchConfig, StreamSearcher};
-use std::io::Cursor;
-
-/// Minimal exporter for tests — just counts matches.
-struct CountingExporter(usize);
-
-impl SearchExporter for CountingExporter {
-    fn add_match(&mut self, _: &str) -> anyhow::Result<()> {
-        self.0 += 1;
-        Ok(())
-    }
-    fn match_count(&self) -> usize {
-        self.0
-    }
-}
+use bucket_scrapper::pipeline::{SearchConfig, StreamSearcher};
 
 #[test]
 fn test_regex_matcher_cached() {
@@ -22,34 +8,27 @@ fn test_regex_matcher_cached() {
     };
     let searcher = StreamSearcher::new(config).unwrap();
 
-    let mut c1 = CountingExporter(0);
-    searcher
-        .search_stream("b", "k1", Cursor::new(b"Line 1\nERROR: bad\nLine 3"), &mut c1)
-        .unwrap();
+    assert!(searcher.matches_line(b"ERROR: bad"));
+    assert!(!searcher.matches_line(b"Line 1"));
+    assert!(!searcher.matches_line(b"Line 3"));
 
-    let mut c2 = CountingExporter(0);
-    searcher
-        .search_stream("b", "k2", Cursor::new(b"Another ERROR\nOk\nERROR again"), &mut c2)
-        .unwrap();
-
-    assert_eq!(c1.match_count(), 1);
-    assert_eq!(c2.match_count(), 2);
+    // Second "file" — same searcher instance
+    assert!(searcher.matches_line(b"Another ERROR"));
+    assert!(!searcher.matches_line(b"Ok"));
+    assert!(searcher.matches_line(b"ERROR again"));
 }
 
 #[test]
-fn test_no_line_numbers() {
+fn test_case_insensitive() {
     let config = SearchConfig {
         pattern: Some("test".to_string()),
         ignore_case: true,
     };
     let searcher = StreamSearcher::new(config).unwrap();
 
-    let mut c = CountingExporter(0);
-    searcher
-        .search_stream("b", "k", Cursor::new(b"This is a TEST line\nAnother test here\nNo match"), &mut c)
-        .unwrap();
-
-    assert_eq!(c.match_count(), 2);
+    assert!(searcher.matches_line(b"This is a TEST line"));
+    assert!(searcher.matches_line(b"Another test here"));
+    assert!(!searcher.matches_line(b"No match"));
 }
 
 #[test]
@@ -60,10 +39,8 @@ fn test_all_lines_mode() {
     };
     let searcher = StreamSearcher::new(config).unwrap();
 
-    let mut c = CountingExporter(0);
-    searcher
-        .search_stream("b", "k", Cursor::new(b"Line 1\nLine 2\nLine 3"), &mut c)
-        .unwrap();
-
-    assert_eq!(c.match_count(), 3);
+    assert!(searcher.matches_line(b"Line 1"));
+    assert!(searcher.matches_line(b"Line 2"));
+    assert!(searcher.matches_line(b"Line 3"));
+    assert!(searcher.matches_line(b""));
 }

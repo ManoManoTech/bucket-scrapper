@@ -1,29 +1,20 @@
-// src/search/searcher.rs
+// src/pipeline/searcher.rs
 use anyhow::Result;
+use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
-use std::io::BufRead;
-use tracing::debug;
-
-use super::result_exporter::SearchExporter;
 
 /// Configuration for the stream searcher
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SearchConfig {
     pub pattern: Option<String>,
     pub ignore_case: bool,
 }
 
-
-/// A searcher that can process streams of data using ripgrep's engine.
-/// When no pattern is provided, all lines are returned without regex overhead.
+/// A searcher that tests individual lines against a regex pattern.
+/// When no pattern is provided, all lines match.
 pub struct StreamSearcher {
     matcher: Option<RegexMatcher>,
 }
-
-// We can't derive Clone because RegexMatcher doesn't implement it
-// But we can work with Arc<StreamSearcher> instead
 
 impl StreamSearcher {
     pub fn new(config: SearchConfig) -> Result<Self> {
@@ -42,83 +33,12 @@ impl StreamSearcher {
         Ok(Self { matcher })
     }
 
-    /// Search through a readable stream and export results using any SearchExporter.
-    /// When no pattern is configured, all lines are yielded via a fast BufRead loop.
-    pub fn search_stream<R: BufRead, E: SearchExporter>(
-        &self,
-        bucket: &str,
-        key: &str,
-        reader: R,
-        exporter: &mut E,
-    ) -> Result<()> {
-        debug!(bucket = %bucket, key = %key, "Starting search");
-
+    /// Test whether a single line matches the configured pattern.
+    /// Returns `true` when no pattern is set (all-lines mode).
+    pub fn matches_line(&self, line: &[u8]) -> bool {
         match self.matcher {
-            Some(ref matcher) => self.search_stream_regex(bucket, key, reader, exporter, matcher),
-            None => self.search_stream_all_lines(bucket, key, reader, exporter),
+            Some(ref matcher) => matcher.is_match(line).unwrap_or(false),
+            None => true,
         }
     }
-
-    fn search_stream_regex<R: BufRead, E: SearchExporter>(
-        &self,
-        bucket: &str,
-        key: &str,
-        mut reader: R,
-        exporter: &mut E,
-        matcher: &RegexMatcher,
-    ) -> Result<()> {
-        let mut searcher_builder = SearcherBuilder::new();
-        searcher_builder
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .line_number(true)
-            .memory_map(MmapChoice::never());
-
-        let mut searcher = searcher_builder.build();
-
-        let mut match_count = 0u64;
-
-        searcher.search_reader(
-            matcher,
-            &mut reader,
-            grep_searcher::sinks::UTF8(|_line_num, line| {
-                exporter
-                    .add_match(line)
-                    .map_err(std::io::Error::other)?;
-                match_count += 1;
-                Ok(true)
-            }),
-        )?;
-
-        if match_count > 0 {
-            debug!(matches = match_count, bucket = %bucket, key = %key, "Found matches");
-        }
-
-        Ok(())
-    }
-
-    fn search_stream_all_lines<R: BufRead, E: SearchExporter>(
-        &self,
-        bucket: &str,
-        key: &str,
-        mut reader: R,
-        exporter: &mut E,
-    ) -> Result<()> {
-        let mut buf = String::new();
-        let mut line_count = 0u64;
-
-        loop {
-            buf.clear();
-            if reader.read_line(&mut buf)? == 0 {
-                break;
-            }
-            exporter.add_match(&buf)?;
-            line_count += 1;
-        }
-        if line_count > 0 {
-            debug!(lines = line_count, bucket = %bucket, key = %key, "Read all lines");
-        }
-
-        Ok(())
-    }
-
 }

@@ -169,7 +169,7 @@ impl SearchProgress {
             } else if line_pct > 80 {
                 "compress"
             } else if dc_pct > 80 {
-                "search"
+                "filter"
             } else {
                 "download"
             };
@@ -225,7 +225,7 @@ impl SearchProgress {
 
             self.prev_uploaded_bytes = uploaded_now;
         } else {
-            let bottleneck = if dc_pct > 80 { "search" } else { "download" };
+            let bottleneck = if dc_pct > 80 { "filter" } else { "download" };
 
             info!(
                 files_done = self.files_processed,

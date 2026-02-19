@@ -8,8 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use super::result_exporter::SearchExporter;
-
 /// A zstd-compressed batch ready for HTTP upload.
 struct CompressedBatch {
     body: Bytes,
@@ -848,40 +846,6 @@ impl HttpResultWriter {
     /// Get the configured URL
     pub fn url(&self) -> &str {
         &self.url
-    }
-}
-
-/// An exporter that streams results to an HTTP API instead of storing in memory.
-/// Implements SearchExporter trait for use with generic search functions.
-pub struct HttpStreamingExporter {
-    sender: flume::Sender<String>,
-    match_count: usize,
-}
-
-impl HttpStreamingExporter {
-    pub fn new(sender: flume::Sender<String>) -> Self {
-        Self {
-            sender,
-            match_count: 0,
-        }
-    }
-}
-
-impl SearchExporter for HttpStreamingExporter {
-    fn add_match(&mut self, line: &str) -> Result<()> {
-        match self.sender.send(line.to_string()) {
-            Ok(()) => {
-                self.match_count += 1;
-                Ok(())
-            }
-            Err(_) => {
-                Err(anyhow::anyhow!("HTTP consumer gone, channel closed"))
-            }
-        }
-    }
-
-    fn match_count(&self) -> usize {
-        self.match_count
     }
 }
 

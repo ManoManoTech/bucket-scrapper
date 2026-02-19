@@ -1,20 +1,28 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::pipeline::{DirectFileExporter, HttpStreamingExporter, PipelineObserver, SearchExporter, StreamSearcher};
-use crate::pipeline::SharedFileWriter;
+use crate::pipeline::{PipelineObserver, SharedFileWriter, StreamSearcher};
 use crate::progress::{ChannelObserver, DownloadObserver, SearchProgress};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use backon::{ExponentialBuilder, Retryable};
+use bytes::Bytes;
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
-/// A downloaded and decompressed S3 object ready for search.
-struct DownloadedObject {
-    data: Vec<u8>,
-    info: S3ObjectInfo,
+/// A single decompressed line tagged with its source file.
+struct DecompressedLine {
+    text: String,
+    source: Arc<S3ObjectInfo>,
+}
+
+/// Where filter workers send their matches.
+enum FilterOutput {
+    Http(flume::Sender<String>),
+    File(SharedFileWriter),
 }
 
 /// Configuration for the streaming downloader
@@ -25,16 +33,16 @@ pub struct StreamingDownloaderConfig {
     pub max_retries: u32,
     pub initial_retry_delay: Duration,
     pub progress_interval: Duration,
-    /// Number of search worker tasks (default: cpu_count / 2)
-    pub processing_tasks: usize,
-    /// Buffer capacity between download+decompress and search
-    /// (RAM ≈ this × avg decompressed file size)
-    pub download_buffer_size: usize,
+    /// Number of filter worker tasks (default: cpu_count / 2)
+    pub filter_tasks: usize,
+    /// Line channel capacity between download+decompress and filter workers
+    /// (RAM ≈ this × ~200 bytes avg line)
+    pub line_buffer_size: usize,
 }
 
 impl Default for StreamingDownloaderConfig {
     fn default() -> Self {
-        let processing_tasks = std::thread::available_parallelism()
+        let filter_tasks = std::thread::available_parallelism()
             .map(|n| n.get() / 2)
             .unwrap_or(2)
             .max(1);
@@ -44,13 +52,14 @@ impl Default for StreamingDownloaderConfig {
             max_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
             progress_interval: Duration::from_secs(3),
-            processing_tasks,
-            download_buffer_size: 32,
+            filter_tasks,
+            line_buffer_size: 1_000,
         }
     }
 }
 
-/// Downloads S3 objects, decompresses them, and feeds them to search workers.
+/// Downloads S3 objects, stream-decompresses them into lines, and feeds them
+/// to filter workers that apply regex matching.
 pub struct StreamingDownloader {
     client: Client,
     config: StreamingDownloaderConfig,
@@ -77,10 +86,9 @@ impl StreamingDownloader {
         http_sender: flume::Sender<String>,
         observer: PipelineObserver,
     ) -> Result<(usize, usize)> {
-        self.search_objects(objects, searcher, Some(observer), move |_obj: &S3ObjectInfo| {
-            HttpStreamingExporter::new(http_sender.clone())
-        })
-        .await
+        let output = FilterOutput::Http(http_sender);
+        self.search_objects(objects, searcher, Some(observer), output)
+            .await
     }
 
     /// Process a batch of S3 objects, streaming results to file writer.
@@ -91,36 +99,29 @@ impl StreamingDownloader {
         searcher: Arc<StreamSearcher>,
         writer: SharedFileWriter,
     ) -> Result<(usize, usize)> {
-        self.search_objects(objects, searcher, None, move |obj: &S3ObjectInfo| {
-            DirectFileExporter::new(writer.clone(), obj.prefix.clone())
-        })
-        .await
+        let output = FilterOutput::File(writer);
+        self.search_objects(objects, searcher, None, output).await
     }
 
-    /// Generic batch processor with decoupled download+decompress and search stages.
+    /// Generic batch processor with decoupled download+decompress and filter stages.
     ///
     /// Architecture:
     /// ```text
-    /// [sem N] → download+decompress → [decompressed_ch] → search workers → exporter
+    /// [sem N] → download + stream_decompress → lines → [line_ch] → filter workers → exporter
     /// ```
     ///
-    /// Download tasks acquire a semaphore permit, fetch and decompress the object,
-    /// release the permit (freeing the S3 connection), then push to the decompressed
-    /// channel. Search workers pull from the channel and run regex search via
-    /// spawn_blocking.
+    /// Download tasks acquire a semaphore permit, fetch the compressed body,
+    /// stream-decompress it line by line pushing into the line channel, then
+    /// release the permit. Filter workers pull lines and run regex matching.
     ///
     /// Returns (files_searched, total_matches)
-    async fn search_objects<E, F>(
+    async fn search_objects(
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
         pipeline: Option<PipelineObserver>,
-        exporter_factory: F,
-    ) -> Result<(usize, usize)>
-    where
-        E: SearchExporter + Send + 'static,
-        F: Fn(&S3ObjectInfo) -> E + Clone + Send + Sync + 'static,
-    {
+        output: FilterOutput,
+    ) -> Result<(usize, usize)> {
         if objects.is_empty() {
             return Ok((0, 0));
         }
@@ -130,23 +131,24 @@ impl StreamingDownloader {
             objects = objects.len(),
             mb = total_bytes / 1_000_000,
             download_concurrency = self.config.max_concurrent_downloads,
-            search_workers = self.config.processing_tasks,
-            download_buffer = self.config.download_buffer_size,
+            filter_workers = self.config.filter_tasks,
+            line_buffer = self.config.line_buffer_size,
             "Starting search"
         );
 
-        // Channel between download+decompress and search workers
-        let (decompressed_tx, decompressed_rx) =
-            flume::bounded::<DownloadedObject>(self.config.download_buffer_size);
+        // Line channel between download+decompress and filter workers
+        let (line_tx, line_rx) =
+            flume::bounded::<DecompressedLine>(self.config.line_buffer_size);
 
         let download_observer = DownloadObserver::new();
+        let match_count = Arc::new(AtomicUsize::new(0));
 
         let progress = Arc::new(Mutex::new(SearchProgress::new(
             objects.len(),
             total_bytes,
             self.config.progress_interval,
             pipeline,
-            ChannelObserver::from_sender(&decompressed_tx),
+            ChannelObserver::from_sender(&line_tx),
             download_observer.clone(),
         )));
 
@@ -156,40 +158,50 @@ impl StreamingDownloader {
             let config = self.config.clone();
             let semaphore = self.download_semaphore.clone();
             let objects = objects.to_vec();
-            let tx = decompressed_tx;
+            let tx = line_tx;
+            let progress = progress.clone();
 
             tokio::spawn(async move {
                 let result = Self::download_coordinator(
-                    client, &objects, config, semaphore, tx, download_observer,
-                ).await;
+                    client,
+                    &objects,
+                    config,
+                    semaphore,
+                    tx,
+                    download_observer,
+                    progress,
+                )
+                .await;
                 // tx is dropped here → channel closes → workers drain and exit
                 result
             })
         };
 
-        // --- Spawn search workers ---
-        let mut worker_handles: Vec<tokio::task::JoinHandle<Result<(usize, usize)>>> =
-            Vec::with_capacity(self.config.processing_tasks);
+        // --- Spawn filter workers ---
+        let output = Arc::new(output);
+        let mut worker_handles: Vec<tokio::task::JoinHandle<Result<usize>>> =
+            Vec::with_capacity(self.config.filter_tasks);
 
-        for worker_id in 0..self.config.processing_tasks {
-            let rx = decompressed_rx.clone();
+        for worker_id in 0..self.config.filter_tasks {
+            let rx = line_rx.clone();
             let searcher = searcher.clone();
-            let factory = exporter_factory.clone();
-            let progress = progress.clone();
+            let output = output.clone();
+            let match_count = match_count.clone();
 
             worker_handles.push(tokio::spawn(async move {
-                Self::search_worker(worker_id, rx, searcher, factory, progress).await
+                Self::filter_worker(worker_id, rx, searcher, output, match_count).await
             }));
         }
 
-        // Drop our clone of decompressed_rx so channel closes when coordinator drops tx
-        drop(decompressed_rx);
+        // Drop our clone of line_rx so channel closes when coordinator drops tx
+        drop(line_rx);
 
         // --- Join download coordinator ---
         match download_handle.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(files_processed)) => {
+                debug!(files = files_processed, "Download coordinator finished");
+            }
             Ok(Err(e)) => {
-                // Abort workers on download error
                 for h in &worker_handles {
                     h.abort();
                 }
@@ -203,51 +215,55 @@ impl StreamingDownloader {
             }
         }
 
-        // --- Join search workers ---
+        // --- Join filter workers ---
         let mut total_matches = 0usize;
-        let mut files_searched = 0usize;
 
         for handle in worker_handles {
             match handle.await {
-                Ok(Ok((files, matches))) => {
-                    files_searched += files;
+                Ok(Ok(matches)) => {
                     total_matches += matches;
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(anyhow::anyhow!("Search worker panicked: {e}")),
+                Err(e) => return Err(anyhow::anyhow!("Filter worker panicked: {e}")),
             }
         }
+
+        // files_searched = total files processed by coordinator
+        let files_searched = progress.lock().await.files_processed;
 
         Ok((files_searched, total_matches))
     }
 
     /// Coordinates download+decompress tasks using semaphore + JoinSet.
-    /// Drops `decompressed_tx` on return to close the channel.
+    /// Each task downloads compressed bytes, then stream-decompresses and emits
+    /// lines into the channel.
+    /// Drops `line_tx` on return to close the channel.
+    /// Returns the number of files successfully processed.
     async fn download_coordinator(
         client: Client,
         objects: &[S3ObjectInfo],
         config: StreamingDownloaderConfig,
         semaphore: Arc<Semaphore>,
-        decompressed_tx: flume::Sender<DownloadedObject>,
+        line_tx: flume::Sender<DecompressedLine>,
         download_observer: DownloadObserver,
-    ) -> Result<()> {
+        progress: Arc<Mutex<SearchProgress>>,
+    ) -> Result<usize> {
         let mut spawned = 0usize;
         let mut completed = 0usize;
 
-        let mut join_set: tokio::task::JoinSet<Result<DownloadedObject>> =
-            tokio::task::JoinSet::new();
+        let mut join_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
 
-        // Helper: drain completed download tasks, send to channel
+        // Helper: drain completed download tasks
         macro_rules! drain_completed {
             () => {
                 while let Some(result) = join_set.try_join_next() {
                     match result {
-                        Ok(Ok(obj)) => {
+                        Ok(Ok(compressed_size)) => {
                             completed += 1;
-                            if decompressed_tx.send_async(obj).await.is_err() {
-                                // All search workers gone
-                                join_set.abort_all();
-                                return Err(anyhow::anyhow!("Search workers gone, channel closed"));
+                            let mut prog = progress.lock().await;
+                            prog.update(compressed_size, 0);
+                            if prog.should_report() {
+                                prog.report();
                             }
                         }
                         Ok(Err(e)) => {
@@ -279,12 +295,27 @@ impl StreamingDownloader {
             let client = client.clone();
             let config = config.clone();
             let dl_obs = download_observer.clone();
+            let tx = line_tx.clone();
 
             join_set.spawn(async move {
-                // Hold permit during download+decompress, release before channel send
-                let result = Self::download_and_decompress(client, obj_clone, config, dl_obs).await;
+                // Download compressed bytes (with retries)
+                let (compressed, obj_info) =
+                    Self::download_with_retry(client, obj_clone, config, dl_obs).await?;
+                let compressed_size = compressed.len();
+
+                // Release permit — S3 connection is free
                 drop(permit);
-                result
+
+                // Stream-decompress and emit lines (no retry — idempotent lines)
+                let source = Arc::new(obj_info);
+                let tx_clone = tx;
+                tokio::task::spawn_blocking(move || {
+                    Self::emit_lines(compressed, &source, &tx_clone)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Decompress+emit task panic: {e}"))??;
+
+                Ok(compressed_size)
             });
 
             spawned += 1;
@@ -305,11 +336,12 @@ impl StreamingDownloader {
         // Drain remaining
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(obj)) => {
+                Ok(Ok(compressed_size)) => {
                     completed += 1;
-                    if decompressed_tx.send_async(obj).await.is_err() {
-                        join_set.abort_all();
-                        return Err(anyhow::anyhow!("Search workers gone, channel closed"));
+                    let mut prog = progress.lock().await;
+                    prog.update(compressed_size, 0);
+                    if prog.should_report() {
+                        prog.report();
                     }
                 }
                 Ok(Err(e)) => {
@@ -324,22 +356,56 @@ impl StreamingDownloader {
         }
 
         debug!(completed = completed, "Download coordinator finished");
+        Ok(completed)
+    }
+
+    /// Stream-decompress compressed bytes and emit lines into the channel.
+    /// Runs inside `spawn_blocking` (synchronous IO).
+    fn emit_lines(
+        compressed: Bytes,
+        source: &Arc<S3ObjectInfo>,
+        line_tx: &flume::Sender<DecompressedLine>,
+    ) -> Result<()> {
+        let cursor = std::io::Cursor::new(compressed);
+        let reader: Box<dyn Read> = if source.key.ends_with(".gz") {
+            Box::new(flate2::read::GzDecoder::new(cursor))
+        } else if source.key.ends_with(".zst") || source.key.ends_with(".zstd") {
+            Box::new(zstd::Decoder::new(cursor)?)
+        } else {
+            Box::new(cursor)
+        };
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if buf_reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            line_tx
+                .send(DecompressedLine {
+                    text: line.clone(),
+                    source: source.clone(),
+                })
+                .map_err(|_| anyhow::anyhow!("Filter workers gone, channel closed"))?;
+        }
+
         Ok(())
     }
 
-    /// Download and decompress a single S3 object with retries.
-    /// Returns the decompressed data.
-    async fn download_and_decompress(
+    /// Download compressed bytes from S3 with retries.
+    /// Returns (compressed_bytes, object_info).
+    async fn download_with_retry(
         client: Client,
         obj: S3ObjectInfo,
         config: StreamingDownloaderConfig,
         download_observer: DownloadObserver,
-    ) -> Result<DownloadedObject> {
+    ) -> Result<(Bytes, S3ObjectInfo)> {
         let bucket = obj.bucket.clone();
         let key = obj.key.clone();
 
         let inner = || async {
-            Self::download_and_decompress_inner(&client, &obj, &download_observer).await
+            Self::download_inner(&client, &obj, &download_observer).await
         };
 
         let retry_params = ExponentialBuilder::default()
@@ -349,7 +415,7 @@ impl StreamingDownloader {
             .with_jitter()
             .with_max_times(config.max_retries as usize);
 
-        inner
+        let compressed = inner
             .retry(retry_params)
             .sleep(tokio::time::sleep)
             .notify(move |err: &anyhow::Error, dur: Duration| {
@@ -361,15 +427,17 @@ impl StreamingDownloader {
                     "Retry scheduled"
                 );
             })
-            .await
+            .await?;
+
+        Ok((compressed, obj))
     }
 
-    /// Download and decompress a single S3 object (no retries).
-    async fn download_and_decompress_inner(
+    /// Download a single S3 object (no retries). Returns compressed bytes.
+    async fn download_inner(
         client: &Client,
         obj: &S3ObjectInfo,
         download_observer: &DownloadObserver,
-    ) -> Result<DownloadedObject> {
+    ) -> Result<Bytes> {
         debug!(
             bucket = %obj.bucket,
             key = %obj.key,
@@ -385,10 +453,10 @@ impl StreamingDownloader {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {e}"))?;
 
-        let content_length = resp.content_length.unwrap_or(0) as usize;
-
-        // Collect entire compressed body into memory
-        let compressed = resp.body.collect().await
+        let compressed = resp
+            .body
+            .collect()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to read S3 object body: {e}"))?
             .into_bytes();
 
@@ -398,88 +466,45 @@ impl StreamingDownloader {
             bucket = %obj.bucket,
             key = %obj.key,
             compressed_bytes = compressed.len(),
-            content_length = content_length,
-            "Downloaded, decompressing"
+            "Downloaded"
         );
 
-        // Decompress synchronously in spawn_blocking
-        let key = obj.key.clone();
-        let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let cursor = std::io::Cursor::new(compressed);
-            let mut decompressed = Vec::new();
-
-            if key.ends_with(".gz") {
-                let mut decoder = flate2::read::GzDecoder::new(cursor);
-                std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
-            } else if key.ends_with(".zst") || key.ends_with(".zstd") {
-                let mut decoder = zstd::Decoder::new(cursor)?;
-                std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
-            } else {
-                let mut reader = cursor;
-                std::io::Read::read_to_end(&mut reader, &mut decompressed)?;
-            }
-
-            Ok(decompressed)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Decompress task panic: {e}"))??;
-
-        debug!(
-            bucket = %obj.bucket,
-            key = %obj.key,
-            compressed_bytes = content_length,
-            decompressed_bytes = data.len(),
-            "Decompressed"
-        );
-
-        Ok(DownloadedObject {
-            data,
-            info: obj.clone(),
-        })
+        Ok(compressed)
     }
 
-    /// Search worker: pulls decompressed objects from channel, runs regex search.
-    async fn search_worker<E, F>(
+    /// Filter worker: pulls lines from channel, applies regex, emits matches.
+    /// Runs entirely in spawn_blocking (CPU-bound regex + blocking channel recv).
+    async fn filter_worker(
         worker_id: usize,
-        rx: flume::Receiver<DownloadedObject>,
+        rx: flume::Receiver<DecompressedLine>,
         searcher: Arc<StreamSearcher>,
-        exporter_factory: F,
-        progress: Arc<Mutex<SearchProgress>>,
-    ) -> Result<(usize, usize)>
-    where
-        E: SearchExporter + Send + 'static,
-        F: Fn(&S3ObjectInfo) -> E,
-    {
-        let mut files_searched = 0usize;
-        let mut total_matches = 0usize;
-
-        while let Ok(obj) = rx.recv_async().await {
-            let compressed_size = obj.info.size;
-            let bucket = obj.info.bucket.clone();
-            let key = obj.info.key.clone();
-            let mut exporter = exporter_factory(&obj.info);
-            let searcher = searcher.clone();
-
-            let matches_found = tokio::task::spawn_blocking(move || {
-                let cursor = std::io::Cursor::new(obj.data);
-                let reader = std::io::BufReader::new(cursor);
-                searcher.search_stream(&bucket, &key, reader, &mut exporter)?;
-                Ok::<usize, anyhow::Error>(exporter.match_count())
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Search task panic: {e}"))??;
-
-            files_searched += 1;
-            total_matches += matches_found;
-
-            let mut prog = progress.lock().await;
-            prog.update(compressed_size, matches_found);
-            if prog.should_report() {
-                prog.report();
+        output: Arc<FilterOutput>,
+        match_count: Arc<AtomicUsize>,
+    ) -> Result<usize> {
+        let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut local = 0usize;
+            while let Ok(line) = rx.recv() {
+                if searcher.matches_line(line.text.as_bytes()) {
+                    match output.as_ref() {
+                        FilterOutput::Http(sender) => {
+                            sender
+                                .send(line.text)
+                                .map_err(|_| anyhow::anyhow!("HTTP consumer gone, channel closed"))?;
+                        }
+                        FilterOutput::File(writer) => {
+                            writer.write_match(&line.source.prefix, &line.text)?;
+                        }
+                    }
+                    local += 1;
+                    match_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
+            Ok(local)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Filter worker panic: {e}"))??;
 
-        debug!(worker = worker_id, files = files_searched, matches = total_matches, "Search worker finished");
-        Ok((files_searched, total_matches))
+        debug!(worker = worker_id, matches = result, "Filter worker finished");
+        Ok(result)
     }
 }

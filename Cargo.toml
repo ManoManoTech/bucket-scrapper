@@ -21,8 +21,8 @@ backon = "1.4.0"
 libc = "0.2"
 
 # Ripgrep libraries for search functionality
-grep-searcher = "0.1"
 grep-regex = "0.1"
+grep-matcher = "0.1"
 
 # HTTP client for REST API integration (using rustls to avoid OpenSSL dependency)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

@@ -58,10 +58,6 @@ struct Cli {
     #[arg(short, long)]
     end: Option<String>,
 
-    /// Lines of context to show around matches
-    #[arg(short = 'C', long, default_value = "0")]
-    context: usize,
-
     /// Case insensitive search
     #[arg(short, long)]
     ignore_case: bool,
@@ -130,14 +126,14 @@ struct Cli {
     #[arg(long, default_value = "4")]
     http_upload_channel_size: usize,
 
-    /// Number of search worker tasks (default: cpu_count / 2)
+    /// Number of filter worker tasks (default: cpu_count / 2)
     #[arg(long)]
-    processing_tasks: Option<usize>,
+    filter_tasks: Option<usize>,
 
-    /// Buffer capacity between download+decompress and search stages
-    /// (RAM ≈ this × avg decompressed file size)
-    #[arg(long, default_value = "32")]
-    download_buffer_size: usize,
+    /// Line channel capacity between download+decompress and filter workers
+    /// (RAM ≈ this × ~200 bytes avg line)
+    #[arg(long, default_value = "1000")]
+    line_buffer_size: usize,
 
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
     #[arg(long, default_value = "12")]
@@ -270,7 +266,7 @@ async fn main() -> Result<()> {
     let searcher = Arc::new(StreamSearcher::new(search_config)?);
 
     // Configure downloader
-    let processing_tasks = cli.processing_tasks.unwrap_or_else(|| {
+    let filter_tasks = cli.filter_tasks.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get() / 2)
             .unwrap_or(2)
@@ -283,8 +279,8 @@ async fn main() -> Result<()> {
         max_retries: cli.max_retries,
         initial_retry_delay: Duration::from_secs(cli.retry_delay),
         progress_interval: Duration::from_secs_f64(cli.progress_interval),
-        processing_tasks,
-        download_buffer_size: cli.download_buffer_size,
+        filter_tasks,
+        line_buffer_size: cli.line_buffer_size,
     };
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
