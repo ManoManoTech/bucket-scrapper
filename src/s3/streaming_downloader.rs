@@ -45,7 +45,7 @@ impl Default for StreamingDownloaderConfig {
             initial_retry_delay: Duration::from_secs(2),
             progress_interval: Duration::from_secs(3),
             processing_tasks,
-            download_buffer_size: 1000,
+            download_buffer_size: 32,
         }
     }
 }

@@ -136,7 +136,7 @@ struct Cli {
 
     /// Buffer capacity between download+decompress and search stages
     /// (RAM ≈ this × avg decompressed file size)
-    #[arg(long, default_value = "1000")]
+    #[arg(long, default_value = "32")]
     download_buffer_size: usize,
 
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
