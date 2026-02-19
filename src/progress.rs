@@ -75,6 +75,14 @@ impl ChannelObserver {
     }
 }
 
+fn rss_mb() -> usize {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map(|pages| pages * 4096 / 1_000_000)
+        .unwrap_or(0)
+}
+
 /// Progress tracking for search operations.
 ///
 /// Observes all pipeline stages (download, decompress channel, compress, upload)
@@ -185,6 +193,7 @@ impl SearchProgress {
                     throttle_mbps = format_args!("{throttle_mbps:.1}"),
                     batches = pipe.batches_uploaded(),
                     avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                    rss_mb = rss_mb(),
                     bottleneck = bottleneck,
                     elapsed_s = self.start_time.elapsed().as_secs_f32(),
                     "Search progress"
@@ -207,6 +216,7 @@ impl SearchProgress {
                     upload_mbps = format_args!("{upload_mbps:.1}"),
                     batches = pipe.batches_uploaded(),
                     avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                    rss_mb = rss_mb(),
                     bottleneck = bottleneck,
                     elapsed_s = self.start_time.elapsed().as_secs_f32(),
                     "Search progress"
@@ -226,6 +236,7 @@ impl SearchProgress {
                 download_mbps = format_args!("{download_mbps:.1}"),
                 matches = self.matches_found,
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
+                rss_mb = rss_mb(),
                 bottleneck = bottleneck,
                 elapsed_s = self.start_time.elapsed().as_secs_f32(),
                 "Search progress"
