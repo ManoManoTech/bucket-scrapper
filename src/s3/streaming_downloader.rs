@@ -148,7 +148,7 @@ impl StreamingDownloader {
             total_bytes,
             self.config.progress_interval,
             pipeline,
-            ChannelObserver::from_sender(&line_tx),
+            ChannelObserver::from_receiver(&line_rx),
             download_observer.clone(),
             match_count.clone(),
         )));

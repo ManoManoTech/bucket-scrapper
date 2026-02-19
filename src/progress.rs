@@ -50,14 +50,15 @@ pub struct ChannelObserver {
 }
 
 impl ChannelObserver {
-    /// Create an observer from any `flume::Sender<T>`.
+    /// Create an observer from any `flume::Receiver<T>`.
     ///
-    /// The generic `T` is erased — only `len()` and `capacity()` survive.
-    pub fn from_sender<T: Send + 'static>(tx: &flume::Sender<T>) -> Self {
-        let tx = tx.clone();
-        let cap = tx.capacity().unwrap_or(0);
+    /// Uses the receiver side so that holding this observer does not prevent
+    /// channel closure (which requires all *senders* to be dropped).
+    pub fn from_receiver<T: Send + 'static>(rx: &flume::Receiver<T>) -> Self {
+        let rx = rx.clone();
+        let cap = rx.capacity().unwrap_or(0);
         Self {
-            len: Box::new(move || tx.len()),
+            len: Box::new(move || rx.len()),
             cap,
         }
     }
