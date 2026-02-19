@@ -1,6 +1,6 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::search::{DirectFileExporter, HttpStreamingExporter, SearchExporter, StreamSearcher};
+use crate::search::{DirectFileExporter, HttpStreamingExporter, PipelineObserver, SearchExporter, StreamSearcher};
 use crate::search::SharedFileWriter;
 use anyhow::Result;
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
@@ -23,10 +23,16 @@ struct SearchProgress {
     matches_found: usize,
     start_time: std::time::Instant,
     last_report_time: std::time::Instant,
+    report_interval: Duration,
+    pipeline: Option<PipelineObserver>,
+    /// Snapshot of bytes_processed at last report (for download_mbps)
+    prev_bytes_processed: usize,
+    /// Snapshot of compressed_bytes_sent at last report (for upload_mbps)
+    prev_uploaded_bytes: usize,
 }
 
 impl SearchProgress {
-    fn new(total_files: usize, total_bytes: usize) -> Self {
+    fn new(total_files: usize, total_bytes: usize, report_interval: Duration, pipeline: Option<PipelineObserver>) -> Self {
         let now = std::time::Instant::now();
         Self {
             total_files,
@@ -36,6 +42,10 @@ impl SearchProgress {
             matches_found: 0,
             start_time: now,
             last_report_time: now,
+            report_interval,
+            pipeline,
+            prev_bytes_processed: 0,
+            prev_uploaded_bytes: 0,
         }
     }
 
@@ -46,23 +56,58 @@ impl SearchProgress {
     }
 
     fn should_report(&self) -> bool {
-        self.last_report_time.elapsed() > Duration::from_secs(10)
+        self.last_report_time.elapsed() > self.report_interval
     }
 
     fn report(&mut self) {
-        let pct = (self.files_processed * 100) / self.total_files.max(1);
+        let pct = (self.bytes_processed * 100) / self.total_bytes.max(1);
+        let interval_s = self.last_report_time.elapsed().as_secs_f64();
 
-        info!(
-            files_done = self.files_processed,
-            files_total = self.total_files,
-            pct = pct,
-            mb_done = self.bytes_processed / 1_000_000,
-            mb_total = self.total_bytes / 1_000_000,
-            matches = self.matches_found,
-            elapsed_s = self.start_time.elapsed().as_secs_f32(),
-            "Search progress"
-        );
+        let download_delta = self.bytes_processed - self.prev_bytes_processed;
+        let download_mbps = if interval_s > 0.0 { download_delta as f64 / 1_000_000.0 / interval_s } else { 0.0 };
 
+        if let Some(ref pipe) = self.pipeline {
+            let uploaded_now = pipe.compressed_bytes_sent();
+            let upload_delta = uploaded_now - self.prev_uploaded_bytes;
+            let upload_mbps = if interval_s > 0.0 { upload_delta as f64 / 1_000_000.0 / interval_s } else { 0.0 };
+
+            info!(
+                files_done = self.files_processed,
+                files_total = self.total_files,
+                pct = pct,
+                input_mb_done = self.bytes_processed / 1_000_000,
+                input_mb_total = self.total_bytes / 1_000_000,
+                download_mbps = format_args!("{download_mbps:.1}"),
+                matches = self.matches_found,
+                line_ch_len = pipe.line_len(),
+                line_ch_cap = pipe.line_capacity(),
+                batch_ch_len = pipe.batch_len(),
+                batch_ch_cap = pipe.batch_capacity(),
+                uploaded_mb = uploaded_now / 1_000_000,
+                upload_mbps = format_args!("{upload_mbps:.1}"),
+                batches = pipe.batches_uploaded(),
+                avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                bottleneck = pipe.bottleneck(),
+                elapsed_s = self.start_time.elapsed().as_secs_f32(),
+                "Search progress"
+            );
+
+            self.prev_uploaded_bytes = uploaded_now;
+        } else {
+            info!(
+                files_done = self.files_processed,
+                files_total = self.total_files,
+                pct = pct,
+                input_mb_done = self.bytes_processed / 1_000_000,
+                input_mb_total = self.total_bytes / 1_000_000,
+                download_mbps = format_args!("{download_mbps:.1}"),
+                matches = self.matches_found,
+                elapsed_s = self.start_time.elapsed().as_secs_f32(),
+                "Search progress"
+            );
+        }
+
+        self.prev_bytes_processed = self.bytes_processed;
         self.last_report_time = std::time::Instant::now();
     }
 }
@@ -74,6 +119,7 @@ pub struct StreamingDownloaderConfig {
     pub buffer_size_bytes: usize,
     pub max_retries: u32,
     pub initial_retry_delay: Duration,
+    pub progress_interval: Duration,
 }
 
 impl Default for StreamingDownloaderConfig {
@@ -83,6 +129,7 @@ impl Default for StreamingDownloaderConfig {
             buffer_size_bytes: 64 * 1024, // 64KB chunks
             max_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
+            progress_interval: Duration::from_secs(3),
         }
     }
 }
@@ -112,8 +159,9 @@ impl StreamingDownloader {
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
         http_sender: flume::Sender<String>,
+        observer: PipelineObserver,
     ) -> Result<(usize, usize)> {
-        self.search_objects(objects, searcher, move |_obj: &S3ObjectInfo| {
+        self.search_objects(objects, searcher, Some(observer), move |_obj: &S3ObjectInfo| {
             HttpStreamingExporter::new(http_sender.clone())
         })
         .await
@@ -129,7 +177,7 @@ impl StreamingDownloader {
         searcher: Arc<StreamSearcher>,
         writer: SharedFileWriter,
     ) -> Result<(usize, usize)> {
-        self.search_objects(objects, searcher, move |obj: &S3ObjectInfo| {
+        self.search_objects(objects, searcher, None, move |obj: &S3ObjectInfo| {
             DirectFileExporter::new(writer.clone(), obj.prefix.clone())
         })
         .await
@@ -143,6 +191,7 @@ impl StreamingDownloader {
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<StreamSearcher>,
+        pipeline: Option<PipelineObserver>,
         exporter_factory: F,
     ) -> Result<(usize, usize)>
     where
@@ -161,7 +210,7 @@ impl StreamingDownloader {
             "Starting search"
         );
 
-        let progress = Arc::new(Mutex::new(SearchProgress::new(objects.len(), total_bytes)));
+        let progress = Arc::new(Mutex::new(SearchProgress::new(objects.len(), total_bytes, self.config.progress_interval, pipeline)));
 
         let mut total_matches = 0usize;
         let mut files_searched = 0usize;

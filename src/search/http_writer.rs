@@ -17,6 +17,77 @@ struct CompressedBatch {
     plaintext_bytes: usize,
 }
 
+/// Read-only view of pipeline channel fill levels.
+///
+/// Cloning the underlying senders is cheap (Arc bump) and does not interfere
+/// with backpressure — senders only block on `send`, not on creation.
+pub struct PipelineObserver {
+    line_tx: flume::Sender<String>,
+    batch_tx: flume::Sender<CompressedBatch>,
+    batches_uploaded: Arc<AtomicUsize>,
+    upload_time_us: Arc<AtomicUsize>,
+    compressed_bytes_sent: Arc<AtomicUsize>,
+}
+
+impl PipelineObserver {
+    pub fn line_len(&self) -> usize {
+        self.line_tx.len()
+    }
+
+    pub fn line_capacity(&self) -> usize {
+        self.line_tx.capacity().unwrap_or(0)
+    }
+
+    pub fn batch_len(&self) -> usize {
+        self.batch_tx.len()
+    }
+
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_tx.capacity().unwrap_or(0)
+    }
+
+    pub fn batches_uploaded(&self) -> usize {
+        self.batches_uploaded.load(Ordering::Relaxed)
+    }
+
+    pub fn compressed_bytes_sent(&self) -> usize {
+        self.compressed_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Average batch upload time in milliseconds, or 0.0 if no batches yet.
+    pub fn avg_upload_ms(&self) -> f64 {
+        let count = self.batches_uploaded();
+        if count == 0 {
+            return 0.0;
+        }
+        let total_us = self.upload_time_us.load(Ordering::Relaxed) as f64;
+        total_us / count as f64 / 1000.0
+    }
+
+    /// Heuristic bottleneck indicator based on channel fill %.
+    ///
+    /// - `batch_ch > 80%` → **upload** (uploaders can't drain fast enough)
+    /// - `line_ch > 80%`  → **compress** (compressors can't keep up)
+    /// - `line_ch < 20%`  → **download** (searchers aren't producing fast enough)
+    /// - otherwise        → **-** (balanced)
+    pub fn bottleneck(&self) -> &'static str {
+        let batch_cap = self.batch_capacity().max(1);
+        let line_cap = self.line_capacity().max(1);
+        let batch_pct = self.batch_len() * 100 / batch_cap;
+        let line_pct = self.line_len() * 100 / line_cap;
+
+        if batch_pct > 80 {
+            "upload"
+        } else if line_pct > 80 {
+            "compress"
+        } else if line_pct < 20 {
+            "download"
+        } else {
+            "-"
+        }
+    }
+}
+
 /// Result of a batch send attempt.
 enum SendResult {
     /// Batch was accepted by the server.
@@ -85,6 +156,8 @@ pub struct HttpWriterStats {
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
     write_tx: flume::Sender<String>,
+    /// Kept for `observer()` — dropped in `finish()` before joining compressors
+    batch_tx: flume::Sender<CompressedBatch>,
     compressor_handles: Vec<tokio::task::JoinHandle<()>>,
     upload_handles: Vec<tokio::task::JoinHandle<usize>>,
     /// Tracks total lines sent (shared with uploader tasks)
@@ -95,6 +168,10 @@ pub struct HttpResultWriter {
     compressed_bytes_sent: Arc<AtomicUsize>,
     /// Tracks total plaintext bytes sent (shared with uploader tasks)
     plaintext_bytes_sent: Arc<AtomicUsize>,
+    /// Tracks total batches successfully uploaded (shared with uploader tasks)
+    batches_uploaded: Arc<AtomicUsize>,
+    /// Tracks cumulative upload time in microseconds (shared with uploader tasks)
+    upload_time_us: Arc<AtomicUsize>,
     /// Set on fatal (4xx) errors to stop the entire pipeline
     fatal_error: Arc<AtomicBool>,
     /// URL for display purposes
@@ -128,6 +205,8 @@ impl HttpResultWriter {
         let lines_dropped = Arc::new(AtomicUsize::new(0));
         let compressed_bytes_sent = Arc::new(AtomicUsize::new(0));
         let plaintext_bytes_sent = Arc::new(AtomicUsize::new(0));
+        let batches_uploaded = Arc::new(AtomicUsize::new(0));
+        let upload_time_us = Arc::new(AtomicUsize::new(0));
         let fatal_error = Arc::new(AtomicBool::new(false));
         let url = config.url.clone();
 
@@ -155,27 +234,32 @@ impl HttpResultWriter {
             let ld = lines_dropped.clone();
             let cb = compressed_bytes_sent.clone();
             let pb = plaintext_bytes_sent.clone();
+            let bu = batches_uploaded.clone();
+            let ut = upload_time_us.clone();
             let fe = fatal_error.clone();
             let handle = tokio::spawn(async move {
-                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, fe).await
+                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, bu, ut, fe).await
             });
             upload_handles.push(handle);
         }
 
-        // Drop original receiver/sender — only task clones hold them,
-        // so channel closure propagates automatically when tasks exit
+        // Drop original receivers — only task clones hold them,
+        // so channel closure propagates automatically when tasks exit.
+        // Keep batch_tx for observer(); dropped explicitly in finish().
         drop(line_rx);
-        drop(batch_tx);
         drop(batch_rx);
 
         Ok(Self {
             write_tx,
+            batch_tx,
             compressor_handles,
             upload_handles,
             lines_sent,
             lines_dropped,
             compressed_bytes_sent,
             plaintext_bytes_sent,
+            batches_uploaded,
+            upload_time_us,
             fatal_error,
             url,
         })
@@ -184,6 +268,17 @@ impl HttpResultWriter {
     /// Get a sender that can be cloned for use in multiple tasks
     pub fn get_sender(&self) -> flume::Sender<String> {
         self.write_tx.clone()
+    }
+
+    /// Get a read-only observer for pipeline channel stats.
+    pub fn observer(&self) -> PipelineObserver {
+        PipelineObserver {
+            line_tx: self.write_tx.clone(),
+            batch_tx: self.batch_tx.clone(),
+            batches_uploaded: self.batches_uploaded.clone(),
+            upload_time_us: self.upload_time_us.clone(),
+            compressed_bytes_sent: self.compressed_bytes_sent.clone(),
+        }
     }
 
     /// Get current lines sent count
@@ -300,7 +395,7 @@ impl HttpResultWriter {
             }
         }
 
-        info!(task = task_id, batches_produced = batches_produced, "Compressor task finished");
+        debug!(task = task_id, batches_produced = batches_produced, "Compressor task finished");
     }
 
     /// IO-bound task that receives compressed batches and uploads them via HTTP.
@@ -314,6 +409,8 @@ impl HttpResultWriter {
         lines_dropped: Arc<AtomicUsize>,
         compressed_bytes_sent: Arc<AtomicUsize>,
         plaintext_bytes_sent: Arc<AtomicUsize>,
+        batches_uploaded: Arc<AtomicUsize>,
+        upload_time_us: Arc<AtomicUsize>,
         fatal_error: Arc<AtomicBool>,
     ) -> usize {
         let mut total_sent = 0usize;
@@ -323,18 +420,23 @@ impl HttpResultWriter {
         while let Ok(batch) = batch_rx.recv_async().await {
             let batch_compressed_bytes = batch.body.len();
 
+            let send_start = Instant::now();
             match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
                 SendResult::Ok => {
+                    let elapsed_us = send_start.elapsed().as_micros() as usize;
                     total_sent += batch.lines;
                     batches_sent += 1;
                     lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
                     compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
                     plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
+                    batches_uploaded.fetch_add(1, Ordering::Relaxed);
+                    upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
                     debug!(
                         task = task_id,
                         lines = batch.lines,
                         compressed_bytes = batch_compressed_bytes,
                         plaintext_bytes = batch.plaintext_bytes,
+                        upload_ms = send_start.elapsed().as_millis() as u64,
                         url = %config.url,
                         "Sent batch"
                     );
@@ -374,7 +476,7 @@ impl HttpResultWriter {
             }
         }
 
-        info!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "Uploader task finished");
+        debug!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "Uploader task finished");
         total_sent
     }
 
@@ -454,6 +556,9 @@ impl HttpResultWriter {
     pub async fn finish(self) -> Result<HttpWriterStats> {
         // 1. Close the line channel to signal compressors to drain and exit
         drop(self.write_tx);
+        // Drop our batch_tx clone so the batch channel closes once compressor
+        // tasks finish and drop their clones
+        drop(self.batch_tx);
 
         // 2. Join all compressor handles — they drain lines, produce final batches, then exit
         //    Their batch_tx clones are dropped on exit, closing the batch channel

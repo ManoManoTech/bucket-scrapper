@@ -5,7 +5,7 @@ pub mod searcher;
 pub mod streaming_exporter;
 pub mod streaming_writer;
 
-pub use http_writer::{HttpResultWriter, HttpStreamingExporter, HttpWriterConfig, HttpWriterStats};
+pub use http_writer::{HttpResultWriter, HttpStreamingExporter, HttpWriterConfig, HttpWriterStats, PipelineObserver};
 pub use result_exporter::SearchExporter;
 pub use searcher::{SearchConfig, StreamSearcher};
 pub use streaming_exporter::DirectFileExporter;

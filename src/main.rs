@@ -86,6 +86,10 @@ struct Cli {
     #[arg(long, default_value = "2")]
     retry_delay: u64,
 
+    /// Progress report interval in seconds (supports fractional, e.g. 0.5)
+    #[arg(long, default_value = "3")]
+    progress_interval: f64,
+
     /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
     #[arg(long, default_value = "60")]
     client_max_age: u64,
@@ -108,7 +112,7 @@ struct Cli {
 
     /// Maximum batch size in MB for HTTP requests.
     #[arg(long, default_value = "2")]
-    http_batch_max_mb: usize,
+    http_batch_max_mb: f64,
 
     /// Timeout for HTTP requests in seconds
     #[arg(long, default_value = "30")]
@@ -233,6 +237,7 @@ async fn main() -> Result<()> {
         buffer_size_bytes: cli.buffer_size_kb * 1024,
         max_retries: cli.max_retries,
         initial_retry_delay: Duration::from_secs(cli.retry_delay),
+        progress_interval: Duration::from_secs_f64(cli.progress_interval),
     };
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
@@ -256,7 +261,7 @@ async fn main() -> Result<()> {
             .and_then(|c| c.http_output.as_ref().map(|h| h.timeout_secs))
             .unwrap_or(cli.http_timeout);
 
-        let batch_max_bytes = cli.http_batch_max_mb * 1024 * 1024;
+        let batch_max_bytes = (cli.http_batch_max_mb * 1024.0 * 1024.0) as usize;
 
         let num_compressor_tasks = cli.http_compressor_tasks.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -397,8 +402,9 @@ async fn main() -> Result<()> {
 
         if let Some(http_writer) = http_streaming {
             let http_sender = http_writer.get_sender();
+            let observer = http_writer.observer();
             let (files_searched, matched_lines) = downloader
-                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender)
+                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, observer)
                 .await?;
 
             let api_url = http_writer.url().to_string();
@@ -412,7 +418,8 @@ async fn main() -> Result<()> {
             }
 
             let elapsed = batch_start.elapsed().as_secs_f64();
-            let compressed_mb = stats.compressed_bytes_sent as f64 / 1_000_000.0;
+            let read_compressed_mb = total_compressed_input as f64 / 1_000_000.0;
+            let wrote_compressed_mb = stats.compressed_bytes_sent as f64 / 1_000_000.0;
             let plaintext_mb = stats.plaintext_bytes_sent as f64 / 1_000_000.0;
             info!(
                 elapsed_s = elapsed,
@@ -420,9 +427,10 @@ async fn main() -> Result<()> {
                 matched_lines = matched_lines,
                 lines_sent = stats.lines_sent,
                 lines_dropped = stats.lines_dropped,
-                compressed_mb = compressed_mb,
+                read_compressed_mb = read_compressed_mb,
+                wrote_compressed_mb = wrote_compressed_mb,
                 plaintext_mb = plaintext_mb,
-                compression_ratio = if compressed_mb > 0.0 { plaintext_mb / compressed_mb } else { 0.0 },
+                compression_ratio = if wrote_compressed_mb > 0.0 { plaintext_mb / wrote_compressed_mb } else { 0.0 },
                 pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
                 url = %api_url,
                 "Search completed"
