@@ -138,6 +138,10 @@ struct Cli {
     /// (RAM ≈ this × avg decompressed file size)
     #[arg(long, default_value = "1000")]
     download_buffer_size: usize,
+
+    /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
+    #[arg(long, default_value = "12")]
+    memory_limit_gb: u64,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -163,6 +167,23 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // Enforce memory limit via RLIMIT_AS (virtual address space)
+    #[cfg(unix)]
+    if cli.memory_limit_gb > 0 {
+        let limit_bytes = cli.memory_limit_gb * 1024 * 1024 * 1024;
+        let rlim = libc::rlimit {
+            rlim_cur: limit_bytes,
+            rlim_max: limit_bytes,
+        };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim) };
+        if rc != 0 {
+            eprintln!(
+                "Warning: Could not set memory limit to {}GB",
+                cli.memory_limit_gb
+            );
+        }
+    }
 
     // Initialize logging
     let env_filter =
