@@ -136,7 +136,7 @@ struct Cli {
     line_buffer_size: usize,
 
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
-    #[arg(long, default_value = "12")]
+    #[arg(long, default_value = "0")]
     memory_limit_gb: u64,
 
     /// Per-batch submission time threshold in seconds for AIMD upload throttle (0 = disabled)
