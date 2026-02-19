@@ -90,8 +90,8 @@ enum SendResult {
 // AIMD upload throttle (adaptive-increase / multiplicative-decrease)
 // ---------------------------------------------------------------------------
 
-/// Floor rate — never throttle below 100 KB/s.
-const MIN_RATE_BYTES_PER_SEC: f64 = 100.0 * 1024.0;
+/// Floor rate — never throttle below 2 MB/s.
+const MIN_RATE_BYTES_PER_SEC: f64 = 2.0 * 1_000_000.0;
 
 /// Shared token-bucket rate limiter with AIMD-controlled refill rate.
 ///
