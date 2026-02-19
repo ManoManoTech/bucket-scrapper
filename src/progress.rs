@@ -166,27 +166,52 @@ impl SearchProgress {
                 "download"
             };
 
-            info!(
-                files_done = self.files_processed,
-                files_total = self.total_files,
-                pct = pct,
-                input_mb_done = self.bytes_processed / 1_000_000,
-                input_mb_total = self.total_bytes / 1_000_000,
-                download_mbps = format_args!("{download_mbps:.1}"),
-                matches = self.matches_found,
-                dc_ch = format_args!("{dc_len}/{dc_cap}"),
-                line_ch_len = pipe.line_len(),
-                line_ch_cap = pipe.line_capacity(),
-                batch_ch_len = pipe.batch_len(),
-                batch_ch_cap = pipe.batch_capacity(),
-                uploaded_mb = uploaded_now / 1_000_000,
-                upload_mbps = format_args!("{upload_mbps:.1}"),
-                batches = pipe.batches_uploaded(),
-                avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
-                bottleneck = bottleneck,
-                elapsed_s = self.start_time.elapsed().as_secs_f32(),
-                "Search progress"
-            );
+            if let Some(throttle_mbps) = pipe.throttle_rate_mbps() {
+                info!(
+                    files_done = self.files_processed,
+                    files_total = self.total_files,
+                    pct = pct,
+                    input_mb_done = self.bytes_processed / 1_000_000,
+                    input_mb_total = self.total_bytes / 1_000_000,
+                    download_mbps = format_args!("{download_mbps:.1}"),
+                    matches = self.matches_found,
+                    dc_ch = format_args!("{dc_len}/{dc_cap}"),
+                    line_ch_len = pipe.line_len(),
+                    line_ch_cap = pipe.line_capacity(),
+                    batch_ch_len = pipe.batch_len(),
+                    batch_ch_cap = pipe.batch_capacity(),
+                    uploaded_mb = uploaded_now / 1_000_000,
+                    upload_mbps = format_args!("{upload_mbps:.1}"),
+                    throttle_mbps = format_args!("{throttle_mbps:.1}"),
+                    batches = pipe.batches_uploaded(),
+                    avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                    bottleneck = bottleneck,
+                    elapsed_s = self.start_time.elapsed().as_secs_f32(),
+                    "Search progress"
+                );
+            } else {
+                info!(
+                    files_done = self.files_processed,
+                    files_total = self.total_files,
+                    pct = pct,
+                    input_mb_done = self.bytes_processed / 1_000_000,
+                    input_mb_total = self.total_bytes / 1_000_000,
+                    download_mbps = format_args!("{download_mbps:.1}"),
+                    matches = self.matches_found,
+                    dc_ch = format_args!("{dc_len}/{dc_cap}"),
+                    line_ch_len = pipe.line_len(),
+                    line_ch_cap = pipe.line_capacity(),
+                    batch_ch_len = pipe.batch_len(),
+                    batch_ch_cap = pipe.batch_capacity(),
+                    uploaded_mb = uploaded_now / 1_000_000,
+                    upload_mbps = format_args!("{upload_mbps:.1}"),
+                    batches = pipe.batches_uploaded(),
+                    avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                    bottleneck = bottleneck,
+                    elapsed_s = self.start_time.elapsed().as_secs_f32(),
+                    "Search progress"
+                );
+            }
 
             self.prev_uploaded_bytes = uploaded_now;
         } else {

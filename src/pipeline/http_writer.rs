@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::Client;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -27,6 +27,8 @@ pub struct PipelineObserver {
     batches_uploaded: Arc<AtomicUsize>,
     upload_time_us: Arc<AtomicUsize>,
     compressed_bytes_sent: Arc<AtomicUsize>,
+    /// Throttle rate bits (f64 as u64). `None` = throttle disabled.
+    throttle_rate_bits: Option<Arc<AtomicU64>>,
 }
 
 impl PipelineObserver {
@@ -64,6 +66,16 @@ impl PipelineObserver {
         total_us / count as f64 / 1000.0
     }
 
+    /// Current throttle rate in MB/s, or `None` if disabled or unlimited.
+    pub fn throttle_rate_mbps(&self) -> Option<f64> {
+        let bits_arc = self.throttle_rate_bits.as_ref()?;
+        let rate = f64::from_bits(bits_arc.load(Ordering::Relaxed));
+        if rate.is_infinite() {
+            None
+        } else {
+            Some(rate / 1_000_000.0)
+        }
+    }
 }
 
 /// Result of a batch send attempt.
@@ -74,6 +86,225 @@ enum SendResult {
     Retryable(anyhow::Error),
     /// Fatal failure (4xx client error) — stop the entire pipeline.
     Fatal(anyhow::Error),
+}
+
+// ---------------------------------------------------------------------------
+// AIMD upload throttle (adaptive-increase / multiplicative-decrease)
+// ---------------------------------------------------------------------------
+
+/// Floor rate — never throttle below 100 KB/s.
+const MIN_RATE_BYTES_PER_SEC: f64 = 100.0 * 1024.0;
+
+/// Shared token-bucket rate limiter with AIMD-controlled refill rate.
+///
+/// All uploader tasks share one `UploadThrottle`.  When a batch takes longer
+/// than `max_submission_time`, the rate is **halved** (multiplicative decrease).
+/// When batches are healthy, the rate grows by a fixed increment (additive
+/// increase).  The asymmetry reacts quickly to overload but recovers cautiously.
+pub struct UploadThrottle {
+    state: tokio::sync::Mutex<ThrottleState>,
+    /// `None` = AIMD disabled (static-only mode).
+    max_submission_time: Option<Duration>,
+    /// Observable rate for progress reporting — stores f64 bits as u64.
+    current_rate_bits: Arc<AtomicU64>,
+}
+
+struct ThrottleState {
+    /// Current allowed rate in bytes/sec.  Starts at `f64::INFINITY` (unlimited).
+    rate: f64,
+    /// First-congestion ceiling — observed aggregate throughput.  Set once.
+    ceiling: f64,
+    /// Available byte budget.
+    tokens: f64,
+    /// Max token bucket size (2 × batch_max_bytes).
+    max_tokens: f64,
+    /// Last time we refilled tokens.
+    last_refill: Instant,
+    /// Last time we performed a multiplicative decrease (cooldown guard).
+    last_decrease: Instant,
+    /// Cumulative bytes uploaded (for first-congestion throughput estimate).
+    total_bytes: u64,
+    /// Pipeline start time (for first-congestion throughput estimate).
+    start_time: Instant,
+    /// Number of congestion events seen.
+    congestion_count: u64,
+}
+
+impl UploadThrottle {
+    /// Create a new throttle.  `batch_max_bytes` sizes the token bucket.
+    ///
+    /// - `max_submission_time`: AIMD congestion threshold. `None` = no AIMD.
+    /// - `static_rate_limit`: hard ceiling in bytes/sec. `None` = unlimited.
+    fn new(
+        max_submission_time: Option<Duration>,
+        batch_max_bytes: usize,
+        static_rate_limit: Option<f64>,
+    ) -> Self {
+        let max_tokens = 2.0 * batch_max_bytes as f64;
+        let now = Instant::now();
+        let (initial_rate, initial_ceiling) = match static_rate_limit {
+            Some(limit) => (limit, limit),
+            None => (f64::INFINITY, 0.0),
+        };
+        Self {
+            state: tokio::sync::Mutex::new(ThrottleState {
+                rate: initial_rate,
+                ceiling: initial_ceiling,
+                tokens: max_tokens,
+                max_tokens,
+                last_refill: now,
+                last_decrease: now - Duration::from_secs(60), // allow immediate first decrease
+                total_bytes: 0,
+                start_time: now,
+                congestion_count: 0,
+            }),
+            max_submission_time,
+            current_rate_bits: Arc::new(AtomicU64::new(initial_rate.to_bits())),
+        }
+    }
+
+    /// Wait until the token bucket has `bytes` available.
+    async fn acquire(&self, bytes: usize) {
+        let bytes_f = bytes as f64;
+        loop {
+            let sleep_dur = {
+                let mut st = self.state.lock().await;
+                // Refill tokens based on elapsed time
+                let now = Instant::now();
+                let elapsed = now.duration_since(st.last_refill).as_secs_f64();
+                if elapsed > 0.0 {
+                    let added = st.rate * elapsed;
+                    st.tokens = (st.tokens + added).min(st.max_tokens);
+                    st.last_refill = now;
+                }
+                // If unlimited or enough tokens, deduct and return
+                if st.rate.is_infinite() || st.tokens >= bytes_f {
+                    st.tokens -= bytes_f;
+                    return;
+                }
+                // Compute how long to wait for enough tokens
+                let deficit = bytes_f - st.tokens;
+                Duration::from_secs_f64(deficit / st.rate)
+            };
+            // Sleep without holding the lock
+            tokio::time::sleep(sleep_dur).await;
+        }
+    }
+
+    /// Record a completed upload and apply AIMD logic.
+    ///
+    /// Called only on successful sends — failed sends do not adjust the rate.
+    /// When `max_submission_time` is `None`, AIMD is skipped (static-only mode).
+    fn record_upload_sync(
+        st: &mut ThrottleState,
+        bytes: usize,
+        duration: Duration,
+        max_submission_time: Option<Duration>,
+        current_rate_bits: &AtomicU64,
+    ) {
+        st.total_bytes += bytes as u64;
+
+        // Without AIMD threshold, only static token-bucket rate applies — nothing to adjust.
+        let mst = match max_submission_time {
+            Some(d) => d,
+            None => return,
+        };
+
+        let cooldown = Duration::from_secs_f64((mst.as_secs_f64() / 2.0).max(1.0));
+
+        if duration > mst {
+            // --- Multiplicative Decrease ---
+            if st.last_decrease.elapsed() < cooldown {
+                return; // cooldown period — ignore concurrent congestion signals
+            }
+            st.congestion_count += 1;
+
+            if st.congestion_count == 1 && !st.rate.is_infinite() && st.ceiling == st.rate {
+                // First AIMD congestion with a static limit already set as ceiling.
+                // Estimate observed throughput and use the lower of the two.
+                let elapsed = st.start_time.elapsed().as_secs_f64();
+                let observed = if elapsed > 0.0 {
+                    st.total_bytes as f64 / elapsed
+                } else {
+                    bytes as f64 / duration.as_secs_f64()
+                };
+                st.ceiling = st.ceiling.min(observed);
+            } else if st.ceiling == 0.0 {
+                // First congestion without any ceiling: estimate from observed throughput
+                let elapsed = st.start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    st.ceiling = st.total_bytes as f64 / elapsed;
+                } else {
+                    st.ceiling = bytes as f64 / duration.as_secs_f64();
+                }
+            }
+
+            let new_rate = if st.rate.is_infinite() {
+                st.ceiling * 0.5
+            } else {
+                (st.rate * 0.5).max(MIN_RATE_BYTES_PER_SEC)
+            };
+
+            info!(
+                old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
+                new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
+                ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
+                submission_ms = duration.as_millis() as u64,
+                threshold_ms = mst.as_millis() as u64,
+                congestion_count = st.congestion_count,
+                "Upload throttle: multiplicative decrease"
+            );
+
+            st.rate = new_rate;
+            st.tokens = 0.0; // prevent post-decrease burst
+            st.last_decrease = Instant::now();
+            st.last_refill = Instant::now();
+        } else if st.ceiling > 0.0 && !st.rate.is_infinite() {
+            // --- Additive Increase ---
+            let increment = st.ceiling * 0.05;
+            let new_rate = (st.rate + increment).min(st.ceiling);
+            if new_rate > st.rate {
+                debug!(
+                    old_rate_mbps = format_args!("{:.2}", st.rate / 1_000_000.0),
+                    new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
+                    ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
+                    "Upload throttle: additive increase"
+                );
+                st.rate = new_rate;
+            }
+        }
+
+        current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Record a completed upload and apply AIMD logic.
+    async fn record_upload(&self, bytes: usize, duration: Duration) {
+        let mut st = self.state.lock().await;
+        Self::record_upload_sync(
+            &mut st,
+            bytes,
+            duration,
+            self.max_submission_time,
+            &self.current_rate_bits,
+        );
+    }
+
+    /// Get current rate in MB/s for progress reporting.
+    /// Returns `None` if unlimited (no throttling engaged).
+    pub fn current_rate_mbps(&self) -> Option<f64> {
+        let bits = self.current_rate_bits.load(Ordering::Relaxed);
+        let rate = f64::from_bits(bits);
+        if rate.is_infinite() {
+            None
+        } else {
+            Some(rate / 1_000_000.0)
+        }
+    }
+
+    /// Get the Arc<AtomicU64> for sharing with PipelineObserver.
+    fn rate_bits(&self) -> Arc<AtomicU64> {
+        self.current_rate_bits.clone()
+    }
 }
 
 /// Configuration for the HTTP writer
@@ -99,6 +330,13 @@ pub struct HttpWriterConfig {
     pub upload_channel_size: usize,
     /// Zstd compression level (1-22)
     pub compression_level: i32,
+    /// Per-batch submission time threshold for AIMD throttle.
+    /// `None` = no AIMD throttling.  Default: `Some(2.5s)`.
+    pub max_submission_time: Option<Duration>,
+    /// Static global upload rate limit in bytes/sec.
+    /// `None` = unlimited.  When set, the token bucket starts at this rate
+    /// instead of `INFINITY`.  AIMD can decrease below it, then recover back.
+    pub max_upload_rate: Option<f64>,
 }
 
 impl Default for HttpWriterConfig {
@@ -118,6 +356,8 @@ impl Default for HttpWriterConfig {
             num_upload_tasks: 4 * num_compressor_tasks,
             upload_channel_size: 4,
             compression_level: 3,
+            max_submission_time: Some(Duration::from_secs_f64(2.5)),
+            max_upload_rate: None,
         }
     }
 }
@@ -152,6 +392,8 @@ pub struct HttpResultWriter {
     upload_time_us: Arc<AtomicUsize>,
     /// Set on fatal (4xx) errors to stop the entire pipeline
     fatal_error: Arc<AtomicBool>,
+    /// AIMD upload throttle (None = disabled)
+    throttle: Option<Arc<UploadThrottle>>,
     /// URL for display purposes
     url: String,
 }
@@ -188,6 +430,17 @@ impl HttpResultWriter {
         let fatal_error = Arc::new(AtomicBool::new(false));
         let url = config.url.clone();
 
+        // Create upload throttle if either AIMD or static rate limit is configured
+        let throttle = if config.max_submission_time.is_some() || config.max_upload_rate.is_some() {
+            Some(Arc::new(UploadThrottle::new(
+                config.max_submission_time,
+                config.batch_max_bytes,
+                config.max_upload_rate,
+            )))
+        } else {
+            None
+        };
+
         // Spawn compressor tasks (CPU-bound: line_rx → batch_tx)
         let mut compressor_handles = Vec::with_capacity(config.num_compressor_tasks);
         for task_id in 0..config.num_compressor_tasks {
@@ -215,8 +468,9 @@ impl HttpResultWriter {
             let bu = batches_uploaded.clone();
             let ut = upload_time_us.clone();
             let fe = fatal_error.clone();
+            let th = throttle.clone();
             let handle = tokio::spawn(async move {
-                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, bu, ut, fe).await
+                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, bu, ut, fe, th).await
             });
             upload_handles.push(handle);
         }
@@ -239,6 +493,7 @@ impl HttpResultWriter {
             batches_uploaded,
             upload_time_us,
             fatal_error,
+            throttle,
             url,
         })
     }
@@ -256,6 +511,7 @@ impl HttpResultWriter {
             batches_uploaded: self.batches_uploaded.clone(),
             upload_time_us: self.upload_time_us.clone(),
             compressed_bytes_sent: self.compressed_bytes_sent.clone(),
+            throttle_rate_bits: self.throttle.as_ref().map(|t| t.rate_bits()),
         }
     }
 
@@ -390,6 +646,7 @@ impl HttpResultWriter {
         batches_uploaded: Arc<AtomicUsize>,
         upload_time_us: Arc<AtomicUsize>,
         fatal_error: Arc<AtomicBool>,
+        throttle: Option<Arc<UploadThrottle>>,
     ) -> usize {
         let mut total_sent = 0usize;
         let mut batches_sent: u64 = 0;
@@ -398,10 +655,16 @@ impl HttpResultWriter {
         while let Ok(batch) = batch_rx.recv_async().await {
             let batch_compressed_bytes = batch.body.len();
 
+            // Wait for token budget from AIMD throttle (no-op if disabled or unlimited)
+            if let Some(ref th) = throttle {
+                th.acquire(batch_compressed_bytes).await;
+            }
+
             let send_start = Instant::now();
             match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
                 SendResult::Ok => {
-                    let elapsed_us = send_start.elapsed().as_micros() as usize;
+                    let send_elapsed = send_start.elapsed();
+                    let elapsed_us = send_elapsed.as_micros() as usize;
                     total_sent += batch.lines;
                     batches_sent += 1;
                     lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
@@ -409,12 +672,18 @@ impl HttpResultWriter {
                     plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
                     batches_uploaded.fetch_add(1, Ordering::Relaxed);
                     upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+
+                    // Feed AIMD throttle with timing data
+                    if let Some(ref th) = throttle {
+                        th.record_upload(batch_compressed_bytes, send_elapsed).await;
+                    }
+
                     debug!(
                         task = task_id,
                         lines = batch.lines,
                         compressed_bytes = batch_compressed_bytes,
                         plaintext_bytes = batch.plaintext_bytes,
-                        upload_ms = send_start.elapsed().as_millis() as u64,
+                        upload_ms = send_elapsed.as_millis() as u64,
                         url = %config.url,
                         "Sent batch"
                     );
@@ -613,5 +882,176 @@ impl SearchExporter for HttpStreamingExporter {
 
     fn match_count(&self) -> usize {
         self.match_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn throttle_starts_unlimited() {
+        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None);
+        assert!(th.current_rate_mbps().is_none(), "should be unlimited initially");
+    }
+
+    #[tokio::test]
+    async fn throttle_acquire_instant_when_unlimited() {
+        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None);
+        let start = Instant::now();
+        th.acquire(1_000_000).await;
+        // Unlimited — should return near-instantly
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn throttle_decreases_on_slow_upload() {
+        let mst = Duration::from_secs_f64(1.0);
+        let th = UploadThrottle::new(Some(mst), 1024, None);
+
+        // Simulate a few healthy uploads to build total_bytes
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+        assert!(th.current_rate_mbps().is_none(), "still unlimited before congestion");
+
+        // Simulate a slow upload (exceeds max_submission_time)
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate = th.current_rate_mbps();
+        assert!(rate.is_some(), "throttle should be engaged after slow upload");
+        assert!(rate.unwrap() > 0.0, "rate should be positive");
+    }
+
+    #[tokio::test]
+    async fn throttle_additive_increase_after_decrease() {
+        let mst = Duration::from_secs_f64(1.0);
+        let th = UploadThrottle::new(Some(mst), 1024, None);
+
+        // Build up bytes
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+        // Trigger decrease
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate_after_decrease = th.current_rate_mbps().unwrap();
+
+        // Healthy upload → additive increase
+        th.record_upload(100_000, Duration::from_millis(200)).await;
+        let rate_after_increase = th.current_rate_mbps().unwrap();
+        assert!(
+            rate_after_increase > rate_after_decrease,
+            "rate should increase: {rate_after_increase} > {rate_after_decrease}"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_respects_cooldown() {
+        let mst = Duration::from_secs_f64(1.0);
+        let th = UploadThrottle::new(Some(mst), 1024, None);
+
+        // Build up bytes
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+        // First decrease
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate1 = th.current_rate_mbps().unwrap();
+
+        // Second slow upload immediately — should be ignored (cooldown)
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate2 = th.current_rate_mbps().unwrap();
+
+        // Rate should have *increased* (additive increase applied, decrease blocked by cooldown)
+        // or at least not halved
+        assert!(
+            rate2 >= rate1 * 0.9,
+            "rate should not halve during cooldown: rate1={rate1}, rate2={rate2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_rate_never_below_floor() {
+        let mst = Duration::from_secs_f64(0.01); // very low threshold
+        let th = UploadThrottle::new(Some(mst), 1024, None);
+
+        // Build up some bytes
+        th.record_upload(1000, Duration::from_millis(5)).await;
+
+        // Trigger many decreases (with pauses to clear cooldown)
+        for _ in 0..20 {
+            th.record_upload(1000, Duration::from_secs(1)).await;
+            // Wait out the cooldown
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let rate = th.current_rate_mbps().unwrap();
+        let floor_mbps = MIN_RATE_BYTES_PER_SEC / 1_000_000.0;
+        assert!(
+            rate >= floor_mbps * 0.99,
+            "rate should not drop below floor: {rate} >= {floor_mbps}"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_static_limit_enforced_from_start() {
+        // 10 MB/s static limit, no AIMD
+        let limit = 10.0 * 1_000_000.0;
+        let th = UploadThrottle::new(None, 2 * 1024 * 1024, Some(limit));
+
+        // Rate should be visible immediately (not None/infinite)
+        let rate = th.current_rate_mbps();
+        assert!(rate.is_some(), "static limit should show rate immediately");
+        assert!(
+            (rate.unwrap() - 10.0).abs() < 0.01,
+            "rate should be ~10 MB/s, got {}",
+            rate.unwrap()
+        );
+
+        // Acquire should succeed (token bucket starts full)
+        let start = Instant::now();
+        th.acquire(1_000_000).await;
+        assert!(start.elapsed() < Duration::from_millis(50), "first acquire should be instant (bucket starts full)");
+
+        // Record upload — with no AIMD, rate should stay at limit
+        th.record_upload(1_000_000, Duration::from_millis(100)).await;
+        let rate_after = th.current_rate_mbps().unwrap();
+        assert!(
+            (rate_after - 10.0).abs() < 0.01,
+            "rate should remain ~10 MB/s without AIMD, got {}",
+            rate_after
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_static_limit_with_aimd() {
+        // 10 MB/s static limit + AIMD with 1s threshold
+        let limit = 10.0 * 1_000_000.0;
+        let mst = Duration::from_secs_f64(1.0);
+        let th = UploadThrottle::new(Some(mst), 1024, Some(limit));
+
+        // Starts at static limit
+        assert!(
+            (th.current_rate_mbps().unwrap() - 10.0).abs() < 0.01,
+            "should start at static limit"
+        );
+
+        // Build up bytes with healthy uploads
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+        // Rate should still be at static limit (additive increase capped by ceiling)
+        assert!(
+            (th.current_rate_mbps().unwrap() - 10.0).abs() < 0.01,
+            "should stay at static limit during healthy uploads"
+        );
+
+        // Trigger congestion → rate should drop below static limit
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate_after_congestion = th.current_rate_mbps().unwrap();
+        assert!(
+            rate_after_congestion < 10.0,
+            "AIMD should decrease below static limit, got {}",
+            rate_after_congestion
+        );
     }
 }

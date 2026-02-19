@@ -142,6 +142,14 @@ struct Cli {
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
     #[arg(long, default_value = "12")]
     memory_limit_gb: u64,
+
+    /// Per-batch submission time threshold in seconds for AIMD upload throttle (0 = disabled)
+    #[arg(long, default_value = "2.5")]
+    max_submission_time: f64,
+
+    /// Global upload rate limit in MB/s (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    max_upload_rate: f64,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -310,12 +318,26 @@ async fn main() -> Result<()> {
         });
         let num_upload_tasks = cli.http_upload_tasks.unwrap_or(4 * num_compressor_tasks);
 
+        let max_submission_time = if cli.max_submission_time > 0.0 {
+            Some(Duration::from_secs_f64(cli.max_submission_time))
+        } else {
+            None
+        };
+
+        let max_upload_rate = if cli.max_upload_rate > 0.0 {
+            Some(cli.max_upload_rate * 1_000_000.0)
+        } else {
+            None
+        };
+
         info!(
             url = %api_url,
             batch_max_mb = cli.http_batch_max_mb,
             compressor_tasks = num_compressor_tasks,
             upload_tasks = num_upload_tasks,
             upload_channel_size = cli.http_upload_channel_size,
+            max_submission_time_s = cli.max_submission_time,
+            max_upload_rate_mbps = cli.max_upload_rate,
             "HTTP streaming mode enabled"
         );
 
@@ -330,6 +352,8 @@ async fn main() -> Result<()> {
             num_upload_tasks,
             upload_channel_size: cli.http_upload_channel_size,
             compression_level: cli.compression_level,
+            max_submission_time,
+            max_upload_rate,
         };
 
         Some(HttpResultWriter::new(http_config)?)
