@@ -129,6 +129,15 @@ struct Cli {
     /// Batch channel buffer between compressors and uploaders (RAM ≈ this × batch_max_bytes)
     #[arg(long, default_value = "4")]
     http_upload_channel_size: usize,
+
+    /// Number of search worker tasks (default: cpu_count / 2)
+    #[arg(long)]
+    processing_tasks: Option<usize>,
+
+    /// Buffer capacity between download+decompress and search stages
+    /// (RAM ≈ this × avg decompressed file size)
+    #[arg(long, default_value = "1000")]
+    download_buffer_size: usize,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -232,12 +241,21 @@ async fn main() -> Result<()> {
     let searcher = Arc::new(StreamSearcher::new(search_config)?);
 
     // Configure downloader
+    let processing_tasks = cli.processing_tasks.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() / 2)
+            .unwrap_or(2)
+            .max(1)
+    });
+
     let download_config = StreamingDownloaderConfig {
         max_concurrent_downloads: cli.max_parallel,
         buffer_size_bytes: cli.buffer_size_kb * 1024,
         max_retries: cli.max_retries,
         initial_retry_delay: Duration::from_secs(cli.retry_delay),
         progress_interval: Duration::from_secs_f64(cli.progress_interval),
+        processing_tasks,
+        download_buffer_size: cli.download_buffer_size,
     };
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);

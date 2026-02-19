@@ -64,28 +64,6 @@ impl PipelineObserver {
         total_us / count as f64 / 1000.0
     }
 
-    /// Heuristic bottleneck indicator based on channel fill %.
-    ///
-    /// - `batch_ch > 80%` → **upload** (uploaders can't drain fast enough)
-    /// - `line_ch > 80%`  → **compress** (compressors can't keep up)
-    /// - `line_ch < 20%`  → **download** (searchers aren't producing fast enough)
-    /// - otherwise        → **-** (balanced)
-    pub fn bottleneck(&self) -> &'static str {
-        let batch_cap = self.batch_capacity().max(1);
-        let line_cap = self.line_capacity().max(1);
-        let batch_pct = self.batch_len() * 100 / batch_cap;
-        let line_pct = self.line_len() * 100 / line_cap;
-
-        if batch_pct > 80 {
-            "upload"
-        } else if line_pct > 80 {
-            "compress"
-        } else if line_pct < 20 {
-            "download"
-        } else {
-            "-"
-        }
-    }
 }
 
 /// Result of a batch send attempt.
