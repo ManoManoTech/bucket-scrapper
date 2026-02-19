@@ -2,7 +2,7 @@
 use crate::config::types::S3ObjectInfo;
 use crate::pipeline::{DirectFileExporter, HttpStreamingExporter, PipelineObserver, SearchExporter, StreamSearcher};
 use crate::pipeline::SharedFileWriter;
-use crate::progress::{ChannelObserver, SearchProgress};
+use crate::progress::{ChannelObserver, DownloadObserver, SearchProgress};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use backon::{ExponentialBuilder, Retryable};
@@ -139,12 +139,15 @@ impl StreamingDownloader {
         let (decompressed_tx, decompressed_rx) =
             flume::bounded::<DownloadedObject>(self.config.download_buffer_size);
 
+        let download_observer = DownloadObserver::new();
+
         let progress = Arc::new(Mutex::new(SearchProgress::new(
             objects.len(),
             total_bytes,
             self.config.progress_interval,
             pipeline,
             ChannelObserver::from_sender(&decompressed_tx),
+            download_observer.clone(),
         )));
 
         // --- Spawn download coordinator ---
@@ -157,7 +160,7 @@ impl StreamingDownloader {
 
             tokio::spawn(async move {
                 let result = Self::download_coordinator(
-                    client, &objects, config, semaphore, tx,
+                    client, &objects, config, semaphore, tx, download_observer,
                 ).await;
                 // tx is dropped here → channel closes → workers drain and exit
                 result
@@ -226,6 +229,7 @@ impl StreamingDownloader {
         config: StreamingDownloaderConfig,
         semaphore: Arc<Semaphore>,
         decompressed_tx: flume::Sender<DownloadedObject>,
+        download_observer: DownloadObserver,
     ) -> Result<()> {
         let mut spawned = 0usize;
         let mut completed = 0usize;
@@ -274,10 +278,11 @@ impl StreamingDownloader {
             let obj_clone = obj.clone();
             let client = client.clone();
             let config = config.clone();
+            let dl_obs = download_observer.clone();
 
             join_set.spawn(async move {
                 // Hold permit during download+decompress, release before channel send
-                let result = Self::download_and_decompress(client, obj_clone, config).await;
+                let result = Self::download_and_decompress(client, obj_clone, config, dl_obs).await;
                 drop(permit);
                 result
             });
@@ -328,12 +333,13 @@ impl StreamingDownloader {
         client: Client,
         obj: S3ObjectInfo,
         config: StreamingDownloaderConfig,
+        download_observer: DownloadObserver,
     ) -> Result<DownloadedObject> {
         let bucket = obj.bucket.clone();
         let key = obj.key.clone();
 
         let inner = || async {
-            Self::download_and_decompress_inner(&client, &obj).await
+            Self::download_and_decompress_inner(&client, &obj, &download_observer).await
         };
 
         let retry_params = ExponentialBuilder::default()
@@ -362,6 +368,7 @@ impl StreamingDownloader {
     async fn download_and_decompress_inner(
         client: &Client,
         obj: &S3ObjectInfo,
+        download_observer: &DownloadObserver,
     ) -> Result<DownloadedObject> {
         debug!(
             bucket = %obj.bucket,
@@ -384,6 +391,8 @@ impl StreamingDownloader {
         let compressed = resp.body.collect().await
             .map_err(|e| anyhow::anyhow!("Failed to read S3 object body: {e}"))?
             .into_bytes();
+
+        download_observer.add_bytes(compressed.len());
 
         debug!(
             bucket = %obj.bucket,

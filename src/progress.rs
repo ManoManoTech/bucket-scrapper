@@ -2,8 +2,41 @@
 //! Cross-cutting progress tracking for the download → search → export pipeline.
 
 use crate::pipeline::PipelineObserver;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
+
+/// Tracks raw bytes downloaded from S3 (before decompression).
+///
+/// Incremented in `download_and_decompress_inner` right after `body.collect()`,
+/// so it measures true S3 download throughput independent of search/upload speed.
+#[derive(Clone)]
+pub struct DownloadObserver {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Default for DownloadObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DownloadObserver {
+    pub fn new() -> Self {
+        Self {
+            bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn add_bytes(&self, n: usize) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
 
 /// Type-erased channel fill-level observer.
 ///
@@ -57,8 +90,9 @@ pub struct SearchProgress {
     pub report_interval: Duration,
     pub pipeline: Option<PipelineObserver>,
     pub decompressed_ch: ChannelObserver,
-    /// Snapshot of bytes_processed at last report (for download_mbps)
-    pub prev_bytes_processed: usize,
+    pub download_observer: DownloadObserver,
+    /// Snapshot of downloaded bytes at last report (for download_mbps)
+    pub prev_downloaded_bytes: usize,
     /// Snapshot of compressed_bytes_sent at last report (for upload_mbps)
     pub prev_uploaded_bytes: usize,
 }
@@ -70,6 +104,7 @@ impl SearchProgress {
         report_interval: Duration,
         pipeline: Option<PipelineObserver>,
         decompressed_ch: ChannelObserver,
+        download_observer: DownloadObserver,
     ) -> Self {
         let now = std::time::Instant::now();
         Self {
@@ -83,7 +118,8 @@ impl SearchProgress {
             report_interval,
             pipeline,
             decompressed_ch,
-            prev_bytes_processed: 0,
+            download_observer,
+            prev_downloaded_bytes: 0,
             prev_uploaded_bytes: 0,
         }
     }
@@ -102,7 +138,8 @@ impl SearchProgress {
         let pct = (self.bytes_processed * 100) / self.total_bytes.max(1);
         let interval_s = self.last_report_time.elapsed().as_secs_f64();
 
-        let download_delta = self.bytes_processed - self.prev_bytes_processed;
+        let dl_now = self.download_observer.bytes();
+        let download_delta = dl_now - self.prev_downloaded_bytes;
         let download_mbps = if interval_s > 0.0 { download_delta as f64 / 1_000_000.0 / interval_s } else { 0.0 };
 
         let dc_cap = self.decompressed_ch.capacity().max(1);
@@ -170,7 +207,7 @@ impl SearchProgress {
             );
         }
 
-        self.prev_bytes_processed = self.bytes_processed;
+        self.prev_downloaded_bytes = dl_now;
         self.last_report_time = std::time::Instant::now();
     }
 }
