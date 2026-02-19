@@ -1,4 +1,4 @@
-// src/search/mod.rs
+// src/pipeline/mod.rs
 pub mod http_writer;
 pub mod result_exporter;
 pub mod searcher;

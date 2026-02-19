@@ -1,4 +1,4 @@
-use bucket_scrapper::search::{SearchExporter, SearchConfig, StreamSearcher};
+use bucket_scrapper::pipeline::{SearchExporter, SearchConfig, StreamSearcher};
 use std::io::Cursor;
 
 /// Minimal exporter for tests — just counts matches.
