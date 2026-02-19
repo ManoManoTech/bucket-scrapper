@@ -92,7 +92,8 @@ pub struct SearchProgress {
     pub files_processed: usize,
     pub total_bytes: usize,
     pub bytes_processed: usize,
-    pub matches_found: usize,
+    /// Shared atomic counter incremented by filter workers.
+    pub match_count: Arc<AtomicUsize>,
     pub start_time: std::time::Instant,
     pub last_report_time: std::time::Instant,
     pub report_interval: Duration,
@@ -113,6 +114,7 @@ impl SearchProgress {
         pipeline: Option<PipelineObserver>,
         decompressed_ch: ChannelObserver,
         download_observer: DownloadObserver,
+        match_count: Arc<AtomicUsize>,
     ) -> Self {
         let now = std::time::Instant::now();
         Self {
@@ -120,7 +122,7 @@ impl SearchProgress {
             files_processed: 0,
             total_bytes,
             bytes_processed: 0,
-            matches_found: 0,
+            match_count,
             start_time: now,
             last_report_time: now,
             report_interval,
@@ -132,10 +134,9 @@ impl SearchProgress {
         }
     }
 
-    pub fn update(&mut self, bytes: usize, matches: usize) {
+    pub fn update(&mut self, bytes: usize) {
         self.files_processed += 1;
         self.bytes_processed += bytes;
-        self.matches_found += matches;
     }
 
     pub fn should_report(&self) -> bool {
@@ -182,7 +183,7 @@ impl SearchProgress {
                     input_mb_done = self.bytes_processed / 1_000_000,
                     input_mb_total = self.total_bytes / 1_000_000,
                     download_mbps = format_args!("{download_mbps:.1}"),
-                    matches = self.matches_found,
+                    matches = self.match_count.load(Ordering::Relaxed),
                     dc_ch = format_args!("{dc_len}/{dc_cap}"),
                     line_ch_len = pipe.line_len(),
                     line_ch_cap = pipe.line_capacity(),
@@ -206,7 +207,7 @@ impl SearchProgress {
                     input_mb_done = self.bytes_processed / 1_000_000,
                     input_mb_total = self.total_bytes / 1_000_000,
                     download_mbps = format_args!("{download_mbps:.1}"),
-                    matches = self.matches_found,
+                    matches = self.match_count.load(Ordering::Relaxed),
                     dc_ch = format_args!("{dc_len}/{dc_cap}"),
                     line_ch_len = pipe.line_len(),
                     line_ch_cap = pipe.line_capacity(),
@@ -234,7 +235,7 @@ impl SearchProgress {
                 input_mb_done = self.bytes_processed / 1_000_000,
                 input_mb_total = self.total_bytes / 1_000_000,
                 download_mbps = format_args!("{download_mbps:.1}"),
-                matches = self.matches_found,
+                matches = self.match_count.load(Ordering::Relaxed),
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
                 rss_mb = rss_mb(),
                 bottleneck = bottleneck,

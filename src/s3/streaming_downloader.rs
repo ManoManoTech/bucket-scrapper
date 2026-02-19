@@ -150,6 +150,7 @@ impl StreamingDownloader {
             pipeline,
             ChannelObserver::from_sender(&line_tx),
             download_observer.clone(),
+            match_count.clone(),
         )));
 
         // --- Spawn download coordinator ---
@@ -196,18 +197,36 @@ impl StreamingDownloader {
         // Drop our clone of line_rx so channel closes when coordinator drops tx
         drop(line_rx);
 
+        // --- Spawn periodic progress ticker ---
+        // Reports progress even when no files complete (e.g. pipeline backed up).
+        let progress_ticker = {
+            let progress = progress.clone();
+            let interval = self.config.progress_interval;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs_f64(interval.as_secs_f64())).await;
+                    let mut prog = progress.lock().await;
+                    if prog.should_report() {
+                        prog.report();
+                    }
+                }
+            })
+        };
+
         // --- Join download coordinator ---
         match download_handle.await {
             Ok(Ok(files_processed)) => {
                 debug!(files = files_processed, "Download coordinator finished");
             }
             Ok(Err(e)) => {
+                progress_ticker.abort();
                 for h in &worker_handles {
                     h.abort();
                 }
                 return Err(e);
             }
             Err(e) => {
+                progress_ticker.abort();
                 for h in &worker_handles {
                     h.abort();
                 }
@@ -227,6 +246,9 @@ impl StreamingDownloader {
                 Err(e) => return Err(anyhow::anyhow!("Filter worker panicked: {e}")),
             }
         }
+
+        // Stop the progress ticker
+        progress_ticker.abort();
 
         // files_searched = total files processed by coordinator
         let files_searched = progress.lock().await.files_processed;
@@ -261,7 +283,7 @@ impl StreamingDownloader {
                         Ok(Ok(compressed_size)) => {
                             completed += 1;
                             let mut prog = progress.lock().await;
-                            prog.update(compressed_size, 0);
+                            prog.update(compressed_size);
                             if prog.should_report() {
                                 prog.report();
                             }
@@ -339,7 +361,7 @@ impl StreamingDownloader {
                 Ok(Ok(compressed_size)) => {
                     completed += 1;
                     let mut prog = progress.lock().await;
-                    prog.update(compressed_size, 0);
+                    prog.update(compressed_size);
                     if prog.should_report() {
                         prog.report();
                     }
