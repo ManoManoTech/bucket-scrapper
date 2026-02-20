@@ -843,6 +843,16 @@ impl HttpResultWriter {
         Ok(stats)
     }
 
+    /// Get the fatal-error flag so callers can observe pipeline aborts.
+    ///
+    /// When an uploader task encounters a non-retryable (4xx) HTTP error it
+    /// stores `true` into this flag.  External code (e.g. download coordinator)
+    /// should poll it to abort early instead of continuing to download data
+    /// that will never be uploaded.
+    pub fn fatal_error_flag(&self) -> Arc<AtomicBool> {
+        self.fatal_error.clone()
+    }
+
     /// Get the configured URL
     pub fn url(&self) -> &str {
         &self.url

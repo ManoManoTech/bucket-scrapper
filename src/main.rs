@@ -462,8 +462,9 @@ async fn main() -> Result<()> {
         if let Some(http_writer) = http_streaming {
             let http_sender = http_writer.get_sender();
             let observer = http_writer.observer();
+            let fatal_error = http_writer.fatal_error_flag();
             let (files_searched, matched_lines) = downloader
-                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, observer)
+                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, observer, fatal_error)
                 .await?;
 
             let api_url = http_writer.url().to_string();
