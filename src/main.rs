@@ -448,7 +448,7 @@ async fn main() -> Result<()> {
     };
 
     if all_bucket_objects.is_empty() {
-        info!("No objects found to search");
+        anyhow::bail!("No objects found to search");
     } else {
         let total_compressed_input: usize = all_bucket_objects.iter().map(|o| o.size).sum();
         info!(
