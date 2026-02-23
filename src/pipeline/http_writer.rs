@@ -142,6 +142,56 @@ impl UploadThrottle {
         }
     }
 
+    /// Apply multiplicative decrease.  Single code path for both timing-based
+    /// and 429-based congestion signals.
+    ///
+    /// Returns `true` if the decrease was applied, `false` if blocked by cooldown.
+    fn apply_decrease(
+        st: &mut ThrottleState,
+        cooldown: Duration,
+        decrease_factor: f64,
+        current_rate_bits: &AtomicU64,
+        reason: &str,
+    ) -> bool {
+        if st.last_decrease.elapsed() < cooldown {
+            return false;
+        }
+        st.congestion_count += 1;
+
+        // Ensure ceiling is estimated from observed throughput
+        if st.ceiling == 0.0 {
+            let elapsed = st.start_time.elapsed().as_secs_f64();
+            if elapsed > 0.0 && st.total_bytes > 0 {
+                st.ceiling = st.total_bytes as f64 / elapsed;
+            } else {
+                st.ceiling = MIN_RATE_BYTES_PER_SEC * 10.0;
+            }
+        }
+
+        let keep = 1.0 - decrease_factor;
+        let new_rate = if st.rate.is_infinite() {
+            st.ceiling * keep
+        } else {
+            (st.rate * keep).max(MIN_RATE_BYTES_PER_SEC)
+        };
+
+        info!(
+            old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
+            new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
+            ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
+            congestion_count = st.congestion_count,
+            reason = reason,
+            "Upload throttle: rate decreased"
+        );
+
+        st.rate = new_rate;
+        st.tokens = 0.0;
+        st.last_decrease = Instant::now();
+        st.last_refill = Instant::now();
+        current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
+        true
+    }
+
     /// Record a completed upload and apply AIMD logic.
     ///
     /// Called only on successful sends — failed sends do not adjust the rate.
@@ -166,53 +216,13 @@ impl UploadThrottle {
         let cooldown = Duration::from_secs_f64((mst.as_secs_f64() / 2.0).max(1.0));
 
         if duration > mst {
-            // --- Multiplicative Decrease ---
-            if st.last_decrease.elapsed() < cooldown {
-                return; // cooldown period — ignore concurrent congestion signals
-            }
-            st.congestion_count += 1;
-
-            if st.congestion_count == 1 && !st.rate.is_infinite() && st.ceiling == st.rate {
-                // First AIMD congestion with a static limit already set as ceiling.
-                // Estimate observed throughput and use the lower of the two.
-                let elapsed = st.start_time.elapsed().as_secs_f64();
-                let observed = if elapsed > 0.0 {
-                    st.total_bytes as f64 / elapsed
-                } else {
-                    bytes as f64 / duration.as_secs_f64()
-                };
-                st.ceiling = st.ceiling.min(observed);
-            } else if st.ceiling == 0.0 {
-                // First congestion without any ceiling: estimate from observed throughput
-                let elapsed = st.start_time.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    st.ceiling = st.total_bytes as f64 / elapsed;
-                } else {
-                    st.ceiling = bytes as f64 / duration.as_secs_f64();
-                }
-            }
-
-            let keep = 1.0 - decrease_factor;
-            let new_rate = if st.rate.is_infinite() {
-                st.ceiling * keep
-            } else {
-                (st.rate * keep).max(MIN_RATE_BYTES_PER_SEC)
-            };
-
-            info!(
-                old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
-                new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
-                ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
-                submission_ms = duration.as_millis() as u64,
-                threshold_ms = mst.as_millis() as u64,
-                congestion_count = st.congestion_count,
-                "Upload throttle: multiplicative decrease"
+            Self::apply_decrease(
+                st,
+                cooldown,
+                decrease_factor,
+                current_rate_bits,
+                "batch exceeded submission time threshold",
             );
-
-            st.rate = new_rate;
-            st.tokens = 0.0; // prevent post-decrease burst
-            st.last_decrease = Instant::now();
-            st.last_refill = Instant::now();
         } else if st.ceiling > 0.0 && !st.rate.is_infinite() {
             // --- Additive Increase ---
             let new_rate = (st.rate + increase_bytes).min(st.ceiling);
@@ -224,10 +234,9 @@ impl UploadThrottle {
                     "Upload throttle: additive increase"
                 );
                 st.rate = new_rate;
+                current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
             }
         }
-
-        current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
     }
 
     /// Record a completed upload and apply AIMD logic.
@@ -249,44 +258,15 @@ impl UploadThrottle {
     /// Respects the same cooldown as timing-based decreases.
     async fn force_decrease(&self) {
         let mut st = self.state.lock().await;
-
-        let mst = self.max_submission_time.unwrap_or(Duration::from_secs(3));
+        let mst = self.max_submission_time.unwrap_or(Duration::from_secs(4));
         let cooldown = Duration::from_secs_f64((mst.as_secs_f64() / 2.0).max(1.0));
-        if st.last_decrease.elapsed() < cooldown {
-            return;
-        }
-        st.congestion_count += 1;
-
-        if st.ceiling == 0.0 {
-            let elapsed = st.start_time.elapsed().as_secs_f64();
-            if elapsed > 0.0 && st.total_bytes > 0 {
-                st.ceiling = st.total_bytes as f64 / elapsed;
-            } else {
-                // No data yet — use a conservative starting point
-                st.ceiling = MIN_RATE_BYTES_PER_SEC * 10.0;
-            }
-        }
-
-        let keep = 1.0 - self.decrease_factor;
-        let new_rate = if st.rate.is_infinite() {
-            st.ceiling * keep
-        } else {
-            (st.rate * keep).max(MIN_RATE_BYTES_PER_SEC)
-        };
-
-        info!(
-            old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
-            new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
-            ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
-            congestion_count = st.congestion_count,
-            "Upload throttle: 429 forced decrease"
+        Self::apply_decrease(
+            &mut st,
+            cooldown,
+            self.decrease_factor,
+            &self.current_rate_bits,
+            "server returned HTTP 429 Too Many Requests",
         );
-
-        st.rate = new_rate;
-        st.tokens = 0.0;
-        st.last_decrease = Instant::now();
-        st.last_refill = Instant::now();
-        self.current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
     }
 
     /// Get current rate in MB/s for progress reporting.
@@ -361,7 +341,7 @@ impl Default for HttpWriterConfig {
             num_upload_tasks: 4 * num_compressor_tasks,
             upload_channel_size: 4,
             compression_level: 3,
-            max_submission_time: Some(Duration::from_secs(3)),
+            max_submission_time: Some(Duration::from_secs(4)),
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
             aimd_increase_bytes: 1_000_000.0,

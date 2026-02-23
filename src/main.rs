@@ -134,7 +134,7 @@ struct Cli {
     memory_limit_gb: u64,
 
     /// Per-batch submission time threshold in seconds for AIMD upload throttle (0 = disabled)
-    #[arg(long, default_value = "3.0")]
+    #[arg(long, default_value = "4.0")]
     max_submission_time: f64,
 
     /// AIMD multiplicative decrease factor (0.15 = reduce rate by 15% on congestion)
