@@ -15,9 +15,8 @@ use bucket_scrapper::config::types::{BucketConfig, S3ObjectInfo};
 use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::{StreamingDownloader, StreamingDownloaderConfig};
-use bucket_scrapper::pipeline::{
-    HttpResultWriter, HttpWriterConfig, LineMatcher, MatcherConfig, SharedFileWriter,
-};
+use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
+use bucket_scrapper::pipeline::{HttpResultWriter, HttpWriterConfig, SharedFileWriter};
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 use bucket_scrapper::utils::path_formatter::generate_path_formatter;
 

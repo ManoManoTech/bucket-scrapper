@@ -1,4 +1,4 @@
-use bucket_scrapper::pipeline::{LineMatcher, MatcherConfig};
+use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
 
 #[test]
 fn test_regex_matcher_cached() {

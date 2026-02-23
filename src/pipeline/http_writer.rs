@@ -1,4 +1,4 @@
-// src/search/http_writer.rs
+use super::observer::PipelineObserver;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::Client;
@@ -13,67 +13,6 @@ struct CompressedBatch {
     body: Bytes,
     lines: usize,
     plaintext_bytes: usize,
-}
-
-/// Read-only view of pipeline channel fill levels.
-///
-/// Cloning the underlying senders is cheap (Arc bump) and does not interfere
-/// with backpressure — senders only block on `send`, not on creation.
-pub struct PipelineObserver {
-    line_tx: flume::Sender<String>,
-    batch_tx: flume::Sender<CompressedBatch>,
-    batches_uploaded: Arc<AtomicUsize>,
-    upload_time_us: Arc<AtomicUsize>,
-    compressed_bytes_sent: Arc<AtomicUsize>,
-    /// Throttle rate bits (f64 as u64). `None` = throttle disabled.
-    throttle_rate_bits: Option<Arc<AtomicU64>>,
-}
-
-impl PipelineObserver {
-    pub fn line_len(&self) -> usize {
-        self.line_tx.len()
-    }
-
-    pub fn line_capacity(&self) -> usize {
-        self.line_tx.capacity().unwrap_or(0)
-    }
-
-    pub fn batch_len(&self) -> usize {
-        self.batch_tx.len()
-    }
-
-    pub fn batch_capacity(&self) -> usize {
-        self.batch_tx.capacity().unwrap_or(0)
-    }
-
-    pub fn batches_uploaded(&self) -> usize {
-        self.batches_uploaded.load(Ordering::Relaxed)
-    }
-
-    pub fn compressed_bytes_sent(&self) -> usize {
-        self.compressed_bytes_sent.load(Ordering::Relaxed)
-    }
-
-    /// Average batch upload time in milliseconds, or 0.0 if no batches yet.
-    pub fn avg_upload_ms(&self) -> f64 {
-        let count = self.batches_uploaded();
-        if count == 0 {
-            return 0.0;
-        }
-        let total_us = self.upload_time_us.load(Ordering::Relaxed) as f64;
-        total_us / count as f64 / 1000.0
-    }
-
-    /// Current throttle rate in MB/s, or `None` if disabled or unlimited.
-    pub fn throttle_rate_mbps(&self) -> Option<f64> {
-        let bits_arc = self.throttle_rate_bits.as_ref()?;
-        let rate = f64::from_bits(bits_arc.load(Ordering::Relaxed));
-        if rate.is_infinite() {
-            None
-        } else {
-            Some(rate / 1_000_000.0)
-        }
-    }
 }
 
 /// Result of a batch send attempt.
@@ -439,6 +378,30 @@ pub struct HttpWriterStats {
     pub plaintext_bytes_sent: usize,
 }
 
+/// Shared atomic counters for uploader tasks.
+#[derive(Clone)]
+struct UploaderCounters {
+    lines_sent: Arc<AtomicUsize>,
+    lines_dropped: Arc<AtomicUsize>,
+    compressed_bytes_sent: Arc<AtomicUsize>,
+    plaintext_bytes_sent: Arc<AtomicUsize>,
+    batches_uploaded: Arc<AtomicUsize>,
+    upload_time_us: Arc<AtomicUsize>,
+}
+
+impl Default for UploaderCounters {
+    fn default() -> Self {
+        Self {
+            lines_sent: Arc::new(AtomicUsize::new(0)),
+            lines_dropped: Arc::new(AtomicUsize::new(0)),
+            compressed_bytes_sent: Arc::new(AtomicUsize::new(0)),
+            plaintext_bytes_sent: Arc::new(AtomicUsize::new(0)),
+            batches_uploaded: Arc::new(AtomicUsize::new(0)),
+            upload_time_us: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
     write_tx: flume::Sender<String>,
@@ -446,18 +409,7 @@ pub struct HttpResultWriter {
     batch_tx: flume::Sender<CompressedBatch>,
     compressor_handles: Vec<tokio::task::JoinHandle<()>>,
     upload_handles: Vec<tokio::task::JoinHandle<usize>>,
-    /// Tracks total lines sent (shared with uploader tasks)
-    lines_sent: Arc<AtomicUsize>,
-    /// Tracks total lines dropped on batch failures (shared with tasks)
-    lines_dropped: Arc<AtomicUsize>,
-    /// Tracks total compressed bytes sent (shared with uploader tasks)
-    compressed_bytes_sent: Arc<AtomicUsize>,
-    /// Tracks total plaintext bytes sent (shared with uploader tasks)
-    plaintext_bytes_sent: Arc<AtomicUsize>,
-    /// Tracks total batches successfully uploaded (shared with uploader tasks)
-    batches_uploaded: Arc<AtomicUsize>,
-    /// Tracks cumulative upload time in microseconds (shared with uploader tasks)
-    upload_time_us: Arc<AtomicUsize>,
+    counters: UploaderCounters,
     /// Set on fatal (4xx) errors to stop the entire pipeline
     fatal_error: Arc<AtomicBool>,
     /// AIMD upload throttle (None = disabled)
@@ -489,12 +441,7 @@ impl HttpResultWriter {
         // Batch channel: compressors → uploaders
         let (batch_tx, batch_rx) = flume::bounded::<CompressedBatch>(config.upload_channel_size);
 
-        let lines_sent = Arc::new(AtomicUsize::new(0));
-        let lines_dropped = Arc::new(AtomicUsize::new(0));
-        let compressed_bytes_sent = Arc::new(AtomicUsize::new(0));
-        let plaintext_bytes_sent = Arc::new(AtomicUsize::new(0));
-        let batches_uploaded = Arc::new(AtomicUsize::new(0));
-        let upload_time_us = Arc::new(AtomicUsize::new(0));
+        let counters = UploaderCounters::default();
         let fatal_error = Arc::new(AtomicBool::new(false));
         let url = config.url.clone();
 
@@ -517,7 +464,7 @@ impl HttpResultWriter {
             let rx = line_rx.clone();
             let tx = batch_tx.clone();
             let cfg = config.clone();
-            let ld = lines_dropped.clone();
+            let ld = counters.lines_dropped.clone();
             let fe = fatal_error.clone();
             let handle = tokio::spawn(async move {
                 Self::compressor_task(task_id, rx, tx, cfg, ld, fe).await;
@@ -531,16 +478,11 @@ impl HttpResultWriter {
             let rx = batch_rx.clone();
             let client = client.clone();
             let cfg = config.clone();
-            let ls = lines_sent.clone();
-            let ld = lines_dropped.clone();
-            let cb = compressed_bytes_sent.clone();
-            let pb = plaintext_bytes_sent.clone();
-            let bu = batches_uploaded.clone();
-            let ut = upload_time_us.clone();
+            let ctrs = counters.clone();
             let fe = fatal_error.clone();
             let th = throttle.clone();
             let handle = tokio::spawn(async move {
-                Self::uploader_task(task_id, rx, client, cfg, ls, ld, cb, pb, bu, ut, fe, th).await
+                Self::uploader_task(task_id, rx, client, cfg, ctrs, fe, th).await
             });
             upload_handles.push(handle);
         }
@@ -556,12 +498,7 @@ impl HttpResultWriter {
             batch_tx,
             compressor_handles,
             upload_handles,
-            lines_sent,
-            lines_dropped,
-            compressed_bytes_sent,
-            plaintext_bytes_sent,
-            batches_uploaded,
-            upload_time_us,
+            counters,
             fatal_error,
             throttle,
             url,
@@ -575,19 +512,19 @@ impl HttpResultWriter {
 
     /// Get a read-only observer for pipeline channel stats.
     pub fn observer(&self) -> PipelineObserver {
-        PipelineObserver {
-            line_tx: self.write_tx.clone(),
-            batch_tx: self.batch_tx.clone(),
-            batches_uploaded: self.batches_uploaded.clone(),
-            upload_time_us: self.upload_time_us.clone(),
-            compressed_bytes_sent: self.compressed_bytes_sent.clone(),
-            throttle_rate_bits: self.throttle.as_ref().map(|t| t.rate_bits()),
-        }
+        PipelineObserver::new(
+            &self.write_tx,
+            &self.batch_tx,
+            self.counters.batches_uploaded.clone(),
+            self.counters.upload_time_us.clone(),
+            self.counters.compressed_bytes_sent.clone(),
+            self.throttle.as_ref().map(|t| t.rate_bits()),
+        )
     }
 
     /// Get current lines sent count
     pub fn lines_sent(&self) -> usize {
-        self.lines_sent.load(Ordering::Relaxed)
+        self.counters.lines_sent.load(Ordering::Relaxed)
     }
 
     /// CPU-bound task that reads lines from the line channel, compresses them into
@@ -703,18 +640,12 @@ impl HttpResultWriter {
     }
 
     /// IO-bound task that receives compressed batches and uploads them via HTTP.
-    #[allow(clippy::too_many_arguments)]
     async fn uploader_task(
         task_id: usize,
         batch_rx: flume::Receiver<CompressedBatch>,
         client: Client,
         config: HttpWriterConfig,
-        lines_sent: Arc<AtomicUsize>,
-        lines_dropped: Arc<AtomicUsize>,
-        compressed_bytes_sent: Arc<AtomicUsize>,
-        plaintext_bytes_sent: Arc<AtomicUsize>,
-        batches_uploaded: Arc<AtomicUsize>,
-        upload_time_us: Arc<AtomicUsize>,
+        ctrs: UploaderCounters,
         fatal_error: Arc<AtomicBool>,
         throttle: Option<Arc<UploadThrottle>>,
     ) -> usize {
@@ -740,11 +671,11 @@ impl HttpResultWriter {
                         let elapsed_us = send_elapsed.as_micros() as usize;
                         total_sent += batch.lines;
                         batches_sent += 1;
-                        lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
-                        compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
-                        plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
-                        batches_uploaded.fetch_add(1, Ordering::Relaxed);
-                        upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+                        ctrs.lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
+                        ctrs.compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
+                        ctrs.plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
+                        ctrs.batches_uploaded.fetch_add(1, Ordering::Relaxed);
+                        ctrs.upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
 
                         // Feed AIMD throttle with timing data
                         if let Some(ref th) = throttle {
@@ -807,7 +738,7 @@ impl HttpResultWriter {
             if let Some(result) = result {
                 match result {
                     SendResult::Retryable(e) => {
-                        lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                        ctrs.lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
                         error!(
                             task = task_id,
                             lines = batch.lines,
@@ -817,7 +748,7 @@ impl HttpResultWriter {
                         );
                     }
                     SendResult::Fatal(e) => {
-                        lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                        ctrs.lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
                         error!(
                             task = task_id,
                             lines = batch.lines,
@@ -958,9 +889,9 @@ impl HttpResultWriter {
 
         let stats = HttpWriterStats {
             lines_sent: total,
-            lines_dropped: self.lines_dropped.load(Ordering::Relaxed),
-            compressed_bytes_sent: self.compressed_bytes_sent.load(Ordering::Relaxed),
-            plaintext_bytes_sent: self.plaintext_bytes_sent.load(Ordering::Relaxed),
+            lines_dropped: self.counters.lines_dropped.load(Ordering::Relaxed),
+            compressed_bytes_sent: self.counters.compressed_bytes_sent.load(Ordering::Relaxed),
+            plaintext_bytes_sent: self.counters.plaintext_bytes_sent.load(Ordering::Relaxed),
         };
 
         if self.fatal_error.load(Ordering::Relaxed) {

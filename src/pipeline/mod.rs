@@ -1,8 +1,7 @@
-// src/pipeline/mod.rs
 pub mod http_writer;
-pub mod searcher;
+pub mod observer;
 pub mod streaming_writer;
 
-pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats, PipelineObserver};
-pub use searcher::{LineMatcher, MatcherConfig};
+pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats};
+pub use observer::PipelineObserver;
 pub use streaming_writer::{FileWriterStats, SharedFileWriter};

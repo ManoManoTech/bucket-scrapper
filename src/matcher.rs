@@ -1,4 +1,4 @@
-// src/pipeline/searcher.rs
+// src/matcher.rs
 use anyhow::Result;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
