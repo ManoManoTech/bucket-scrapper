@@ -10,14 +10,15 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use bucket_scrapper::config::loader::load_config;
-use bucket_scrapper::config::types::{BucketConfig, S3ObjectInfo};
+use bucket_scrapper::config::types::BucketConfig;
+use bucket_scrapper::s3::S3ObjectInfo;
 use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
-use bucket_scrapper::s3::{StreamingDownloader, StreamingDownloaderConfig};
+use bucket_scrapper::pipeline::{StreamingDownloader, StreamingDownloaderConfig};
 use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
 use bucket_scrapper::pipeline::{HttpResultWriter, HttpWriterConfig, SharedFileWriter};
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
-use bucket_scrapper::utils::path_formatter::generate_path_formatter;
+use bucket_scrapper::config::path_formatter::generate_path_formatter;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]

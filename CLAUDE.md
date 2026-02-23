@@ -16,12 +16,13 @@ S3 download (semaphore-bounded)
 ```
 
 Key modules:
-- `src/s3/streaming_downloader.rs` — pipeline orchestrator (despite living in `s3/`)
+- `src/pipeline/orchestrator.rs` — pipeline orchestrator: download → decompress → filter → output
 - `src/pipeline/http_writer.rs` — HTTP output: compressor pool + uploader pool + AIMD throttle
-- `src/pipeline/observer.rs` — type-erased channel fill-level observer for progress reporting
+- `src/pipeline/observer.rs` — observer primitives: `PipelineObserver`, `ChannelObserver`, `DownloadObserver`
 - `src/pipeline/streaming_writer.rs` — file output: `SharedFileWriter` with per-prefix `Mutex<ZstdEncoder>`
 - `src/matcher.rs` — `LineMatcher`: stateless regex wrapper around `grep-matcher`
 - `src/progress.rs` — periodic structured-log progress reports with bottleneck detection
+- `src/config/path_formatter.rs` — date/hour prefix formatting from `BucketConfig` path schemas
 
 ## Tech Stack
 

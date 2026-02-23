@@ -1,5 +1,5 @@
 pub mod client;
 pub mod dns_cache;
-pub mod streaming_downloader;
+pub mod types;
 
-pub use streaming_downloader::{StreamingDownloader, StreamingDownloaderConfig};
+pub use types::S3ObjectInfo;

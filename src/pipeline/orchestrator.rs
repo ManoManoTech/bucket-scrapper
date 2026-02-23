@@ -1,14 +1,14 @@
 //! Pipeline orchestrator: download → decompress → filter → output.
 //!
-//! Despite living in `s3/`, this module is the main pipeline coordinator.
 //! Only `download_inner` and `download_with_retry` perform actual S3 I/O;
 //! the rest is concurrency orchestration (semaphores, channels, task pools)
 //! and progress reporting.
 
-use crate::config::types::S3ObjectInfo;
 use crate::matcher::LineMatcher;
-use crate::pipeline::{PipelineObserver, SharedFileWriter};
-use crate::progress::{ChannelObserver, DownloadObserver, PipelineProgress};
+use crate::progress::PipelineProgress;
+use crate::s3::S3ObjectInfo;
+use super::observer::{ChannelObserver, DownloadObserver, PipelineObserver};
+use super::SharedFileWriter;
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use backon::{ExponentialBuilder, Retryable};

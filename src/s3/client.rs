@@ -1,4 +1,4 @@
-use crate::config::types::S3ObjectInfo;
+use super::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use anyhow::{Context, Result};
 use aws_config::retry::RetryConfig;

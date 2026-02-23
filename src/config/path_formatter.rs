@@ -1,4 +1,4 @@
-use crate::config::types::{BucketConfig, PathSchema};
+use super::types::{BucketConfig, PathSchema};
 use crate::utils::date::{common_date_format, empty_date_format, raw_logs_date_format};
 use anyhow::Result;
 use regex::Regex;
@@ -50,7 +50,7 @@ fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
 ///
 /// ```
 /// use bucket_scrapper::config::types::{BucketConfig, PathSchema};
-/// use bucket_scrapper::utils::path_formatter::generate_path_formatter;
+/// use bucket_scrapper::config::path_formatter::generate_path_formatter;
 /// use std::collections::HashMap;
 ///
 /// let bucket = BucketConfig {
@@ -102,7 +102,6 @@ pub fn generate_path_formatter(bucket: &BucketConfig) -> PathFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{BucketConfig, PathSchema};
     use std::collections::HashMap;
 
     #[test]

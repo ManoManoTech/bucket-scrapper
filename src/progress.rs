@@ -1,79 +1,10 @@
 //! Cross-cutting progress tracking for the download → search → export pipeline.
 
-use crate::pipeline::PipelineObserver;
+use crate::pipeline::{ChannelObserver, DownloadObserver, PipelineObserver};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
-
-/// Tracks raw bytes downloaded from S3 (before decompression).
-///
-/// Incremented in `download_and_decompress_inner` right after `body.collect()`,
-/// so it measures true S3 download throughput independent of search/upload speed.
-#[derive(Clone)]
-pub struct DownloadObserver {
-    bytes: Arc<AtomicUsize>,
-}
-
-impl Default for DownloadObserver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DownloadObserver {
-    pub fn new() -> Self {
-        Self {
-            bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn add_bytes(&self, n: usize) {
-        self.bytes.fetch_add(n, Ordering::Relaxed);
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
-    }
-}
-
-/// Type-erased channel fill-level observer.
-///
-/// Captures the `len()` and `capacity()` of a `flume` channel at construction
-/// time without retaining the concrete item type `T`.  This lets
-/// [`PipelineProgress`] observe decompressed-channel fill levels without
-/// depending on the private `DownloadedObject` type.
-pub struct ChannelObserver {
-    len: Box<dyn Fn() -> usize + Send + Sync>,
-    cap: usize,
-}
-
-impl ChannelObserver {
-    /// Create an observer from any `flume::Receiver<T>`.
-    ///
-    /// Uses the receiver side so that holding this observer does not prevent
-    /// channel closure (which requires all *senders* to be dropped).
-    pub fn from_receiver<T: Send + 'static>(rx: &flume::Receiver<T>) -> Self {
-        let rx = rx.clone();
-        let cap = rx.capacity().unwrap_or(0);
-        Self {
-            len: Box::new(move || rx.len()),
-            cap,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        (self.len)()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.cap
-    }
-}
 
 fn rss_mb() -> usize {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
