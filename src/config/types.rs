@@ -136,15 +136,3 @@ mod tests {
     }
 }
 
-// Type aliases for date/hour strings
-pub type DateString = String; // YYYYMMDD format
-pub type HourString = String; // HH format 00-23
-
-/// Collection of S3 files with metadata
-#[derive(Debug, Clone)]
-pub struct S3FileList {
-    pub bucket: String,
-    pub checksum: String,
-    pub files: Vec<S3ObjectInfo>,
-    pub total_archives_size: usize,
-}

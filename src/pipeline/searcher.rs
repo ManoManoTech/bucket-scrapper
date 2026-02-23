@@ -3,21 +3,21 @@ use anyhow::Result;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 
-/// Configuration for the stream searcher
+/// Configuration for the line matcher
 #[derive(Clone, Default)]
-pub struct SearchConfig {
+pub struct MatcherConfig {
     pub pattern: Option<String>,
     pub ignore_case: bool,
 }
 
-/// A searcher that tests individual lines against a regex pattern.
+/// Tests individual lines against a regex pattern.
 /// When no pattern is provided, all lines match.
-pub struct StreamSearcher {
+pub struct LineMatcher {
     matcher: Option<RegexMatcher>,
 }
 
-impl StreamSearcher {
-    pub fn new(config: SearchConfig) -> Result<Self> {
+impl LineMatcher {
+    pub fn new(config: MatcherConfig) -> Result<Self> {
         let matcher = if let Some(ref pattern) = config.pattern {
             let mut matcher_builder = RegexMatcherBuilder::new();
             matcher_builder.case_insensitive(config.ignore_case);

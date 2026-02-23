@@ -1,12 +1,11 @@
 // src/utils/date.rs
-use crate::config::types::{DateString, HourString};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Debug, Clone)]
 pub struct DateHour {
-    pub date: DateString,
-    pub hour: HourString,
+    pub date: String,
+    pub hour: String,
 }
 
 /// Formats date as YYYYMMDD
@@ -20,7 +19,7 @@ pub struct DateHour {
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// assert_eq!(format_date(&date), "20231225");
 /// ```
-pub fn format_date(date: &DateTime<Utc>) -> DateString {
+pub fn format_date(date: &DateTime<Utc>) -> String {
     date.format("%Y%m%d").to_string()
 }
 
@@ -38,7 +37,7 @@ pub fn format_date(date: &DateTime<Utc>) -> DateString {
 /// let date_zero = Utc.with_ymd_and_hms(2023, 12, 25, 0, 30, 0).unwrap();
 /// assert_eq!(format_hour(&date_zero), "00");
 /// ```
-pub fn format_hour(date: &DateTime<Utc>) -> HourString {
+pub fn format_hour(date: &DateTime<Utc>) -> String {
     date.format("%H").to_string()
 }
 
@@ -122,7 +121,7 @@ pub fn date_range_to_date_hour_list(
 /// let hour = "14".to_string();
 /// assert_eq!(common_date_format(&date, &hour), "dt=20231225/hour=14");
 /// ```
-pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
+pub fn common_date_format(date: &str, hour: &str) -> String {
     format!("dt={date}/hour={hour}")
 }
 
@@ -141,7 +140,7 @@ pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
 /// let invalid_date = "2023125".to_string(); // 7 characters instead of 8
 /// assert!(raw_logs_date_format(&invalid_date, &hour).is_err());
 /// ```
-pub fn raw_logs_date_format(date: &DateString, hour: &HourString) -> Result<String> {
+pub fn raw_logs_date_format(date: &str, hour: &str) -> Result<String> {
     if date.len() != 8 {
         return Err(anyhow::anyhow!(
             "Invalid date: {date}. Should be YYYYMMDD, 8 characters."
@@ -158,7 +157,7 @@ pub fn raw_logs_date_format(date: &DateString, hour: &HourString) -> Result<Stri
 }
 
 /// Returns an empty string (used for some edge cases)
-pub fn empty_date_format(_date: &DateString, _hour: &HourString) -> String {
+pub fn empty_date_format(_date: &str, _hour: &str) -> String {
     String::new()
 }
 

@@ -42,7 +42,7 @@ impl DownloadObserver {
 ///
 /// Captures the `len()` and `capacity()` of a `flume` channel at construction
 /// time without retaining the concrete item type `T`.  This lets
-/// [`SearchProgress`] observe decompressed-channel fill levels without
+/// [`PipelineProgress`] observe decompressed-channel fill levels without
 /// depending on the private `DownloadedObject` type.
 pub struct ChannelObserver {
     len: Box<dyn Fn() -> usize + Send + Sync>,
@@ -88,7 +88,7 @@ fn rss_mb() -> usize {
 ///
 /// Observes all pipeline stages (download, decompress channel, compress, upload)
 /// and emits periodic structured-log reports with throughput and bottleneck info.
-pub struct SearchProgress {
+pub struct PipelineProgress {
     pub total_files: usize,
     pub files_processed: usize,
     pub total_bytes: usize,
@@ -107,7 +107,7 @@ pub struct SearchProgress {
     pub prev_uploaded_bytes: usize,
 }
 
-impl SearchProgress {
+impl PipelineProgress {
     pub fn new(
         total_files: usize,
         total_bytes: usize,

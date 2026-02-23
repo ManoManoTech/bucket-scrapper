@@ -16,7 +16,7 @@ use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::{StreamingDownloader, StreamingDownloaderConfig};
 use bucket_scrapper::pipeline::{
-    HttpResultWriter, HttpWriterConfig, SearchConfig, SharedFileWriter, StreamSearcher,
+    HttpResultWriter, HttpWriterConfig, LineMatcher, MatcherConfig, SharedFileWriter,
 };
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 use bucket_scrapper::utils::path_formatter::generate_path_formatter;
@@ -66,13 +66,9 @@ struct Cli {
     #[arg(long, default_value = "32")]
     max_parallel: usize,
 
-    /// Stream buffer size in KB
-    #[arg(long, default_value = "64")]
-    buffer_size_kb: usize,
-
-    /// Channel buffer size for match backpressure (max matches buffered in memory)
+    /// HTTP line channel capacity (max matched lines buffered before compressors)
     #[arg(long, default_value = "1000")]
-    channel_buffer: usize,
+    http_line_channel_size: usize,
 
     /// Maximum retry attempts for failed downloads
     #[arg(long, default_value = "10")]
@@ -246,7 +242,7 @@ async fn main() -> Result<()> {
         Arc::new(WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?);
 
     // Configure search
-    let search_config = SearchConfig {
+    let matcher_config = MatcherConfig {
         pattern: cli.line_pattern_regex.clone(),
         ignore_case: cli.ignore_case,
     };
@@ -271,7 +267,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let searcher = Arc::new(StreamSearcher::new(search_config)?);
+    let searcher = Arc::new(LineMatcher::new(matcher_config)?);
 
     // Configure downloader
     let filter_tasks = cli.filter_tasks.unwrap_or_else(|| {
@@ -283,7 +279,6 @@ async fn main() -> Result<()> {
 
     let download_config = StreamingDownloaderConfig {
         max_concurrent_downloads: cli.max_parallel,
-        buffer_size_bytes: cli.buffer_size_kb * 1024,
         max_retries: cli.max_retries,
         initial_retry_delay: Duration::from_secs(cli.retry_delay),
         progress_interval: Duration::from_secs_f64(cli.progress_interval),
@@ -353,7 +348,7 @@ async fn main() -> Result<()> {
             batch_max_bytes,
             timeout_secs,
             max_retries: cli.max_retries.min(10),
-            channel_buffer_size: cli.channel_buffer,
+            channel_buffer_size: cli.http_line_channel_size,
             num_compressor_tasks,
             num_upload_tasks,
             upload_channel_size: cli.http_upload_channel_size,

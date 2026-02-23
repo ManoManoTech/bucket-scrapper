@@ -4,5 +4,5 @@ pub mod searcher;
 pub mod streaming_writer;
 
 pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats, PipelineObserver};
-pub use searcher::{SearchConfig, StreamSearcher};
+pub use searcher::{LineMatcher, MatcherConfig};
 pub use streaming_writer::{FileWriterStats, SharedFileWriter};

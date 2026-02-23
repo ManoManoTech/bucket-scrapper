@@ -1,7 +1,7 @@
 // src/s3/streaming_downloader.rs
 use crate::config::types::S3ObjectInfo;
-use crate::pipeline::{PipelineObserver, SharedFileWriter, StreamSearcher};
-use crate::progress::{ChannelObserver, DownloadObserver, SearchProgress};
+use crate::pipeline::{LineMatcher, PipelineObserver, SharedFileWriter};
+use crate::progress::{ChannelObserver, DownloadObserver, PipelineProgress};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use backon::{ExponentialBuilder, Retryable};
@@ -29,7 +29,6 @@ enum FilterOutput {
 #[derive(Clone)]
 pub struct StreamingDownloaderConfig {
     pub max_concurrent_downloads: usize,
-    pub buffer_size_bytes: usize,
     pub max_retries: u32,
     pub initial_retry_delay: Duration,
     pub progress_interval: Duration,
@@ -48,7 +47,6 @@ impl Default for StreamingDownloaderConfig {
             .max(1);
         Self {
             max_concurrent_downloads: 32,
-            buffer_size_bytes: 64 * 1024, // 64KB chunks
             max_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
             progress_interval: Duration::from_secs(3),
@@ -88,7 +86,7 @@ impl StreamingDownloader {
     pub async fn search_objects_to_http(
         &self,
         objects: &[S3ObjectInfo],
-        searcher: Arc<StreamSearcher>,
+        searcher: Arc<LineMatcher>,
         http_sender: flume::Sender<String>,
         observer: PipelineObserver,
         fatal_error: Arc<AtomicBool>,
@@ -103,7 +101,7 @@ impl StreamingDownloader {
     pub async fn search_objects_to_file(
         &self,
         objects: &[S3ObjectInfo],
-        searcher: Arc<StreamSearcher>,
+        searcher: Arc<LineMatcher>,
         writer: SharedFileWriter,
     ) -> Result<(usize, usize)> {
         let output = FilterOutput::File(writer);
@@ -126,7 +124,7 @@ impl StreamingDownloader {
     async fn search_objects(
         &self,
         objects: &[S3ObjectInfo],
-        searcher: Arc<StreamSearcher>,
+        searcher: Arc<LineMatcher>,
         pipeline: Option<PipelineObserver>,
         output: FilterOutput,
         fatal_error: Option<Arc<AtomicBool>>,
@@ -152,7 +150,7 @@ impl StreamingDownloader {
         let download_observer = DownloadObserver::new();
         let match_count = Arc::new(AtomicUsize::new(0));
 
-        let progress = Arc::new(Mutex::new(SearchProgress::new(
+        let progress = Arc::new(Mutex::new(PipelineProgress::new(
             objects.len(),
             total_bytes,
             self.config.progress_interval,
@@ -281,7 +279,7 @@ impl StreamingDownloader {
         semaphore: Arc<Semaphore>,
         line_tx: flume::Sender<DecompressedLine>,
         download_observer: DownloadObserver,
-        progress: Arc<Mutex<SearchProgress>>,
+        progress: Arc<Mutex<PipelineProgress>>,
         fatal_error: Option<Arc<AtomicBool>>,
     ) -> Result<usize> {
         let mut spawned = 0usize;
@@ -568,7 +566,7 @@ impl StreamingDownloader {
     async fn filter_worker(
         worker_id: usize,
         rx: flume::Receiver<DecompressedLine>,
-        searcher: Arc<StreamSearcher>,
+        searcher: Arc<LineMatcher>,
         output: Arc<FilterOutput>,
         match_count: Arc<AtomicUsize>,
         fatal_error: Option<Arc<AtomicBool>>,

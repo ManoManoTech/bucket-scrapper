@@ -1,5 +1,5 @@
 // src/config/loader.rs
-use crate::config::types::{BucketConfig, ConfigSchema};
+use crate::config::types::ConfigSchema;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
@@ -18,11 +18,6 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
         "Config loaded"
     );
     Ok(config)
-}
-
-/// Get configured buckets from the config
-pub fn get_buckets(config: &ConfigSchema) -> Vec<&BucketConfig> {
-    config.buckets.iter().collect()
 }
 
 #[cfg(test)]
@@ -62,26 +57,4 @@ buckets:
         assert_eq!(config.buckets[0].bucket, "my-bucket");
     }
 
-    #[test]
-    fn get_buckets_returns_all() {
-        let config = ConfigSchema {
-            buckets: vec![
-                BucketConfig {
-                    bucket: "a".into(),
-                    path: vec![],
-                    only_prefix_patterns: None,
-                    extra: Default::default(),
-                },
-                BucketConfig {
-                    bucket: "b".into(),
-                    path: vec![],
-                    only_prefix_patterns: None,
-                    extra: Default::default(),
-                },
-            ],
-            ..Default::default()
-        };
-        let buckets = get_buckets(&config);
-        assert_eq!(buckets.len(), 2);
-    }
 }

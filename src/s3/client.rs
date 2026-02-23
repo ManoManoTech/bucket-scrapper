@@ -1,5 +1,4 @@
 // src/s3/client.rs
-// Location: src/s3/client.rs
 use crate::config::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use anyhow::{Context, Result};
@@ -141,8 +140,8 @@ impl WrappedS3Client {
 
         debug!(bucket = %bucket, prefix = %prefix, "Listing objects");
 
-        let mut all_objects = Vec::new();
-        let mut result = Vec::new();
+        let mut all_keys = Vec::new();
+        let mut matched = Vec::new();
         let mut continuation_token = None;
         let mut pages = 0u32;
 
@@ -175,12 +174,12 @@ impl WrappedS3Client {
 
                         // Apply regex filter if provided
                         if let Some(ref regex) = filter_regex {
-                            all_objects.push(obj_info.key.clone());
+                            all_keys.push(obj_info.key.clone());
                             if regex.is_match(&obj_info.key) {
-                                result.push(obj_info);
+                                matched.push(obj_info);
                             }
                         } else {
-                            result.push(obj_info);
+                            matched.push(obj_info);
                         }
                     }
                 }
@@ -194,7 +193,7 @@ impl WrappedS3Client {
                     bucket = %bucket,
                     prefix = %prefix,
                     page = pages,
-                    keys = result.len(),
+                    keys = matched.len(),
                     "Listing page, continuing"
                 );
             } else {
@@ -206,8 +205,8 @@ impl WrappedS3Client {
             debug!(
                 bucket = %bucket,
                 prefix = %prefix,
-                matched = result.len(),
-                total = all_objects.len(),
+                matched = matched.len(),
+                total = all_keys.len(),
                 pages = pages,
                 "Listed with filter"
             );
@@ -215,116 +214,14 @@ impl WrappedS3Client {
             debug!(
                 bucket = %bucket,
                 prefix = %prefix,
-                objects = result.len(),
+                objects = matched.len(),
                 pages = pages,
                 "Listed"
             );
         }
-        Ok(result)
+        Ok(matched)
     }
 
-    /// Downloads an object using a provided client - use this when making multiple downloads
-    /// to avoid repeated get_client() overhead and reduce DNS lookups
-    pub async fn download_object_with_client(
-        &self,
-        client: &Client,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Vec<u8>> {
-        debug!(bucket = %bucket, key = %key, "Downloading object");
-
-        let response = client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{e:#}"); // Use alternate format for full error chain
-                let err_debug = format!("{e:?}"); // Debug format for maximum details
-
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 get_object failed"
-                );
-
-                if err_msg.contains("dispatch failure") {
-                    anyhow::anyhow!(
-                        "S3 download failed: {err_msg}. This often indicates expired AWS credentials. \
-                         Try running 'aws sso login' or check your AWS_* environment variables."
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "S3 get_object from bucket '{bucket}' key '{key}' failed: {err_msg}"
-                    )
-                }
-            })?;
-
-        let bytes = response.body.collect().await?.into_bytes().to_vec();
-
-        debug!(
-            bytes = bytes.len(),
-            bucket = %bucket,
-            key = %key,
-            "Downloaded object"
-        );
-
-        Ok(bytes)
-    }
-
-    /// Uploads an object to S3
-    pub async fn upload_object(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
-        let client = self.get_client().await?;
-        self.upload_object_with_client(&client, bucket, key, data)
-            .await
-    }
-
-    /// Uploads an object using a provided client
-    pub async fn upload_object_with_client(
-        &self,
-        client: &Client,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        debug!(bucket = %bucket, key = %key, "Uploading object");
-
-        let body = aws_sdk_s3::primitives::ByteStream::from(data);
-
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body)
-            .content_type("application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{e:#}"); // Use alternate format for full error chain
-                let err_debug = format!("{e:?}"); // Debug format for maximum details
-
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 put_object failed"
-                );
-
-                anyhow::anyhow!(
-                    "S3 put_object to bucket '{bucket}' key '{key}' failed: {err_msg}"
-                )
-            })?;
-
-        info!(bucket = %bucket, key = %key, "Uploaded check result");
-
-        Ok(())
-    }
 }
 
 /// Build TLS context, adding a custom CA cert if `AWS_CA_BUNDLE` is set

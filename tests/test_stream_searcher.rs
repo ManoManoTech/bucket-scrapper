@@ -1,12 +1,12 @@
-use bucket_scrapper::pipeline::{SearchConfig, StreamSearcher};
+use bucket_scrapper::pipeline::{LineMatcher, MatcherConfig};
 
 #[test]
 fn test_regex_matcher_cached() {
-    let config = SearchConfig {
+    let config = MatcherConfig {
         pattern: Some("ERROR".to_string()),
         ignore_case: false,
     };
-    let searcher = StreamSearcher::new(config).unwrap();
+    let searcher = LineMatcher::new(config).unwrap();
 
     assert!(searcher.matches_line(b"ERROR: bad"));
     assert!(!searcher.matches_line(b"Line 1"));
@@ -20,11 +20,11 @@ fn test_regex_matcher_cached() {
 
 #[test]
 fn test_case_insensitive() {
-    let config = SearchConfig {
+    let config = MatcherConfig {
         pattern: Some("test".to_string()),
         ignore_case: true,
     };
-    let searcher = StreamSearcher::new(config).unwrap();
+    let searcher = LineMatcher::new(config).unwrap();
 
     assert!(searcher.matches_line(b"This is a TEST line"));
     assert!(searcher.matches_line(b"Another test here"));
@@ -33,11 +33,11 @@ fn test_case_insensitive() {
 
 #[test]
 fn test_all_lines_mode() {
-    let config = SearchConfig {
+    let config = MatcherConfig {
         pattern: None,
         ignore_case: false,
     };
-    let searcher = StreamSearcher::new(config).unwrap();
+    let searcher = LineMatcher::new(config).unwrap();
 
     assert!(searcher.matches_line(b"Line 1"));
     assert!(searcher.matches_line(b"Line 2"));
@@ -47,11 +47,11 @@ fn test_all_lines_mode() {
 
 #[test]
 fn test_invalid_regex_returns_error() {
-    let config = SearchConfig {
+    let config = MatcherConfig {
         pattern: Some("[invalid".to_string()),
         ignore_case: false,
     };
-    let result = StreamSearcher::new(config);
+    let result = LineMatcher::new(config);
     let err = result.err().expect("should be Err for invalid regex");
     let msg = format!("{err:#}");
     assert!(msg.contains("Invalid regex pattern"), "got: {msg}");
@@ -59,11 +59,11 @@ fn test_invalid_regex_returns_error() {
 
 #[test]
 fn test_empty_pattern_matches_all() {
-    let config = SearchConfig {
+    let config = MatcherConfig {
         pattern: None,
         ignore_case: false,
     };
-    let searcher = StreamSearcher::new(config).unwrap();
+    let searcher = LineMatcher::new(config).unwrap();
     assert!(searcher.matches_line(b"anything"));
     assert!(searcher.matches_line(b""));
     assert!(searcher.matches_line(b"\xff\xfe binary"));
