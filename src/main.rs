@@ -140,8 +140,16 @@ struct Cli {
     memory_limit_gb: u64,
 
     /// Per-batch submission time threshold in seconds for AIMD upload throttle (0 = disabled)
-    #[arg(long, default_value = "2.5")]
+    #[arg(long, default_value = "3.0")]
     max_submission_time: f64,
+
+    /// AIMD multiplicative decrease factor (0.15 = reduce rate by 15% on congestion)
+    #[arg(long, default_value = "0.15")]
+    http_aimd_decrease_factor: f64,
+
+    /// AIMD additive increase in MB/s per healthy batch
+    #[arg(long, default_value = "1.0")]
+    http_aimd_increase: f64,
 
     /// Global upload rate limit in MB/s (0 = unlimited)
     #[arg(long, default_value = "0")]
@@ -333,6 +341,8 @@ async fn main() -> Result<()> {
             upload_tasks = num_upload_tasks,
             upload_channel_size = cli.http_upload_channel_size,
             max_submission_time_s = cli.max_submission_time,
+            aimd_decrease_factor = cli.http_aimd_decrease_factor,
+            aimd_increase_mbps = cli.http_aimd_increase,
             max_upload_rate_mbps = cli.max_upload_rate,
             "HTTP streaming mode enabled"
         );
@@ -350,6 +360,8 @@ async fn main() -> Result<()> {
             compression_level: cli.compression_level,
             max_submission_time,
             max_upload_rate,
+            aimd_decrease_factor: cli.http_aimd_decrease_factor,
+            aimd_increase_bytes: cli.http_aimd_increase * 1_000_000.0,
         };
 
         Some(HttpResultWriter::new(http_config)?)
