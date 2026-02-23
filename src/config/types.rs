@@ -1,4 +1,3 @@
-// src/config/types.rs
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +17,7 @@ pub struct BucketConfig {
     pub path: Vec<PathSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_prefix_patterns: Option<Vec<String>>,
-    #[allow(dead_code)]
+    /// Captures unknown YAML keys for forward-compatibility.
     #[serde(flatten, skip_serializing)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
@@ -76,7 +75,7 @@ pub struct ConfigSchema {
     #[serde(default)]
     pub http_output: Option<HttpOutputConfig>,
 
-    #[allow(dead_code)]
+    /// Captures unknown YAML keys for forward-compatibility.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }

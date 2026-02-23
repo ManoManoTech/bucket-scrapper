@@ -1,4 +1,3 @@
-// src/s3/client.rs
 use crate::config::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use anyhow::{Context, Result};

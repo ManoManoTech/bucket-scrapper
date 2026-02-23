@@ -1,4 +1,3 @@
-// src/utils/proxy.rs
 use tracing::info;
 
 /// Resolve a custom CA bundle path for TLS verification through proxies.

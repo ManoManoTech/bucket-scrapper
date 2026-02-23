@@ -1,4 +1,3 @@
-// src/s3/dns_cache.rs
 //! DNS caching layer to reduce load on CoreDNS when running many concurrent processes.
 //!
 //! Uses hickory-resolver with moka cache for application-level DNS caching.

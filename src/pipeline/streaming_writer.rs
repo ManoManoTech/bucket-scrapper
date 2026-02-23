@@ -1,4 +1,3 @@
-// src/search/streaming_writer.rs
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::{self, File};

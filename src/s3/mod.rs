@@ -1,4 +1,3 @@
-// src/s3/mod.rs
 pub mod client;
 pub mod dns_cache;
 pub mod streaming_downloader;

@@ -1,4 +1,3 @@
-// src/progress.rs
 //! Cross-cutting progress tracking for the download → search → export pipeline.
 
 use crate::pipeline::PipelineObserver;
@@ -77,10 +76,11 @@ impl ChannelObserver {
 }
 
 fn rss_mb() -> usize {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
-        .map(|pages| pages * 4096 / 1_000_000)
+        .map(|pages| pages * page_size / 1_000_000)
         .unwrap_or(0)
 }
 

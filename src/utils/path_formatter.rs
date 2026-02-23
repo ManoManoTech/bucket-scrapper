@@ -1,4 +1,3 @@
-// src/utils/path_formatter.rs
 use crate::config::types::{BucketConfig, PathSchema};
 use crate::utils::date::{common_date_format, empty_date_format, raw_logs_date_format};
 use anyhow::Result;
@@ -27,6 +26,7 @@ fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
             }
         })
     } else if prefix.contains("2006/01/02/15") {
+        // Go reference time: Mon Jan 2 15:04:05 MST 2006 (YYYY/MM/DD/HH)
         let regex = Regex::new(r"2006\/01\/02\/15").unwrap();
         let key_prefix = regex.replace_all(&prefix, "").to_string();
 
