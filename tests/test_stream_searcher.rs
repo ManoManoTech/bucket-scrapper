@@ -44,3 +44,27 @@ fn test_all_lines_mode() {
     assert!(searcher.matches_line(b"Line 3"));
     assert!(searcher.matches_line(b""));
 }
+
+#[test]
+fn test_invalid_regex_returns_error() {
+    let config = SearchConfig {
+        pattern: Some("[invalid".to_string()),
+        ignore_case: false,
+    };
+    let result = StreamSearcher::new(config);
+    let err = result.err().expect("should be Err for invalid regex");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("Invalid regex pattern"), "got: {msg}");
+}
+
+#[test]
+fn test_empty_pattern_matches_all() {
+    let config = SearchConfig {
+        pattern: None,
+        ignore_case: false,
+    };
+    let searcher = StreamSearcher::new(config).unwrap();
+    assert!(searcher.matches_line(b"anything"));
+    assert!(searcher.matches_line(b""));
+    assert!(searcher.matches_line(b"\xff\xfe binary"));
+}

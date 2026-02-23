@@ -150,3 +150,75 @@ pub struct FileWriterStats {
     pub compressed_bytes: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn write_and_finish_single_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SharedFileWriter::new(dir.path().to_str().unwrap().to_string(), 1).unwrap();
+
+        let line = "{\"msg\":\"hello\"}\n";
+        for _ in 0..10 {
+            writer.write_match("2025-02-23/14", line).unwrap();
+        }
+
+        let stats = writer.finish().unwrap();
+        assert_eq!(stats.files_written, 1);
+        assert_eq!(stats.lines_written, 10);
+        assert_eq!(stats.plaintext_bytes, (line.len() * 10) as u64);
+
+        // Verify the file is valid zstd and contains expected content
+        let path = dir.path().join("2025-02-23/14.zst");
+        assert!(path.exists(), "output file should exist");
+
+        let file = File::open(&path).unwrap();
+        let mut decoder = zstd::Decoder::new(file).unwrap();
+        let mut content = String::new();
+        decoder.read_to_string(&mut content).unwrap();
+        assert_eq!(content, line.repeat(10));
+    }
+
+    #[test]
+    fn write_multiple_prefixes_creates_separate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SharedFileWriter::new(dir.path().to_str().unwrap().to_string(), 1).unwrap();
+
+        let prefixes = ["2025-02-23/10", "2025-02-23/11", "2025-02-23/12"];
+        for prefix in &prefixes {
+            writer.write_match(prefix, "line\n").unwrap();
+        }
+
+        let stats = writer.finish().unwrap();
+        assert_eq!(stats.files_written, 3);
+
+        for prefix in &prefixes {
+            let path = dir.path().join(format!("{prefix}.zst"));
+            assert!(path.exists(), "file for prefix '{prefix}' should exist");
+        }
+    }
+
+    #[test]
+    fn finish_reports_compressed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SharedFileWriter::new(dir.path().to_str().unwrap().to_string(), 1).unwrap();
+
+        // Write enough repeated data that zstd compresses well
+        let line = "{\"timestamp\":\"2025-02-23T14:00:00Z\",\"level\":\"INFO\",\"msg\":\"test\"}\n";
+        for _ in 0..100 {
+            writer.write_match("2025-02-23/14", line).unwrap();
+        }
+
+        let stats = writer.finish().unwrap();
+        assert!(stats.compressed_bytes > 0, "should have compressed bytes");
+        assert!(
+            stats.compressed_bytes < stats.plaintext_bytes,
+            "compressed ({}) should be smaller than plaintext ({})",
+            stats.compressed_bytes,
+            stats.plaintext_bytes
+        );
+    }
+}
+

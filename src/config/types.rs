@@ -94,6 +94,48 @@ pub struct S3ObjectInfo {
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket_config(path: Vec<PathSchema>) -> BucketConfig {
+        BucketConfig {
+            bucket: "test-bucket".to_string(),
+            path,
+            only_prefix_patterns: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_path_without_datefmt() {
+        let cfg = bucket_config(vec![PathSchema::Static {
+            static_path: "logs/".to_string(),
+        }]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("test-bucket"), "error should name the bucket: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_path_with_datefmt() {
+        let cfg = bucket_config(vec![
+            PathSchema::Static {
+                static_path: "logs/".to_string(),
+            },
+            PathSchema::DateFormat {
+                datefmt: "dt=%Y%m%d".to_string(),
+            },
+        ]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_empty_path() {
+        let cfg = bucket_config(vec![]);
+        assert!(cfg.validate().is_err());
+    }
+}
+
 // Type aliases for date/hour strings
 pub type DateString = String; // YYYYMMDD format
 pub type HourString = String; // HH format 00-23

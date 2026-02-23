@@ -24,3 +24,64 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
 pub fn get_buckets(config: &ConfigSchema) -> Vec<&BucketConfig> {
     config.buckets.iter().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn load_config_missing_file() {
+        let err = load_config("/nonexistent/path.yaml").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Failed to read config file"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_config_invalid_yaml() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b":::bad").unwrap();
+        let err = load_config(f.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Failed to parse YAML"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_config_valid_yaml() {
+        let yaml = r#"
+buckets:
+  - bucket: my-bucket
+    path:
+      - static_path: "logs/"
+      - datefmt: "dt=%Y%m%d"
+"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        let config = load_config(f.path()).unwrap();
+        assert_eq!(config.buckets.len(), 1);
+        assert_eq!(config.buckets[0].bucket, "my-bucket");
+    }
+
+    #[test]
+    fn get_buckets_returns_all() {
+        let config = ConfigSchema {
+            buckets: vec![
+                BucketConfig {
+                    bucket: "a".into(),
+                    path: vec![],
+                    only_prefix_patterns: None,
+                    extra: Default::default(),
+                },
+                BucketConfig {
+                    bucket: "b".into(),
+                    path: vec![],
+                    only_prefix_patterns: None,
+                    extra: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let buckets = get_buckets(&config);
+        assert_eq!(buckets.len(), 2);
+    }
+}

@@ -387,3 +387,63 @@ pub fn is_recoverable_s3_error(error_msg: &str) -> bool {
     // All other errors are considered recoverable (transient)
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fatal_s3_errors_are_not_recoverable() {
+        let fatal = [
+            "AccessDenied",
+            "Access Denied",
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "NoSuchBucket",
+            "InvalidBucketName",
+            "AccountProblem",
+            "InvalidSecurity",
+            "NotSignedUp",
+            "InvalidIdentityToken",
+            "MalformedPolicy",
+            "InvalidClientTokenId",
+        ];
+        for pattern in &fatal {
+            assert!(
+                !is_recoverable_s3_error(pattern),
+                "'{pattern}' should be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_s3_errors_are_recoverable() {
+        let transient = [
+            "Throttling",
+            "SlowDown",
+            "ServiceUnavailable",
+            "InternalError",
+            "connection reset",
+            "timeout",
+        ];
+        for pattern in &transient {
+            assert!(
+                is_recoverable_s3_error(pattern),
+                "'{pattern}' should be recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_error_is_recoverable() {
+        assert!(is_recoverable_s3_error(""));
+    }
+
+    #[test]
+    fn fatal_pattern_as_substring() {
+        assert!(!is_recoverable_s3_error("Something AccessDenied happened"));
+        assert!(!is_recoverable_s3_error("Error: NoSuchBucket for arn:..."));
+    }
+}
