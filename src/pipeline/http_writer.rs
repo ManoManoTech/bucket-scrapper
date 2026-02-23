@@ -84,6 +84,10 @@ enum SendResult {
     Retryable(anyhow::Error),
     /// Fatal failure (4xx client error) — stop the entire pipeline.
     Fatal(anyhow::Error),
+    /// Server asked us to slow down (HTTP 429). Trigger AIMD decrease and retry.
+    Throttled {
+        retry_after: Option<Duration>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +109,10 @@ pub struct UploadThrottle {
     max_submission_time: Option<Duration>,
     /// Observable rate for progress reporting — stores f64 bits as u64.
     current_rate_bits: Arc<AtomicU64>,
+    /// AIMD multiplicative decrease factor (e.g. 0.15 → multiply rate by 0.85).
+    decrease_factor: f64,
+    /// AIMD additive increase in bytes/sec per healthy batch.
+    increase_bytes: f64,
 }
 
 struct ThrottleState {
@@ -133,10 +141,14 @@ impl UploadThrottle {
     ///
     /// - `max_submission_time`: AIMD congestion threshold. `None` = no AIMD.
     /// - `static_rate_limit`: hard ceiling in bytes/sec. `None` = unlimited.
+    /// - `decrease_factor`: fraction to reduce rate by on congestion (e.g. 0.15 → rate × 0.85).
+    /// - `increase_bytes`: additive increase in bytes/sec per healthy batch.
     fn new(
         max_submission_time: Option<Duration>,
         batch_max_bytes: usize,
         static_rate_limit: Option<f64>,
+        decrease_factor: f64,
+        increase_bytes: f64,
     ) -> Self {
         let max_tokens = 2.0 * batch_max_bytes as f64;
         let now = Instant::now();
@@ -158,6 +170,8 @@ impl UploadThrottle {
             }),
             max_submission_time,
             current_rate_bits: Arc::new(AtomicU64::new(initial_rate.to_bits())),
+            decrease_factor,
+            increase_bytes,
         }
     }
 
@@ -199,6 +213,8 @@ impl UploadThrottle {
         duration: Duration,
         max_submission_time: Option<Duration>,
         current_rate_bits: &AtomicU64,
+        decrease_factor: f64,
+        increase_bytes: f64,
     ) {
         st.total_bytes += bytes as u64;
 
@@ -237,10 +253,11 @@ impl UploadThrottle {
                 }
             }
 
+            let keep = 1.0 - decrease_factor;
             let new_rate = if st.rate.is_infinite() {
-                st.ceiling * 0.5
+                st.ceiling * keep
             } else {
-                (st.rate * 0.5).max(MIN_RATE_BYTES_PER_SEC)
+                (st.rate * keep).max(MIN_RATE_BYTES_PER_SEC)
             };
 
             info!(
@@ -259,8 +276,7 @@ impl UploadThrottle {
             st.last_refill = Instant::now();
         } else if st.ceiling > 0.0 && !st.rate.is_infinite() {
             // --- Additive Increase ---
-            let increment = st.ceiling * 0.05;
-            let new_rate = (st.rate + increment).min(st.ceiling);
+            let new_rate = (st.rate + increase_bytes).min(st.ceiling);
             if new_rate > st.rate {
                 debug!(
                     old_rate_mbps = format_args!("{:.2}", st.rate / 1_000_000.0),
@@ -284,7 +300,54 @@ impl UploadThrottle {
             duration,
             self.max_submission_time,
             &self.current_rate_bits,
+            self.decrease_factor,
+            self.increase_bytes,
         );
+    }
+
+    /// Force a multiplicative decrease (e.g. on HTTP 429).
+    ///
+    /// Respects the same cooldown as timing-based decreases.
+    async fn force_decrease(&self) {
+        let mut st = self.state.lock().await;
+
+        let mst = self.max_submission_time.unwrap_or(Duration::from_secs(3));
+        let cooldown = Duration::from_secs_f64((mst.as_secs_f64() / 2.0).max(1.0));
+        if st.last_decrease.elapsed() < cooldown {
+            return;
+        }
+        st.congestion_count += 1;
+
+        if st.ceiling == 0.0 {
+            let elapsed = st.start_time.elapsed().as_secs_f64();
+            if elapsed > 0.0 && st.total_bytes > 0 {
+                st.ceiling = st.total_bytes as f64 / elapsed;
+            } else {
+                // No data yet — use a conservative starting point
+                st.ceiling = MIN_RATE_BYTES_PER_SEC * 10.0;
+            }
+        }
+
+        let keep = 1.0 - self.decrease_factor;
+        let new_rate = if st.rate.is_infinite() {
+            st.ceiling * keep
+        } else {
+            (st.rate * keep).max(MIN_RATE_BYTES_PER_SEC)
+        };
+
+        info!(
+            old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
+            new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
+            ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
+            congestion_count = st.congestion_count,
+            "Upload throttle: 429 forced decrease"
+        );
+
+        st.rate = new_rate;
+        st.tokens = 0.0;
+        st.last_decrease = Instant::now();
+        st.last_refill = Instant::now();
+        self.current_rate_bits.store(st.rate.to_bits(), Ordering::Relaxed);
     }
 
     /// Get current rate in MB/s for progress reporting.
@@ -335,6 +398,11 @@ pub struct HttpWriterConfig {
     /// `None` = unlimited.  When set, the token bucket starts at this rate
     /// instead of `INFINITY`.  AIMD can decrease below it, then recover back.
     pub max_upload_rate: Option<f64>,
+    /// AIMD multiplicative decrease factor (0.15 = reduce rate by 15%).
+    /// Applied as `rate * (1.0 - factor)`.
+    pub aimd_decrease_factor: f64,
+    /// AIMD additive increase in bytes/sec per healthy batch.
+    pub aimd_increase_bytes: f64,
 }
 
 impl Default for HttpWriterConfig {
@@ -354,8 +422,10 @@ impl Default for HttpWriterConfig {
             num_upload_tasks: 4 * num_compressor_tasks,
             upload_channel_size: 4,
             compression_level: 3,
-            max_submission_time: Some(Duration::from_secs_f64(2.5)),
+            max_submission_time: Some(Duration::from_secs(3)),
             max_upload_rate: None,
+            aimd_decrease_factor: 0.15,
+            aimd_increase_bytes: 1_000_000.0,
         }
     }
 }
@@ -434,6 +504,8 @@ impl HttpResultWriter {
                 config.max_submission_time,
                 config.batch_max_bytes,
                 config.max_upload_rate,
+                config.aimd_decrease_factor,
+                config.aimd_increase_bytes,
             )))
         } else {
             None
@@ -658,55 +730,105 @@ impl HttpResultWriter {
                 th.acquire(batch_compressed_bytes).await;
             }
 
-            let send_start = Instant::now();
-            match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
-                SendResult::Ok => {
-                    let send_elapsed = send_start.elapsed();
-                    let elapsed_us = send_elapsed.as_micros() as usize;
-                    total_sent += batch.lines;
-                    batches_sent += 1;
-                    lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
-                    compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
-                    plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
-                    batches_uploaded.fetch_add(1, Ordering::Relaxed);
-                    upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+            // Try sending with 429-aware retry loop
+            let mut throttle_retries = 0u32;
+            let result = loop {
+                let send_start = Instant::now();
+                match Self::send_batch(&client, &config, &batch.body, batch.lines).await {
+                    SendResult::Ok => {
+                        let send_elapsed = send_start.elapsed();
+                        let elapsed_us = send_elapsed.as_micros() as usize;
+                        total_sent += batch.lines;
+                        batches_sent += 1;
+                        lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
+                        compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
+                        plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
+                        batches_uploaded.fetch_add(1, Ordering::Relaxed);
+                        upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
 
-                    // Feed AIMD throttle with timing data
-                    if let Some(ref th) = throttle {
-                        th.record_upload(batch_compressed_bytes, send_elapsed).await;
+                        // Feed AIMD throttle with timing data
+                        if let Some(ref th) = throttle {
+                            th.record_upload(batch_compressed_bytes, send_elapsed).await;
+                        }
+
+                        debug!(
+                            task = task_id,
+                            lines = batch.lines,
+                            compressed_bytes = batch_compressed_bytes,
+                            plaintext_bytes = batch.plaintext_bytes,
+                            upload_ms = send_elapsed.as_millis() as u64,
+                            url = %config.url,
+                            "Sent batch"
+                        );
+                        break None; // success
                     }
+                    SendResult::Throttled { retry_after } => {
+                        // Trigger AIMD decrease
+                        if let Some(ref th) = throttle {
+                            th.force_decrease().await;
+                        }
 
-                    debug!(
-                        task = task_id,
-                        lines = batch.lines,
-                        compressed_bytes = batch_compressed_bytes,
-                        plaintext_bytes = batch.plaintext_bytes,
-                        upload_ms = send_elapsed.as_millis() as u64,
-                        url = %config.url,
-                        "Sent batch"
-                    );
+                        throttle_retries += 1;
+                        if throttle_retries > config.max_retries {
+                            warn!(
+                                task = task_id,
+                                retries = throttle_retries,
+                                "429 retries exhausted, dropping batch"
+                            );
+                            break Some(SendResult::Retryable(anyhow::anyhow!(
+                                "HTTP 429 retries exhausted after {} attempts",
+                                throttle_retries
+                            )));
+                        }
+
+                        let delay = retry_after.unwrap_or_else(|| {
+                            Duration::from_millis(100 * 2u64.pow(throttle_retries - 1))
+                        });
+                        warn!(
+                            task = task_id,
+                            retry = throttle_retries,
+                            delay_ms = delay.as_millis() as u64,
+                            retry_after_header = retry_after.is_some(),
+                            "HTTP 429, backing off"
+                        );
+                        tokio::time::sleep(delay).await;
+
+                        // Re-acquire throttle tokens before retry
+                        if let Some(ref th) = throttle {
+                            th.acquire(batch_compressed_bytes).await;
+                        }
+                        continue; // retry the same batch
+                    }
+                    other => break Some(other),
                 }
-                SendResult::Retryable(e) => {
-                    lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
-                    error!(
-                        task = task_id,
-                        lines = batch.lines,
-                        compressed_bytes = batch_compressed_bytes,
-                        error = %e,
-                        "Failed to send batch"
-                    );
-                }
-                SendResult::Fatal(e) => {
-                    lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
-                    error!(
-                        task = task_id,
-                        lines = batch.lines,
-                        compressed_bytes = batch_compressed_bytes,
-                        error = %e,
-                        "Fatal error, stopping pipeline"
-                    );
-                    fatal_error.store(true, Ordering::Relaxed);
-                    break;
+            };
+
+            // Handle non-429 results
+            if let Some(result) = result {
+                match result {
+                    SendResult::Retryable(e) => {
+                        lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                        error!(
+                            task = task_id,
+                            lines = batch.lines,
+                            compressed_bytes = batch_compressed_bytes,
+                            error = %e,
+                            "Failed to send batch"
+                        );
+                    }
+                    SendResult::Fatal(e) => {
+                        lines_dropped.fetch_add(batch.lines, Ordering::Relaxed);
+                        error!(
+                            task = task_id,
+                            lines = batch.lines,
+                            compressed_bytes = batch_compressed_bytes,
+                            error = %e,
+                            "Fatal error, stopping pipeline"
+                        );
+                        fatal_error.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    SendResult::Ok | SendResult::Throttled { .. } => unreachable!(),
                 }
             }
 
@@ -760,6 +882,15 @@ impl HttpResultWriter {
             match result {
                 Ok(response) => {
                     let status = response.status();
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .map(Duration::from_secs_f64);
+                        return SendResult::Throttled { retry_after };
+                    }
                     let response_body = response.text().await.unwrap_or_default();
 
                     if status.is_success() {
@@ -865,13 +996,13 @@ mod tests {
 
     #[tokio::test]
     async fn throttle_starts_unlimited() {
-        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None);
+        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None, 0.15, 1_000_000.0);
         assert!(th.current_rate_mbps().is_none(), "should be unlimited initially");
     }
 
     #[tokio::test]
     async fn throttle_acquire_instant_when_unlimited() {
-        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None);
+        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None, 0.15, 1_000_000.0);
         let start = Instant::now();
         th.acquire(1_000_000).await;
         // Unlimited — should return near-instantly
@@ -881,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn throttle_decreases_on_slow_upload() {
         let mst = Duration::from_secs_f64(1.0);
-        let th = UploadThrottle::new(Some(mst), 1024, None);
+        let th = UploadThrottle::new(Some(mst), 1024, None, 0.15, 1_000_000.0);
 
         // Simulate a few healthy uploads to build total_bytes
         for _ in 0..5 {
@@ -899,7 +1030,7 @@ mod tests {
     #[tokio::test]
     async fn throttle_additive_increase_after_decrease() {
         let mst = Duration::from_secs_f64(1.0);
-        let th = UploadThrottle::new(Some(mst), 1024, None);
+        let th = UploadThrottle::new(Some(mst), 1024, None, 0.15, 1_000_000.0);
 
         // Build up bytes
         for _ in 0..5 {
@@ -921,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn throttle_respects_cooldown() {
         let mst = Duration::from_secs_f64(1.0);
-        let th = UploadThrottle::new(Some(mst), 1024, None);
+        let th = UploadThrottle::new(Some(mst), 1024, None, 0.15, 1_000_000.0);
 
         // Build up bytes
         for _ in 0..5 {
@@ -946,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn throttle_rate_never_below_floor() {
         let mst = Duration::from_secs_f64(0.01); // very low threshold
-        let th = UploadThrottle::new(Some(mst), 1024, None);
+        let th = UploadThrottle::new(Some(mst), 1024, None, 0.15, 1_000_000.0);
 
         // Build up some bytes
         th.record_upload(1000, Duration::from_millis(5)).await;
@@ -970,7 +1101,7 @@ mod tests {
     async fn throttle_static_limit_enforced_from_start() {
         // 10 MB/s static limit, no AIMD
         let limit = 10.0 * 1_000_000.0;
-        let th = UploadThrottle::new(None, 2 * 1024 * 1024, Some(limit));
+        let th = UploadThrottle::new(None, 2 * 1024 * 1024, Some(limit), 0.15, 1_000_000.0);
 
         // Rate should be visible immediately (not None/infinite)
         let rate = th.current_rate_mbps();
@@ -997,11 +1128,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_decrease_reduces_rate() {
+        let mst = Duration::from_secs_f64(1.0);
+        let decrease_factor = 0.15;
+        let th = UploadThrottle::new(Some(mst), 1024, None, decrease_factor, 1_000_000.0);
+
+        // Build up total_bytes with healthy uploads
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+        // Trigger first congestion to establish ceiling and finite rate
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate_after_congestion = th.current_rate_mbps().unwrap();
+
+        // Wait out cooldown (min 1s) before force_decrease can fire
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        th.force_decrease().await;
+        let rate_after_force = th.current_rate_mbps().unwrap();
+
+        let expected = rate_after_congestion * (1.0 - decrease_factor);
+        let floor_mbps = MIN_RATE_BYTES_PER_SEC / 1_000_000.0;
+        let expected = expected.max(floor_mbps);
+        assert!(
+            (rate_after_force - expected).abs() < 0.01,
+            "force_decrease should reduce rate by {decrease_factor}: \
+             expected ~{expected:.4}, got {rate_after_force:.4}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_factors_produce_expected_values() {
+        let mst = Duration::from_secs_f64(1.0);
+        let decrease_factor = 0.30;
+        let increase_bytes = 2_000_000.0;
+        let th = UploadThrottle::new(Some(mst), 1024, None, decrease_factor, increase_bytes);
+
+        // Build up total_bytes with healthy uploads
+        for _ in 0..5 {
+            th.record_upload(100_000, Duration::from_millis(200)).await;
+        }
+
+        // Trigger congestion — ceiling is estimated from throughput, rate = ceiling * 0.70
+        th.record_upload(100_000, Duration::from_secs(2)).await;
+        let rate_after_decrease = th.current_rate_mbps().unwrap();
+
+        // Read ceiling from the rate: rate = ceiling * (1 - 0.30) = ceiling * 0.70
+        let implied_ceiling_mbps = rate_after_decrease / (1.0 - decrease_factor);
+        // Verify the rate is consistent with a 0.30 decrease from ceiling
+        assert!(
+            (rate_after_decrease - implied_ceiling_mbps * 0.70).abs() < 0.01,
+            "rate should be ceiling * 0.70, got {rate_after_decrease:.4}"
+        );
+
+        // Healthy upload → additive increase of exactly 2 MB/s
+        th.record_upload(100_000, Duration::from_millis(200)).await;
+        let rate_after_increase = th.current_rate_mbps().unwrap();
+        let increase_mbps = increase_bytes / 1_000_000.0;
+        let expected = (rate_after_decrease + increase_mbps).min(implied_ceiling_mbps);
+        assert!(
+            (rate_after_increase - expected).abs() < 0.01,
+            "additive increase should add {increase_mbps} MB/s (capped at ceiling): \
+             expected ~{expected:.4}, got {rate_after_increase:.4}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_handles_429_and_recovers() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // First 3 requests → 429 with Retry-After header
+        Mock::given(method("POST"))
+            .and(path("/api/v1/logs"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0.05"),
+            )
+            .up_to_n_times(3)
+            .with_priority(1) // Higher priority, consumed first
+            .mount(&mock_server)
+            .await;
+
+        // Subsequent requests → 200
+        Mock::given(method("POST"))
+            .and(path("/api/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2) // Lower priority, used after 429s exhausted
+            .mount(&mock_server)
+            .await;
+
+        let config = HttpWriterConfig {
+            url: format!("{}/api/v1/logs", mock_server.uri()),
+            api_key: "test-key".to_string(),
+            batch_max_bytes: 4 * 1024, // 4KB — small batches flush quickly
+            timeout_secs: 5,
+            max_retries: 5,
+            channel_buffer_size: 10,
+            num_compressor_tasks: 1,
+            num_upload_tasks: 1,
+            upload_channel_size: 4,
+            compression_level: 1,
+            // Enable AIMD so force_decrease fires on 429
+            max_submission_time: Some(Duration::from_secs(3)),
+            max_upload_rate: None,
+            aimd_decrease_factor: 0.15,
+            aimd_increase_bytes: 1_000_000.0,
+        };
+
+        let writer = HttpResultWriter::new(config).expect("writer creation should succeed");
+        let sender = writer.get_sender();
+
+        // Send 50 lines
+        let num_lines = 50;
+        for i in 0..num_lines {
+            sender
+                .send_async(format!("{{\"msg\": \"test line {i}\"}}\n"))
+                .await
+                .expect("send should succeed");
+        }
+        drop(sender);
+
+        let stats = writer.finish().await.expect("finish should succeed");
+
+        assert_eq!(
+            stats.lines_sent, num_lines,
+            "all lines should be delivered: sent={}, expected={}",
+            stats.lines_sent, num_lines
+        );
+        assert_eq!(
+            stats.lines_dropped, 0,
+            "no lines should be dropped: dropped={}",
+            stats.lines_dropped
+        );
+
+        // Verify the mock server received more requests than it would have without 429s
+        // (the 3 rejected + at least 1 successful = at least 4 requests)
+        let received = mock_server.received_requests().await.unwrap();
+        assert!(
+            received.len() > 3,
+            "mock server should have received retried requests: got {} requests",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
     async fn throttle_static_limit_with_aimd() {
         // 10 MB/s static limit + AIMD with 1s threshold
         let limit = 10.0 * 1_000_000.0;
         let mst = Duration::from_secs_f64(1.0);
-        let th = UploadThrottle::new(Some(mst), 1024, Some(limit));
+        let th = UploadThrottle::new(Some(mst), 1024, Some(limit), 0.15, 1_000_000.0);
 
         // Starts at static limit
         assert!(
