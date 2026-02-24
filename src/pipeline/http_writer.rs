@@ -322,6 +322,12 @@ pub struct HttpWriterConfig {
     pub aimd_decrease_factor: f64,
     /// AIMD additive increase in bytes/sec per healthy batch.
     pub aimd_increase_bytes: f64,
+    /// Hostname to include in log entries (defaults to machine hostname)
+    pub hostname: String,
+    /// Service name to include in log entries
+    pub service: String,
+    /// Team name for HTTP context (for associating logs with a team)
+    pub team: Option<String>,
 }
 
 impl Default for HttpWriterConfig {
@@ -345,6 +351,11 @@ impl Default for HttpWriterConfig {
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
             aimd_increase_bytes: 1_000_000.0,
+            hostname: gethostname::gethostname()
+                .to_string_lossy()
+                .to_string(),
+            service: "bucket-scrapper".to_string(),
+            team: None,
         }
     }
 }
@@ -396,6 +407,10 @@ pub struct HttpResultWriter {
     throttle: Option<Arc<UploadThrottle>>,
     /// URL for display purposes
     url: String,
+    /// HTTP metadata fields
+    hostname: String,
+    service: String,
+    team: Option<String>,
 }
 
 impl HttpResultWriter {
@@ -482,6 +497,9 @@ impl HttpResultWriter {
             fatal_error,
             throttle,
             url,
+            hostname: config.hostname,
+            service: config.service,
+            team: config.team,
         })
     }
 
@@ -898,6 +916,21 @@ impl HttpResultWriter {
     /// Get the configured URL
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Get the hostname for HTTP API metadata
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Get the service for HTTP API metadata
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Get the team for HTTP API metadata
+    pub fn team(&self) -> Option<&str> {
+        self.team.as_deref()
     }
 }
 

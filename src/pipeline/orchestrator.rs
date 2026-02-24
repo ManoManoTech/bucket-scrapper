@@ -28,7 +28,12 @@ struct DecompressedLine {
 
 /// Where filter workers send their matches.
 enum FilterOutput {
-    Http(flume::Sender<String>),
+    Http {
+        sender: flume::Sender<String>,
+        hostname: String,
+        service: String,
+        team: Option<String>,
+    },
     File(SharedFileWriter),
 }
 
@@ -95,10 +100,18 @@ impl StreamingDownloader {
         objects: &[S3ObjectInfo],
         searcher: Arc<LineMatcher>,
         http_sender: flume::Sender<String>,
+        hostname: String,
+        service: String,
+        team: Option<String>,
         observer: PipelineObserver,
         fatal_error: Arc<AtomicBool>,
     ) -> Result<(usize, usize)> {
-        let output = FilterOutput::Http(http_sender);
+        let output = FilterOutput::Http {
+            sender: http_sender,
+            hostname,
+            service,
+            team,
+        };
         self.search_objects(objects, searcher, Some(observer), output, Some(fatal_error))
             .await
     }
@@ -595,9 +608,21 @@ impl StreamingDownloader {
 
                 if searcher.matches_line(line.text.as_bytes()) {
                     match output.as_ref() {
-                        FilterOutput::Http(sender) => {
+                        FilterOutput::Http { sender, hostname, service, team } => {
+                            // Format as NDJSON: {"message": "...", "hostname": "...", "service": "...", "context": {"team": "..."}}
+                            let escaped_message = line.text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+                            let escaped_hostname = hostname.replace('\\', "\\\\").replace('"', "\\\"");
+                            let escaped_service = service.replace('\\', "\\\\").replace('"', "\\\"");
+                            let json_line = if let Some(t) = team {
+                                let escaped_team = t.replace('\\', "\\\\").replace('"', "\\\"");
+                                format!("{{\"message\":\"{}\",\"hostname\":\"{}\",\"service\":\"{}\",\"context\":{{\"team\":\"{}\"}}}}\n",
+                                    escaped_message, escaped_hostname, escaped_service, escaped_team)
+                            } else {
+                                format!("{{\"message\":\"{}\",\"hostname\":\"{}\",\"service\":\"{}\"}}\n",
+                                    escaped_message, escaped_hostname, escaped_service)
+                            };
                             sender
-                                .send(line.text)
+                                .send(json_line)
                                 .map_err(|_| anyhow::anyhow!("HTTP consumer gone, channel closed"))?;
                         }
                         FilterOutput::File(writer) => {
