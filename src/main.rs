@@ -149,18 +149,6 @@ struct Cli {
     /// Global upload rate limit in MB/s (0 = unlimited)
     #[arg(long, default_value = "0")]
     max_upload_rate: f64,
-
-    /// Hostname to include in log entries (defaults to machine hostname)
-    #[arg(long, env = "HTTP_HOSTNAME")]
-    http_hostname: Option<String>,
-
-    /// Service name to include in log entries
-    #[arg(long, env = "HTTP_SERVICE", default_value = "bucket-scrapper")]
-    http_service: String,
-
-    /// Team name for HTTP context (for associating logs with a team)
-    #[arg(long, env = "HTTP_TEAM")]
-    http_team: Option<String>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -353,12 +341,6 @@ async fn main() -> Result<()> {
             "HTTP streaming mode enabled"
         );
 
-        let hostname = cli.http_hostname.unwrap_or_else(|| {
-            gethostname::gethostname()
-                .to_string_lossy()
-                .to_string()
-        });
-
         let http_config = HttpWriterConfig {
             url: api_url,
             api_key,
@@ -374,9 +356,6 @@ async fn main() -> Result<()> {
             max_upload_rate,
             aimd_decrease_factor: cli.http_aimd_decrease_factor,
             aimd_increase_bytes: cli.http_aimd_increase * 1_000_000.0,
-            hostname,
-            service: cli.http_service.clone(),
-            team: cli.http_team.clone(),
         };
 
         Some(HttpResultWriter::new(http_config)?)
@@ -488,13 +467,10 @@ async fn main() -> Result<()> {
 
         if let Some(http_writer) = http_streaming {
             let http_sender = http_writer.get_sender();
-            let hostname = http_writer.hostname().to_string();
-            let service = http_writer.service().to_string();
-            let team = http_writer.team().map(|s| s.to_string());
             let observer = http_writer.observer();
             let fatal_error = http_writer.fatal_error_flag();
             let (files_searched, matched_lines) = downloader
-                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, hostname, service, team, observer, fatal_error)
+                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, observer, fatal_error)
                 .await?;
 
             let api_url = http_writer.url().to_string();
