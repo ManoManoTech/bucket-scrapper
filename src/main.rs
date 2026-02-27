@@ -97,9 +97,9 @@ struct Cli {
     #[arg(long, env = "HTTP_URL")]
     http_url: Option<String>,
 
-    /// API key for HTTP authentication (can also use HTTP_BEARER_AUTH env var)
+    /// Bearer token for HTTP authentication (can also use HTTP_BEARER_AUTH env var)
     #[arg(long, env = "HTTP_BEARER_AUTH")]
-    http_api_key: Option<String>,
+    http_bearer_auth: Option<String>,
 
     /// Maximum batch size in MB for HTTP requests.
     #[arg(long, default_value = "2")]
@@ -296,11 +296,8 @@ async fn main() -> Result<()> {
                 "HTTP output enabled but no URL specified. Use --http-url or set HTTP_URL env var"
             ))?;
 
-        let api_key = cli.http_api_key.clone()
-            .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().and_then(|h| h.api_key.clone())))
-            .ok_or_else(|| anyhow::anyhow!(
-                "HTTP output enabled but no API key specified. Use --http-api-key or set HTTP_BEARER_AUTH env var"
-            ))?;
+        let bearer_token = cli.http_bearer_auth.clone()
+            .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().and_then(|h| h.bearer_auth.clone())));
 
         let timeout_secs = config.as_ref()
             .and_then(|c| c.http_output.as_ref().map(|h| h.timeout_secs))
@@ -343,7 +340,7 @@ async fn main() -> Result<()> {
 
         let http_config = HttpWriterConfig {
             url: api_url,
-            api_key,
+            bearer_token,
             batch_max_bytes,
             timeout_secs,
             max_retries: cli.max_retries.min(10),

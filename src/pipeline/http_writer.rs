@@ -292,8 +292,8 @@ impl UploadThrottle {
 pub struct HttpWriterConfig {
     /// The URL to send logs to (e.g., https://intake.handy-mango.http.com/api/v1/logs)
     pub url: String,
-    /// API key for authentication
-    pub api_key: String,
+    /// Optional bearer token for Authorization header
+    pub bearer_token: Option<String>,
     /// Maximum batch size in compressed bytes. Default limit is 30MB.
     pub batch_max_bytes: usize,
     /// Timeout for HTTP requests in seconds
@@ -332,7 +332,7 @@ impl Default for HttpWriterConfig {
             .max(1);
         Self {
             url: String::new(),
-            api_key: String::new(),
+            bearer_token: None,
             batch_max_bytes: 2 * 1024 * 1024, // 2MB default
             timeout_secs: 30,
             max_retries: 3,
@@ -781,11 +781,14 @@ impl HttpResultWriter {
                 tokio::time::sleep(delay).await;
             }
 
-            let result = client
+            let mut request = client
                 .post(&config.url)
                 .header("Content-Type", "application/x-ndjson")
-                .header("Content-Encoding", "zstd")
-                .header("Authorization", format!("Bearer {}", config.api_key))
+                .header("Content-Encoding", "zstd");
+            if let Some(token) = &config.bearer_token {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+            let result = request
                 .body(body.clone()) // O(1) Arc bump
                 .send()
                 .await;
@@ -1133,7 +1136,7 @@ mod tests {
 
         let config = HttpWriterConfig {
             url: format!("{}/api/v1/logs", mock_server.uri()),
-            api_key: "test-key".to_string(),
+            bearer_token: Some("test-key".to_string()),
             batch_max_bytes: 4 * 1024, // 4KB — small batches flush quickly
             timeout_secs: 5,
             max_retries: 5,

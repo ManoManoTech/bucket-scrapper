@@ -42,9 +42,9 @@ impl BucketConfig {
 pub struct HttpOutputConfig {
     /// The URL to send logs to (e.g., https://intake.handy-mango.http.com/api/v1/logs)
     pub url: String,
-    /// API key for authentication (can also be set via HTTP_BEARER_AUTH env var)
+    /// Bearer token for authentication (can also be set via HTTP_BEARER_AUTH env var)
     #[serde(default)]
-    pub api_key: Option<String>,
+    pub bearer_auth: Option<String>,
     /// Timeout for HTTP requests in seconds (default: 30)
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
