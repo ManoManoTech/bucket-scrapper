@@ -6,7 +6,7 @@ High-performance S3 bucket content searcher. Downloads compressed objects, strea
 
 - **Streaming pipeline** -- no full decompressed object ever held in memory
 - **Regex filtering** -- ripgrep-based line matching (or omit pattern to extract all lines)
-- **Dual output** -- local zstd files grouped by date/hour, or HTTP streaming (HTTP/NDJSON)
+- **Dual output** -- local zstd files grouped by date/hour, or HTTP streaming (NDJSON)
 - **Parallel downloads** -- semaphore-bounded concurrent S3 fetches
 - **AIMD upload throttle** -- adaptive rate control for HTTP output with 429 back-off
 - **Compression support** -- reads `.gz` and `.zst` objects automatically
@@ -37,7 +37,7 @@ output_dir: ./scrapper-output
 
 # Optional: HTTP output defaults
 http_output:
-  url: https://intake.handy-mango.http.com/api/v1/logs
+  url: https://logs.example.com/api/v1/logs
   api_key: your-api-key
   timeout_secs: 30
 ```
@@ -68,7 +68,7 @@ bucket-scrapper -s 2024-01-15T10:00:00Z --line-pattern-regex "failed" -i
 bucket-scrapper -s 2024-01-15T10:00:00Z -f "service-a.*\.json\.zst$"
 ```
 
-### HTTP output (HTTP API)
+### HTTP output
 
 Sends matched lines as zstd-compressed NDJSON batches with AIMD-based adaptive throttling.
 
@@ -77,12 +77,12 @@ Sends matched lines as zstd-compressed NDJSON batches with AIMD-based adaptive t
 bucket-scrapper -s 2024-01-15T10:00:00Z \
   --line-pattern-regex "ERROR" \
   --http-output \
-  --http-url "https://intake.handy-mango.http.com/api/v1/logs" \
-  --http-api-key "your-api-key"
+  --http-url "https://logs.example.com/api/v1/logs" \
+  --http-bearer-auth "your-token"
 
 # Using environment variables
-export HTTP_URL="https://intake.handy-mango.http.com/api/v1/logs"
-export HTTP_BEARER_AUTH="your-api-key"
+export HTTP_URL="https://logs.example.com/api/v1/logs"
+export HTTP_BEARER_AUTH="your-token"
 bucket-scrapper -s 2024-01-15T10:00:00Z --http-output --line-pattern-regex "ERROR"
 ```
 
@@ -140,7 +140,7 @@ Usage: bucket-scrapper [OPTIONS] --start <START>
 |------|---------|-------------|
 | `--http-output` | false | Enable HTTP output mode |
 | `--http-url` | `HTTP_URL` env | HTTP API URL |
-| `--http-api-key` | `HTTP_BEARER_AUTH` env | API key for authentication |
+| `--http-bearer-auth` | `HTTP_BEARER_AUTH` env | Bearer token for authentication |
 | `--http-batch-max-mb` | 2 | Max batch size in MB |
 | `--http-timeout` | 30 | HTTP request timeout in seconds |
 | `--http-line-channel-size` | 1000 | Line channel capacity before compressors |

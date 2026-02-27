@@ -290,7 +290,7 @@ impl UploadThrottle {
 /// Configuration for the HTTP writer
 #[derive(Debug, Clone)]
 pub struct HttpWriterConfig {
-    /// The URL to send logs to (e.g., https://intake.handy-mango.http.com/api/v1/logs)
+    /// The URL to send logs to (e.g., https://logs.example.com/api/v1/logs)
     pub url: String,
     /// Optional bearer token for Authorization header
     pub bearer_token: Option<String>,

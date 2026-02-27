@@ -37,10 +37,10 @@ impl BucketConfig {
     }
 }
 
-/// HTTP output configuration for sending logs to a REST API (e.g., HTTP)
+/// HTTP output configuration for sending logs to a REST API
 #[derive(Debug, Deserialize, Clone)]
 pub struct HttpOutputConfig {
-    /// The URL to send logs to (e.g., https://intake.handy-mango.http.com/api/v1/logs)
+    /// The URL to send logs to (e.g., https://logs.example.com/api/v1/logs)
     pub url: String,
     /// Bearer token for authentication (can also be set via HTTP_BEARER_AUTH env var)
     #[serde(default)]
@@ -70,7 +70,7 @@ pub struct ConfigSchema {
     #[serde(default)]
     pub output_dir: Option<String>,
 
-    /// HTTP output configuration (for sending to REST API like REST API)
+    /// HTTP output configuration (for sending to REST API)
     #[serde(default)]
     pub http_output: Option<HttpOutputConfig>,
 

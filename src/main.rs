@@ -93,7 +93,7 @@ struct Cli {
     #[arg(long)]
     http_output: bool,
 
-    /// HTTP API URL for log ingestion (e.g., https://intake.handy-mango.http.com/api/v1/logs)
+    /// HTTP API URL for log ingestion (e.g., https://logs.example.com/api/v1/logs)
     #[arg(long, env = "HTTP_URL")]
     http_url: Option<String>,
 

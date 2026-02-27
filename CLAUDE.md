@@ -1,6 +1,6 @@
 # bucket-scrapper
 
-S3 bucket content searcher. Downloads compressed objects from S3, stream-decompresses, filters lines by regex, and outputs to either local zstd files or an HTTP API (HTTP).
+S3 bucket content searcher. Downloads compressed objects from S3, stream-decompresses, filters lines by regex, and outputs to either local zstd files or an HTTP API (NDJSON).
 
 ## Architecture
 
