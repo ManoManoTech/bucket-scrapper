@@ -61,7 +61,7 @@ impl Default for StreamingDownloaderConfig {
             max_concurrent_downloads: 32,
             max_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
-            progress_interval: Duration::from_secs(3),
+            progress_interval: Duration::from_secs(1),
             filter_tasks,
             line_buffer_size: 1_000,
         }
@@ -179,6 +179,12 @@ impl StreamingDownloader {
             download_observer.clone(),
             match_count.clone(),
         )));
+
+        // Emit initial progress at t=0 so charts always have a starting point
+        {
+            let mut prog = progress.lock().await;
+            prog.report();
+        }
 
         // --- Spawn download coordinator ---
         let download_handle = {

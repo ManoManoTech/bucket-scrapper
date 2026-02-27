@@ -78,7 +78,7 @@ struct Cli {
     retry_delay: u64,
 
     /// Progress report interval in seconds (supports fractional, e.g. 0.5)
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "1")]
     progress_interval: f64,
 
     /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
