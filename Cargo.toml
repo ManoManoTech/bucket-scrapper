@@ -49,6 +49,7 @@ wiremock = "0.6"
 name = "bucket-scrapper"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91"
 authors = ["Elie Bleton <elie.bleton@manomano.com>", "Julien Dauliac <julien.dauliac@manomano.com>"]
 description = "A high-performance tool for searching through S3 bucket contents using ripgrep"
 
