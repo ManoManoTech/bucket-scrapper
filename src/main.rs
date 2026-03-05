@@ -1,3 +1,7 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -159,6 +163,9 @@ enum LogFormat {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     // Set nice priority to prevent system resource starvation
     #[cfg(unix)]
     {

@@ -189,3 +189,15 @@ Uses standard AWS SDK credential chain:
 4. AWS SSO (`aws sso login`)
 
 Custom CA bundles are supported via `AWS_CA_BUNDLE` environment variable.
+
+## Profiling
+
+### CPU
+
+Use samply + profiling build
+
+### Memory
+
+- `cargo build --profile profiling --features dhat-heap`
+- `./target/profiling/bucket-scrapper ...`
+- Submit `profiler.json` to [dh_view](https://nnethercote.github.io/dh_view/dh_view.html)
