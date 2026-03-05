@@ -4,11 +4,11 @@
 //! bounded channel (`ChunkReader`), avoiding full-object buffering.  Retries
 //! resume mid-object using S3 range requests (`bytes=N-`).
 
+use super::observer::{ChannelObserver, DownloadObserver, PipelineObserver};
+use super::SharedFileWriter;
 use crate::matcher::LineMatcher;
 use crate::progress::PipelineProgress;
 use crate::s3::{self, S3ObjectInfo};
-use super::observer::{ChannelObserver, DownloadObserver, PipelineObserver};
-use super::SharedFileWriter;
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
@@ -187,8 +187,7 @@ impl StreamingDownloader {
         );
 
         // Line channel between download+decompress and filter workers
-        let (line_tx, line_rx) =
-            flume::bounded::<DecompressedLine>(self.config.line_buffer_size);
+        let (line_tx, line_rx) = flume::bounded::<DecompressedLine>(self.config.line_buffer_size);
 
         let download_observer = DownloadObserver::new();
         let match_count = Arc::new(AtomicUsize::new(0));
@@ -335,8 +334,7 @@ impl StreamingDownloader {
         let mut completed = 0usize;
 
         let is_fatal = |fe: &Option<Arc<AtomicBool>>| -> bool {
-            fe.as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
+            fe.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
         };
 
         let mut join_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
@@ -404,7 +402,13 @@ impl StreamingDownloader {
             join_set.spawn(async move {
                 let source = Arc::new(obj_clone);
                 let size = Self::download_and_stream(
-                    &client, &source, source.clone(), tx, &config, &dl_obs, fe,
+                    &client,
+                    &source,
+                    source.clone(),
+                    tx,
+                    &config,
+                    &dl_obs,
+                    fe,
                 )
                 .await?;
 
@@ -587,10 +591,7 @@ impl StreamingDownloader {
             }
 
             // Build GetObject request, adding Range header when resuming.
-            let mut req = client
-                .get_object()
-                .bucket(&obj.bucket)
-                .key(&obj.key);
+            let mut req = client.get_object().bucket(&obj.bucket).key(&obj.key);
             if bytes_forwarded > 0 {
                 req = req.range(format!("bytes={bytes_forwarded}-"));
             }
@@ -631,9 +632,7 @@ impl StreamingDownloader {
                             drop(chunk_tx);
                             return emit_handle
                                 .await
-                                .map_err(|e| {
-                                    anyhow::anyhow!("Streaming emit task panic: {e}")
-                                })?
+                                .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))?
                                 .map(|()| bytes_forwarded);
                         }
                     }
@@ -719,9 +718,9 @@ impl StreamingDownloader {
                 if searcher.matches_line(&line.data) {
                     match output.as_ref() {
                         FilterOutput::Http(sender) => {
-                            sender
-                                .send(line.data)
-                                .map_err(|_| anyhow::anyhow!("HTTP consumer gone, channel closed"))?;
+                            sender.send(line.data).map_err(|_| {
+                                anyhow::anyhow!("HTTP consumer gone, channel closed")
+                            })?;
                         }
                         FilterOutput::File(writer) => {
                             writer.write_match(&line.source.prefix, &line.data)?;
@@ -736,7 +735,11 @@ impl StreamingDownloader {
         .await
         .map_err(|e| anyhow::anyhow!("Filter worker panic: {e}"))??;
 
-        debug!(worker = worker_id, matches = result, "Filter worker finished");
+        debug!(
+            worker = worker_id,
+            matches = result,
+            "Filter worker finished"
+        );
         Ok(result)
     }
 }

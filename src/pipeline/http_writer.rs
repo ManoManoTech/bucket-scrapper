@@ -24,9 +24,7 @@ enum SendResult {
     /// Fatal failure (4xx client error) — stop the entire pipeline.
     Fatal(anyhow::Error),
     /// Server asked us to slow down (HTTP 429). Trigger AIMD decrease and retry.
-    Throttled {
-        retry_after: Option<Duration>,
-    },
+    Throttled { retry_after: Option<Duration> },
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +174,14 @@ impl UploadThrottle {
         };
 
         info!(
-            old_rate_mbps = format_args!("{:.2}", if st.rate.is_infinite() { f64::INFINITY } else { st.rate / 1_000_000.0 }),
+            old_rate_mbps = format_args!(
+                "{:.2}",
+                if st.rate.is_infinite() {
+                    f64::INFINITY
+                } else {
+                    st.rate / 1_000_000.0
+                }
+            ),
             new_rate_mbps = format_args!("{:.2}", new_rate / 1_000_000.0),
             ceiling_mbps = format_args!("{:.2}", st.ceiling / 1_000_000.0),
             congestion_count = st.congestion_count,
@@ -401,8 +406,7 @@ pub struct HttpResultWriter {
 impl HttpResultWriter {
     /// Create a new HTTP writer with separate compressor and uploader pools
     pub fn new(config: HttpWriterConfig) -> Result<Self> {
-        let mut builder = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs));
+        let mut builder = Client::builder().timeout(Duration::from_secs(config.timeout_secs));
 
         if let Some(path) = crate::utils::proxy::resolve_ca_bundle_path() {
             let pem = std::fs::read(&path)
@@ -413,8 +417,7 @@ impl HttpResultWriter {
             info!(path = %path, "Loaded custom CA bundle for HTTP writer");
         }
 
-        let client = builder.build()
-            .context("Failed to create HTTP client")?;
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         // Line channel: searchers → compressors
         let (write_tx, line_rx) = flume::bounded::<Vec<u8>>(config.channel_buffer_size);
@@ -558,11 +561,8 @@ impl HttpResultWriter {
                 let line = match line_rx.try_recv() {
                     Ok(line) => line,
                     Err(flume::TryRecvError::Empty) => {
-                        match tokio::time::timeout(
-                            Duration::from_millis(50),
-                            line_rx.recv_async(),
-                        )
-                        .await
+                        match tokio::time::timeout(Duration::from_millis(50), line_rx.recv_async())
+                            .await
                         {
                             Ok(Ok(line)) => line,
                             Ok(Err(_)) => {
@@ -589,7 +589,9 @@ impl HttpResultWriter {
                 Err(e) => {
                     error!(task = task_id, error = %e, lines = batch_lines, "Failed to finalize zstd frame");
                     lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
-                    if channel_closed { break 'outer; }
+                    if channel_closed {
+                        break 'outer;
+                    }
                     continue 'outer;
                 }
             };
@@ -604,7 +606,11 @@ impl HttpResultWriter {
             // Send to uploader pool — backpressure if uploaders fall behind
             if batch_tx.send_async(batch).await.is_err() {
                 // All uploaders gone
-                error!(task = task_id, lines = batch_lines, "Batch channel closed, uploaders gone");
+                error!(
+                    task = task_id,
+                    lines = batch_lines,
+                    "Batch channel closed, uploaders gone"
+                );
                 lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
                 break 'outer;
             }
@@ -616,7 +622,11 @@ impl HttpResultWriter {
             }
         }
 
-        debug!(task = task_id, batches_produced = batches_produced, "Compressor task finished");
+        debug!(
+            task = task_id,
+            batches_produced = batches_produced,
+            "Compressor task finished"
+        );
     }
 
     /// IO-bound task that receives compressed batches and uploads them via HTTP.
@@ -652,8 +662,10 @@ impl HttpResultWriter {
                         total_sent += batch.lines;
                         batches_sent += 1;
                         ctrs.lines_sent.fetch_add(batch.lines, Ordering::Relaxed);
-                        ctrs.compressed_bytes_sent.fetch_add(batch_compressed_bytes, Ordering::Relaxed);
-                        ctrs.plaintext_bytes_sent.fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
+                        ctrs.compressed_bytes_sent
+                            .fetch_add(batch_compressed_bytes, Ordering::Relaxed);
+                        ctrs.plaintext_bytes_sent
+                            .fetch_add(batch.plaintext_bytes, Ordering::Relaxed);
                         ctrs.batches_uploaded.fetch_add(1, Ordering::Relaxed);
                         ctrs.upload_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
 
@@ -754,7 +766,12 @@ impl HttpResultWriter {
             }
         }
 
-        debug!(task = task_id, total_lines = total_sent, batches_sent = batches_sent, "Uploader task finished");
+        debug!(
+            task = task_id,
+            total_lines = total_sent,
+            batches_sent = batches_sent,
+            "Uploader task finished"
+        );
         total_sent
     }
 
@@ -821,9 +838,8 @@ impl HttpResultWriter {
                             "HTTP {status}: {response_body}"
                         ));
                     } else {
-                        last_error = Some(anyhow::anyhow!(
-                            "HTTP {status} from API: {response_body}"
-                        ));
+                        last_error =
+                            Some(anyhow::anyhow!("HTTP {status} from API: {response_body}"));
                     }
                 }
                 Err(e) => {
@@ -910,13 +926,28 @@ mod tests {
 
     #[tokio::test]
     async fn throttle_starts_unlimited() {
-        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None, 0.15, 1_000_000.0);
-        assert!(th.current_rate_mbps().is_none(), "should be unlimited initially");
+        let th = UploadThrottle::new(
+            Some(Duration::from_secs_f64(2.5)),
+            2 * 1024 * 1024,
+            None,
+            0.15,
+            1_000_000.0,
+        );
+        assert!(
+            th.current_rate_mbps().is_none(),
+            "should be unlimited initially"
+        );
     }
 
     #[tokio::test]
     async fn throttle_acquire_instant_when_unlimited() {
-        let th = UploadThrottle::new(Some(Duration::from_secs_f64(2.5)), 2 * 1024 * 1024, None, 0.15, 1_000_000.0);
+        let th = UploadThrottle::new(
+            Some(Duration::from_secs_f64(2.5)),
+            2 * 1024 * 1024,
+            None,
+            0.15,
+            1_000_000.0,
+        );
         let start = Instant::now();
         th.acquire(1_000_000).await;
         // Unlimited — should return near-instantly
@@ -932,12 +963,18 @@ mod tests {
         for _ in 0..5 {
             th.record_upload(100_000, Duration::from_millis(200)).await;
         }
-        assert!(th.current_rate_mbps().is_none(), "still unlimited before congestion");
+        assert!(
+            th.current_rate_mbps().is_none(),
+            "still unlimited before congestion"
+        );
 
         // Simulate a slow upload (exceeds max_submission_time)
         th.record_upload(100_000, Duration::from_secs(2)).await;
         let rate = th.current_rate_mbps();
-        assert!(rate.is_some(), "throttle should be engaged after slow upload");
+        assert!(
+            rate.is_some(),
+            "throttle should be engaged after slow upload"
+        );
         assert!(rate.unwrap() > 0.0, "rate should be positive");
     }
 
@@ -1029,10 +1066,14 @@ mod tests {
         // Acquire should succeed (token bucket starts full)
         let start = Instant::now();
         th.acquire(1_000_000).await;
-        assert!(start.elapsed() < Duration::from_millis(50), "first acquire should be instant (bucket starts full)");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "first acquire should be instant (bucket starts full)"
+        );
 
         // Record upload — with no AIMD, rate should stay at limit
-        th.record_upload(1_000_000, Duration::from_millis(100)).await;
+        th.record_upload(1_000_000, Duration::from_millis(100))
+            .await;
         let rate_after = th.current_rate_mbps().unwrap();
         assert!(
             (rate_after - 10.0).abs() < 0.01,
@@ -1109,18 +1150,15 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_handles_429_and_recovers() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
         // First 3 requests → 429 with Retry-After header
         Mock::given(method("POST"))
             .and(path("/api/v1/logs"))
-            .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "0.05"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0.05"))
             .up_to_n_times(3)
             .with_priority(1) // Higher priority, consumed first
             .mount(&mock_server)

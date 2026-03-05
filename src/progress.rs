@@ -81,7 +81,11 @@ impl PipelineProgress {
 
         let dl_now = self.download_observer.bytes();
         let download_delta = dl_now - self.prev_downloaded_bytes;
-        let download_mbps = if interval_s > 0.0 { download_delta as f64 / 1_000_000.0 / interval_s } else { 0.0 };
+        let download_mbps = if interval_s > 0.0 {
+            download_delta as f64 / 1_000_000.0 / interval_s
+        } else {
+            0.0
+        };
 
         let dc_cap = self.decompressed_ch.capacity().max(1);
         let dc_len = self.decompressed_ch.len();
@@ -90,7 +94,11 @@ impl PipelineProgress {
         if let Some(ref pipe) = self.pipeline {
             let uploaded_now = pipe.compressed_bytes_sent();
             let upload_delta = uploaded_now - self.prev_uploaded_bytes;
-            let upload_mbps = if interval_s > 0.0 { upload_delta as f64 / 1_000_000.0 / interval_s } else { 0.0 };
+            let upload_mbps = if interval_s > 0.0 {
+                upload_delta as f64 / 1_000_000.0 / interval_s
+            } else {
+                0.0
+            };
 
             let batch_cap = pipe.batch_capacity().max(1);
             let line_cap = pipe.line_capacity().max(1);

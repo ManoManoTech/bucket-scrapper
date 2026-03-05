@@ -70,33 +70,31 @@ fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
 pub fn generate_path_formatter(bucket: &BucketConfig) -> PathFormatter {
     let path_components = bucket.path.clone();
 
-    Box::new(
-        move |date: &str, hour: &str| -> Result<String> {
-            let mut parts = Vec::new();
+    Box::new(move |date: &str, hour: &str| -> Result<String> {
+        let mut parts = Vec::new();
 
-            for component in &path_components {
-                match component {
-                    PathSchema::Static { static_path } => {
-                        parts.push(static_path.clone());
-                    }
-                    PathSchema::DateFormat { datefmt } => {
-                        let formatter = extract_single_format_date_and_prefix(datefmt.clone());
-                        parts.push(formatter(date, hour)?);
-                    }
+        for component in &path_components {
+            match component {
+                PathSchema::Static { static_path } => {
+                    parts.push(static_path.clone());
+                }
+                PathSchema::DateFormat { datefmt } => {
+                    let formatter = extract_single_format_date_and_prefix(datefmt.clone());
+                    parts.push(formatter(date, hour)?);
                 }
             }
+        }
 
-            // Filter out empty parts and join with "/"
-            let path = parts
-                .iter()
-                .filter(|part: &&String| !part.is_empty())
-                .map(|s: &String| s.as_str())
-                .collect::<Vec<_>>()
-                .join("/");
+        // Filter out empty parts and join with "/"
+        let path = parts
+            .iter()
+            .filter(|part: &&String| !part.is_empty())
+            .map(|s: &String| s.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
 
-            Ok(path)
-        },
-    )
+        Ok(path)
+    })
 }
 
 #[cfg(test)]

@@ -132,10 +132,13 @@ impl WrappedS3Client {
         let client = self.get_client().await?;
 
         // Compile regex filter up front (before pagination loop)
-        let filter_regex = filter_pattern
-            .map(Regex::new)
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("Invalid filter regex '{}': {}", filter_pattern.unwrap_or(""), e))?;
+        let filter_regex = filter_pattern.map(Regex::new).transpose().map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid filter regex '{}': {}",
+                filter_pattern.unwrap_or(""),
+                e
+            )
+        })?;
 
         debug!(bucket = %bucket, prefix = %prefix, "Listing objects");
 
@@ -145,10 +148,7 @@ impl WrappedS3Client {
         let mut pages = 0u32;
 
         loop {
-            let mut request = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix);
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
 
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
@@ -220,7 +220,6 @@ impl WrappedS3Client {
         }
         Ok(matched)
     }
-
 }
 
 /// Build TLS context, adding a custom CA cert if `AWS_CA_BUNDLE` is set
@@ -229,8 +228,8 @@ fn build_tls_context() -> Result<TlsContext> {
     let mut trust_store = TrustStore::default();
 
     if let Some(path) = crate::utils::proxy::resolve_ca_bundle_path() {
-        let pem = std::fs::read(&path)
-            .with_context(|| format!("Failed to read CA bundle: {path}"))?;
+        let pem =
+            std::fs::read(&path).with_context(|| format!("Failed to read CA bundle: {path}"))?;
         info!(path = %path, "Loaded custom CA bundle for S3 client");
         trust_store = trust_store.with_pem_certificate(pem);
     }

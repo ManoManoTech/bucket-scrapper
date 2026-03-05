@@ -58,7 +58,8 @@ impl SharedFileWriter {
         encoder.write_all(content)?;
 
         self.lines_written.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(content.len(), Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(content.len(), Ordering::Relaxed);
 
         Ok(())
     }
@@ -101,11 +102,10 @@ impl SharedFileWriter {
 
     /// Finalize all encoders. Must be called after all search tasks have completed.
     pub fn finish(self) -> Result<FileWriterStats> {
-        let rwlock = Arc::try_unwrap(self.encoders)
-            .unwrap_or_else(|arc| {
-                let guard = arc.read().unwrap_or_else(|e| e.into_inner());
-                RwLock::new(guard.clone())
-            });
+        let rwlock = Arc::try_unwrap(self.encoders).unwrap_or_else(|arc| {
+            let guard = arc.read().unwrap_or_else(|e| e.into_inner());
+            RwLock::new(guard.clone())
+        });
 
         let map = rwlock.into_inner().unwrap_or_else(|e| e.into_inner());
 
@@ -161,7 +161,9 @@ mod tests {
 
         let line = "{\"msg\":\"hello\"}\n";
         for _ in 0..10 {
-            writer.write_match("2025-02-23/14", line.as_bytes()).unwrap();
+            writer
+                .write_match("2025-02-23/14", line.as_bytes())
+                .unwrap();
         }
 
         let stats = writer.finish().unwrap();
@@ -207,7 +209,9 @@ mod tests {
         // Write enough repeated data that zstd compresses well
         let line = "{\"timestamp\":\"2025-02-23T14:00:00Z\",\"level\":\"INFO\",\"msg\":\"test\"}\n";
         for _ in 0..100 {
-            writer.write_match("2025-02-23/14", line.as_bytes()).unwrap();
+            writer
+                .write_match("2025-02-23/14", line.as_bytes())
+                .unwrap();
         }
 
         let stats = writer.finish().unwrap();
@@ -220,4 +224,3 @@ mod tests {
         );
     }
 }
-

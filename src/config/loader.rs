@@ -12,10 +12,7 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
     let config: ConfigSchema =
         serde_yaml::from_str(&config_str).with_context(|| "Failed to parse YAML config")?;
 
-    info!(
-        buckets = config.buckets.len(),
-        "Config loaded"
-    );
+    info!(buckets = config.buckets.len(), "Config loaded");
     Ok(config)
 }
 
@@ -55,5 +52,4 @@ buckets:
         assert_eq!(config.buckets.len(), 1);
         assert_eq!(config.buckets[0].bucket, "my-bucket");
     }
-
 }

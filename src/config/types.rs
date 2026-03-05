@@ -25,7 +25,10 @@ impl BucketConfig {
     /// Validate that the bucket config has at least one DateFormat path component.
     /// Without it, the prefix never narrows by date/hour and we'd list the entire bucket.
     pub fn validate(&self) -> Result<(), String> {
-        let has_datefmt = self.path.iter().any(|p| matches!(p, PathSchema::DateFormat { .. }));
+        let has_datefmt = self
+            .path
+            .iter()
+            .any(|p| matches!(p, PathSchema::DateFormat { .. }));
         if !has_datefmt {
             return Err(format!(
                 "Bucket '{}' has no datefmt in path — this would list the entire bucket prefix. \
@@ -55,8 +58,7 @@ fn default_timeout_secs() -> u64 {
 }
 
 /// Simplified config schema for bucket scrapper
-#[derive(Debug, Deserialize, Clone)]
-#[derive(Default)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ConfigSchema {
     /// List of buckets to search
     #[serde(default)]
@@ -79,7 +81,6 @@ pub struct ConfigSchema {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,7 +100,10 @@ mod tests {
             static_path: "logs/".to_string(),
         }]);
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("test-bucket"), "error should name the bucket: {err}");
+        assert!(
+            err.contains("test-bucket"),
+            "error should name the bucket: {err}"
+        );
     }
 
     #[test]
@@ -121,4 +125,3 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 }
-

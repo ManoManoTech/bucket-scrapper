@@ -14,15 +14,15 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use bucket_scrapper::config::loader::load_config;
+use bucket_scrapper::config::path_formatter::generate_path_formatter;
 use bucket_scrapper::config::types::BucketConfig;
-use bucket_scrapper::s3::S3ObjectInfo;
-use bucket_scrapper::s3::client::WrappedS3Client;
-use bucket_scrapper::s3::dns_cache;
-use bucket_scrapper::pipeline::{StreamingDownloader, StreamingDownloaderConfig};
 use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
 use bucket_scrapper::pipeline::{HttpResultWriter, HttpWriterConfig, SharedFileWriter};
+use bucket_scrapper::pipeline::{StreamingDownloader, StreamingDownloaderConfig};
+use bucket_scrapper::s3::client::WrappedS3Client;
+use bucket_scrapper::s3::dns_cache;
+use bucket_scrapper::s3::S3ObjectInfo;
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
-use bucket_scrapper::config::path_formatter::generate_path_formatter;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]
@@ -204,7 +204,11 @@ async fn main() -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
     match cli.log_format {
-        LogFormat::Json => fmt().with_env_filter(env_filter).with_target(false).json().init(),
+        LogFormat::Json => fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .json()
+            .init(),
         LogFormat::Text => fmt().with_env_filter(env_filter).with_target(false).init(),
     }
 
@@ -244,8 +248,7 @@ async fn main() -> Result<()> {
         .context("Invalid start date format")?;
 
     // Create S3 client (Arc for sharing across spawned listing tasks)
-    let s3_client =
-        Arc::new(WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?);
+    let s3_client = Arc::new(WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?);
 
     // Configure search
     let matcher_config = MatcherConfig {
@@ -297,16 +300,28 @@ async fn main() -> Result<()> {
     // Check if we're using HTTP streaming output
     let http_streaming = if cli.http_output {
         // Validate HTTP config early
-        let api_url = cli.http_url.clone()
-            .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().map(|h| h.url.clone())))
-            .ok_or_else(|| anyhow::anyhow!(
+        let api_url = cli
+            .http_url
+            .clone()
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|c| c.http_output.as_ref().map(|h| h.url.clone()))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
                 "HTTP output enabled but no URL specified. Use --http-url or set HTTP_URL env var"
-            ))?;
+            )
+            })?;
 
-        let bearer_token = cli.http_bearer_auth.clone()
-            .or_else(|| config.as_ref().and_then(|c| c.http_output.as_ref().and_then(|h| h.bearer_auth.clone())));
+        let bearer_token = cli.http_bearer_auth.clone().or_else(|| {
+            config
+                .as_ref()
+                .and_then(|c| c.http_output.as_ref().and_then(|h| h.bearer_auth.clone()))
+        });
 
-        let timeout_secs = config.as_ref()
+        let timeout_secs = config
+            .as_ref()
             .and_then(|c| c.http_output.as_ref().map(|h| h.timeout_secs))
             .unwrap_or(cli.http_timeout);
 
@@ -407,7 +422,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        info!(tasks = total_tasks, buckets = config_buckets.len(), "Spawned listing tasks");
+        info!(
+            tasks = total_tasks,
+            buckets = config_buckets.len(),
+            "Spawned listing tasks"
+        );
 
         // Drain results — abort all remaining tasks on first failure
         let mut all_objects = Vec::new();
@@ -432,7 +451,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if successful < total_tasks && last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            if successful < total_tasks
+                && last_report.elapsed() >= std::time::Duration::from_secs(5)
+            {
                 last_report = std::time::Instant::now();
                 info!(
                     prefixes_done = successful,
@@ -474,7 +495,13 @@ async fn main() -> Result<()> {
             let observer = http_writer.observer();
             let fatal_error = http_writer.fatal_error_flag();
             let (files_searched, matched_lines) = downloader
-                .search_objects_to_http(&all_bucket_objects, searcher.clone(), http_sender, observer, fatal_error)
+                .search_objects_to_http(
+                    &all_bucket_objects,
+                    searcher.clone(),
+                    http_sender,
+                    observer,
+                    fatal_error,
+                )
                 .await?;
 
             let api_url = http_writer.url().to_string();
@@ -511,15 +538,10 @@ async fn main() -> Result<()> {
                 .and_then(|c| c.output_dir.clone())
                 .unwrap_or_else(|| "./scrapper-output".to_string());
 
-            let file_writer =
-                SharedFileWriter::new(output_dir.clone(), cli.compression_level)?;
+            let file_writer = SharedFileWriter::new(output_dir.clone(), cli.compression_level)?;
 
             let (files_searched, matched_lines) = downloader
-                .search_objects_to_file(
-                    &all_bucket_objects,
-                    searcher.clone(),
-                    file_writer.clone(),
-                )
+                .search_objects_to_file(&all_bucket_objects, searcher.clone(), file_writer.clone())
                 .await?;
 
             let stats = file_writer.finish()?;
@@ -546,4 +568,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
