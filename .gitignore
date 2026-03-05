@@ -8,3 +8,7 @@ report.html
 
 scrapper-output/
 profile.json.gz
+dhat-heap.json
+heaptrack.*
+quickwit_index_config.yml
+.serena/
