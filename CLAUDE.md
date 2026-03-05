@@ -7,7 +7,8 @@ S3 bucket content searcher. Downloads compressed objects from S3, stream-decompr
 Streaming pipeline with decoupled stages connected by bounded channels:
 
 ```
-S3 download (semaphore-bounded)
+S3 GetObject stream (semaphore-bounded, range-based resume on retries)
+  → async chunk loop → flume::bounded(4) → ChunkReader (impl Read)
   → spawn_blocking: stream-decompress (.gz/.zst) line-by-line
   → line_ch (flume bounded)
   → filter_worker pool (spawn_blocking, regex via grep-matcher)

@@ -1,19 +1,18 @@
 //! Pipeline orchestrator: download → decompress → filter → output.
 //!
-//! Only `download_inner` and `download_with_retry` perform actual S3 I/O;
-//! the rest is concurrency orchestration (semaphores, channels, task pools)
-//! and progress reporting.
+//! Downloads stream S3 response chunks directly into the decompressor via a
+//! bounded channel (`ChunkReader`), avoiding full-object buffering.  Retries
+//! resume mid-object using S3 range requests (`bytes=N-`).
 
 use crate::matcher::LineMatcher;
 use crate::progress::PipelineProgress;
-use crate::s3::S3ObjectInfo;
+use crate::s3::{self, S3ObjectInfo};
 use super::observer::{ChannelObserver, DownloadObserver, PipelineObserver};
 use super::SharedFileWriter;
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +29,41 @@ struct DecompressedLine {
 enum FilterOutput {
     Http(flume::Sender<Vec<u8>>),
     File(SharedFileWriter),
+}
+
+/// Bridges async S3 `ByteStream` chunks into synchronous [`Read`] for
+/// `spawn_blocking`.  A bounded `flume` channel provides backpressure so the
+/// async chunk-forwarding loop slows down when the decompressor can't keep up.
+struct ChunkReader {
+    rx: flume::Receiver<Bytes>,
+    /// Leftover bytes from the last chunk not yet consumed by `read()`.
+    remainder: Bytes,
+}
+
+impl ChunkReader {
+    fn new(rx: flume::Receiver<Bytes>) -> Self {
+        Self {
+            rx,
+            remainder: Bytes::new(),
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Serve leftover bytes from the previous chunk first.
+        if self.remainder.is_empty() {
+            match self.rx.recv() {
+                Ok(chunk) => self.remainder = chunk,
+                // Sender dropped — EOF.
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.remainder.len());
+        buf[..n].copy_from_slice(&self.remainder[..n]);
+        self.remainder = self.remainder.slice(n..);
+        Ok(n)
+    }
 }
 
 /// Configuration for the streaming downloader
@@ -120,12 +154,14 @@ impl StreamingDownloader {
     ///
     /// Architecture:
     /// ```text
-    /// [sem N] → download + stream_decompress → lines → [line_ch] → filter workers → exporter
+    /// [sem N] → S3 stream → ChunkReader → decompress → lines → [line_ch] → filter workers → exporter
     /// ```
     ///
-    /// Download tasks acquire a semaphore permit, fetch the compressed body,
-    /// stream-decompress it line by line pushing into the line channel, then
-    /// release the permit. Filter workers pull lines and run regex matching.
+    /// Download tasks acquire a semaphore permit, then stream S3 chunks through
+    /// a bounded channel into a synchronous decompressor (`spawn_blocking`).
+    /// Lines are emitted into the line channel. The permit is held for the
+    /// entire download+decompress duration (S3 connection stays open).
+    /// On transient errors, range-based resume retries from the last byte offset.
     ///
     /// Returns (files_searched, total_matches)
     async fn search_objects(
@@ -366,24 +402,16 @@ impl StreamingDownloader {
             let fe = fatal_error.clone();
 
             join_set.spawn(async move {
-                // Download compressed bytes (with retries)
-                let (compressed, obj_info) =
-                    Self::download_with_retry(client, obj_clone, config, dl_obs).await?;
-                let compressed_size = compressed.len();
+                let source = Arc::new(obj_clone);
+                let size = Self::download_and_stream(
+                    &client, &source, source.clone(), tx, &config, &dl_obs, fe,
+                )
+                .await?;
 
-                // Release permit — S3 connection is free
+                // Release permit AFTER streaming+decompress completes
+                // (S3 connection was open throughout).
                 drop(permit);
-
-                // Stream-decompress and emit lines (no retry — idempotent lines)
-                let source = Arc::new(obj_info);
-                let tx_clone = tx;
-                tokio::task::spawn_blocking(move || {
-                    Self::emit_lines(compressed, &source, &tx_clone, fe)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Decompress+emit task panic: {e}"))??;
-
-                Ok(compressed_size)
+                Ok(size)
             });
 
             spawned += 1;
@@ -441,24 +469,26 @@ impl StreamingDownloader {
         Ok(completed)
     }
 
-    /// Stream-decompress compressed bytes and emit lines into the channel.
+    /// Stream-decompress and emit lines into the channel.
     /// Runs inside `spawn_blocking` (synchronous IO).
+    ///
+    /// `reader` is any [`Read`] — either a `ChunkReader` (streaming from S3)
+    /// or a `Cursor<Bytes>` (tests).
     ///
     /// Checks `fatal_error` every 1024 lines so we stop emitting early when the
     /// HTTP pipeline is dead — avoids blocking on a full line channel.
     fn emit_lines(
-        compressed: Bytes,
+        reader: impl Read,
         source: &Arc<S3ObjectInfo>,
         line_tx: &flume::Sender<DecompressedLine>,
         fatal_error: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
-        let cursor = std::io::Cursor::new(compressed);
         let reader: Box<dyn Read> = if source.key.ends_with(".gz") {
-            Box::new(flate2::read::GzDecoder::new(cursor))
+            Box::new(flate2::read::GzDecoder::new(reader))
         } else if source.key.ends_with(".zst") || source.key.ends_with(".zstd") {
-            Box::new(zstd::Decoder::new(cursor)?)
+            Box::new(zstd::Decoder::new(reader)?)
         } else {
-            Box::new(cursor)
+            Box::new(reader)
         };
 
         let mut buf_reader = BufReader::new(reader);
@@ -491,83 +521,170 @@ impl StreamingDownloader {
         Ok(())
     }
 
-    /// Download compressed bytes from S3 with retries.
-    /// Returns (compressed_bytes, object_info).
-    async fn download_with_retry(
-        client: Client,
-        obj: S3ObjectInfo,
-        config: StreamingDownloaderConfig,
-        download_observer: DownloadObserver,
-    ) -> Result<(Bytes, S3ObjectInfo)> {
-        let bucket = obj.bucket.clone();
-        let key = obj.key.clone();
-
-        let inner = || async {
-            Self::download_inner(&client, &obj, &download_observer).await
-        };
-
-        let retry_params = ExponentialBuilder::default()
-            .with_min_delay(config.initial_retry_delay)
-            .with_max_delay(Duration::from_secs(60))
-            .with_factor(2.0)
-            .with_jitter()
-            .with_max_times(config.max_retries as usize);
-
-        let compressed = inner
-            .retry(retry_params)
-            .sleep(tokio::time::sleep)
-            .notify(move |err: &anyhow::Error, dur: Duration| {
-                warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    retry_in_s = dur.as_secs_f64(),
-                    error = %err,
-                    "Retry scheduled"
-                );
-            })
-            .await?;
-
-        Ok((compressed, obj))
-    }
-
-    /// Download a single S3 object (no retries). Returns compressed bytes.
-    async fn download_inner(
+    /// Stream an S3 object's body directly into the decompressor via a bounded
+    /// chunk channel, with range-based resume on transient errors.
+    ///
+    /// The decompressor (running in `spawn_blocking`) sees a seamless byte
+    /// stream — retries are invisible because range requests resume the
+    /// compressed stream exactly where it left off.
+    ///
+    /// Returns the total number of compressed bytes streamed.
+    #[allow(clippy::too_many_arguments)]
+    async fn download_and_stream(
         client: &Client,
         obj: &S3ObjectInfo,
+        source: Arc<S3ObjectInfo>,
+        line_tx: flume::Sender<DecompressedLine>,
+        config: &StreamingDownloaderConfig,
         download_observer: &DownloadObserver,
-    ) -> Result<Bytes> {
+        fatal_error: Option<Arc<AtomicBool>>,
+    ) -> Result<usize> {
+        // Bounded channel for async→sync chunk bridging.
+        // Capacity 4 ≈ 256 KB of S3 chunks in flight (typical chunk ~64 KB).
+        let (chunk_tx, chunk_rx) = flume::bounded::<Bytes>(4);
+
+        // Spawn the synchronous decompressor side.
+        let emit_source = source.clone();
+        let emit_handle = tokio::task::spawn_blocking(move || {
+            let reader = ChunkReader::new(chunk_rx);
+            Self::emit_lines(reader, &emit_source, &line_tx, fatal_error)
+        });
+
         debug!(
             bucket = %obj.bucket,
             key = %obj.key,
             bytes = obj.size,
-            "Downloading"
+            "Streaming download"
         );
 
-        let resp = client
-            .get_object()
-            .bucket(&obj.bucket)
-            .key(&obj.key)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get S3 object: {e}"))?;
+        let mut bytes_forwarded: usize = 0;
+        let mut succeeded = false;
 
-        let compressed = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read S3 object body: {e}"))?
-            .into_bytes();
+        for attempt in 0..=config.max_retries {
+            if attempt > 0 {
+                // Exponential backoff with simple jitter (±25%).
+                let base = config
+                    .initial_retry_delay
+                    .mul_f64(2.0f64.powi(attempt as i32 - 1))
+                    .min(Duration::from_secs(60));
+                // Jitter: vary by ±25% using low bits of the current instant.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos();
+                let jitter_factor = 0.75 + (nanos % 500) as f64 / 1000.0;
+                let delay = base.mul_f64(jitter_factor);
 
-        download_observer.add_bytes(compressed.len());
+                warn!(
+                    bucket = %obj.bucket,
+                    key = %obj.key,
+                    attempt,
+                    bytes_forwarded,
+                    retry_in_s = delay.as_secs_f64(),
+                    "Retry scheduled (range resume)"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            // Build GetObject request, adding Range header when resuming.
+            let mut req = client
+                .get_object()
+                .bucket(&obj.bucket)
+                .key(&obj.key);
+            if bytes_forwarded > 0 {
+                req = req.range(format!("bytes={bytes_forwarded}-"));
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !s3::is_recoverable_s3_error(&msg) {
+                        drop(chunk_tx);
+                        // Abort the emit task — we won't send more data.
+                        emit_handle.abort();
+                        return Err(anyhow::anyhow!("Fatal S3 error: {e}"));
+                    }
+                    warn!(
+                        bucket = %obj.bucket,
+                        key = %obj.key,
+                        attempt,
+                        error = %e,
+                        "S3 request failed"
+                    );
+                    continue;
+                }
+            };
+
+            // Stream body chunks into the decompressor channel.
+            let mut body = resp.body;
+            let mut stream_failed = false;
+
+            while let Some(chunk_result) = body.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        bytes_forwarded += chunk.len();
+                        download_observer.add_bytes(chunk.len());
+
+                        if chunk_tx.send_async(chunk).await.is_err() {
+                            // Receiver dropped — emit_lines errored or was cancelled.
+                            drop(chunk_tx);
+                            return emit_handle
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Streaming emit task panic: {e}")
+                                })?
+                                .map(|()| bytes_forwarded);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            bucket = %obj.bucket,
+                            key = %obj.key,
+                            attempt,
+                            bytes_forwarded,
+                            error = %e,
+                            "S3 body stream error"
+                        );
+                        stream_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !stream_failed {
+                succeeded = true;
+                break;
+            }
+        }
+
+        // Drop sender to signal EOF to ChunkReader.
+        drop(chunk_tx);
+
+        if !succeeded {
+            // Abort the emit task — partial data was sent but we can't finish.
+            emit_handle.abort();
+            return Err(anyhow::anyhow!(
+                "S3 download failed after {} retries (streamed {bytes_forwarded} bytes): {}/{}",
+                config.max_retries,
+                obj.bucket,
+                obj.key,
+            ));
+        }
+
+        // Wait for the decompressor to finish.
+        emit_handle
+            .await
+            .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))??;
 
         debug!(
             bucket = %obj.bucket,
             key = %obj.key,
-            compressed_bytes = compressed.len(),
-            "Downloaded"
+            compressed_bytes = bytes_forwarded,
+            "Streamed"
         );
 
-        Ok(compressed)
+        Ok(bytes_forwarded)
     }
 
     /// Filter worker: pulls lines from channel, applies regex, emits matches.

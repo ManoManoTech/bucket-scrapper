@@ -40,7 +40,7 @@ impl WrappedS3Client {
         dns_cache::prewarm_global_dns_cache(region).await;
 
         // Enable AWS SDK retries for transient failures (rate limiting, network issues)
-        // Downloads also have additional retry logic in downloader.rs with backon
+        // Downloads also have range-based resume in the pipeline orchestrator
         // for full visibility via structured logging (date, hour, bucket, key, error)
         let retry_config = RetryConfig::standard()
             .with_max_attempts(5)
