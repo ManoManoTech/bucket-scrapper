@@ -1,12 +1,10 @@
-// src/utils/date.rs
-use crate::config::types::{DateString, HourString};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Debug, Clone)]
 pub struct DateHour {
-    pub date: DateString,
-    pub hour: HourString,
+    pub date: String,
+    pub hour: String,
 }
 
 /// Formats date as YYYYMMDD
@@ -15,12 +13,12 @@ pub struct DateHour {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::format_date;
+/// use bucket_scrapper::utils::date::format_date;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// assert_eq!(format_date(&date), "20231225");
 /// ```
-pub fn format_date(date: &DateTime<Utc>) -> DateString {
+pub fn format_date(date: &DateTime<Utc>) -> String {
     date.format("%Y%m%d").to_string()
 }
 
@@ -30,7 +28,7 @@ pub fn format_date(date: &DateTime<Utc>) -> DateString {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::format_hour;
+/// use bucket_scrapper::utils::date::format_hour;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// assert_eq!(format_hour(&date), "14");
@@ -38,7 +36,7 @@ pub fn format_date(date: &DateTime<Utc>) -> DateString {
 /// let date_zero = Utc.with_ymd_and_hms(2023, 12, 25, 0, 30, 0).unwrap();
 /// assert_eq!(format_hour(&date_zero), "00");
 /// ```
-pub fn format_hour(date: &DateTime<Utc>) -> HourString {
+pub fn format_hour(date: &DateTime<Utc>) -> String {
     date.format("%H").to_string()
 }
 
@@ -48,7 +46,7 @@ pub fn format_hour(date: &DateTime<Utc>) -> HourString {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::date_to_date_hour;
+/// use bucket_scrapper::utils::date::date_to_date_hour;
 ///
 /// let date = Utc.with_ymd_and_hms(2023, 12, 25, 14, 30, 0).unwrap();
 /// let date_hour = date_to_date_hour(&date);
@@ -68,7 +66,7 @@ pub fn date_to_date_hour(date: &DateTime<Utc>) -> DateHour {
 ///
 /// ```
 /// use chrono::{DateTime, Utc, TimeZone};
-/// use log_consolidator_checker_rust::utils::date::date_range_to_date_hour_list;
+/// use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 ///
 /// let start = Utc.with_ymd_and_hms(2023, 12, 25, 14, 0, 0).unwrap();
 /// let end = Utc.with_ymd_and_hms(2023, 12, 25, 16, 0, 0).unwrap();
@@ -97,7 +95,7 @@ pub fn date_range_to_date_hour_list(
 
     while current_date <= *end {
         date_hour_list.push(date_to_date_hour(&current_date));
-        current_date = current_date + Duration::hours(1);
+        current_date += Duration::hours(1);
     }
 
     if date_hour_list.is_empty() {
@@ -116,14 +114,14 @@ pub fn date_range_to_date_hour_list(
 /// # Examples
 ///
 /// ```
-/// use log_consolidator_checker_rust::utils::date::common_date_format;
+/// use bucket_scrapper::utils::date::common_date_format;
 ///
 /// let date = "20231225".to_string();
 /// let hour = "14".to_string();
 /// assert_eq!(common_date_format(&date, &hour), "dt=20231225/hour=14");
 /// ```
-pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
-    format!("dt={}/hour={}", date, hour)
+pub fn common_date_format(date: &str, hour: &str) -> String {
+    format!("dt={date}/hour={hour}")
 }
 
 /// Formats date and hour as YYYY/MM/DD/HH
@@ -131,7 +129,7 @@ pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
 /// # Examples
 ///
 /// ```
-/// use log_consolidator_checker_rust::utils::date::raw_logs_date_format;
+/// use bucket_scrapper::utils::date::raw_logs_date_format;
 ///
 /// let date = "20231225".to_string();
 /// let hour = "14".to_string();
@@ -141,11 +139,10 @@ pub fn common_date_format(date: &DateString, hour: &HourString) -> String {
 /// let invalid_date = "2023125".to_string(); // 7 characters instead of 8
 /// assert!(raw_logs_date_format(&invalid_date, &hour).is_err());
 /// ```
-pub fn raw_logs_date_format(date: &DateString, hour: &HourString) -> Result<String> {
+pub fn raw_logs_date_format(date: &str, hour: &str) -> Result<String> {
     if date.len() != 8 {
         return Err(anyhow::anyhow!(
-            "Invalid date: {}. Should be YYYYMMDD, 8 characters.",
-            date
+            "Invalid date: {date}. Should be YYYYMMDD, 8 characters."
         ));
     }
 
@@ -159,7 +156,7 @@ pub fn raw_logs_date_format(date: &DateString, hour: &HourString) -> Result<Stri
 }
 
 /// Returns an empty string (used for some edge cases)
-pub fn empty_date_format(_date: &DateString, _hour: &HourString) -> String {
+pub fn empty_date_format(_date: &str, _hour: &str) -> String {
     String::new()
 }
 

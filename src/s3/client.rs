@@ -1,15 +1,13 @@
-// src/s3/client.rs
-// Location: src/s3/client.rs
-use crate::config::types::{BucketConfig, DateString, HourString, S3FileList, S3ObjectInfo};
+use super::types::S3ObjectInfo;
 use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
-use crate::utils::path_formatter::generate_path_formatter;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::ResponseChecksumValidation;
 use aws_sdk_s3::Client;
-use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
-use aws_smithy_http_client::Builder as HttpClientBuilder;
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
+use aws_smithy_http_client::{Builder as HttpClientBuilder, Connector};
 use aws_smithy_types::timeout::TimeoutConfig;
 use aws_types::region::Region;
 use regex::Regex;
@@ -42,7 +40,7 @@ impl WrappedS3Client {
         dns_cache::prewarm_global_dns_cache(region).await;
 
         // Enable AWS SDK retries for transient failures (rate limiting, network issues)
-        // Downloads also have additional retry logic in downloader.rs with backon
+        // Downloads also have range-based resume in the pipeline orchestrator
         // for full visibility via structured logging (date, hour, bucket, key, error)
         let retry_config = RetryConfig::standard()
             .with_max_attempts(5)
@@ -55,20 +53,33 @@ impl WrappedS3Client {
             .operation_attempt_timeout(Duration::from_secs(60))
             .build();
 
-        // Build custom HTTP client with our cached DNS resolver if available
-        // This is the KEY integration - it ensures all S3 requests use our
-        // hickory-resolver + moka cache instead of hyper's default system resolver
+        // Build custom HTTP client with proxy support, custom CA, and cached DNS resolver
+        let proxy_config = ProxyConfig::from_env();
+        if !proxy_config.is_disabled() {
+            info!("Proxy configured from environment variables");
+        }
+
+        let tls_context = build_tls_context()?;
+
         let http_client = if let Some(dns_cache) = dns_cache::get_global_dns_cache() {
             info!("Creating S3 client with cached DNS resolver");
             let resolver = AwsDnsResolverAdapter::new(dns_cache.clone());
-            HttpClientBuilder::new()
-                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
-                .build_with_resolver(resolver)
+            HttpClientBuilder::new().build_with_connector_fn(move |_, _| {
+                Connector::builder()
+                    .proxy_config(proxy_config.clone())
+                    .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                    .tls_context(tls_context.clone())
+                    .build_with_resolver(resolver.clone())
+            })
         } else {
-            warn!("DNS cache not available, using default resolver (will cause more DNS queries)");
-            HttpClientBuilder::new()
-                .tls_provider(Provider::rustls(CryptoMode::AwsLc))
-                .build_https()
+            warn!("DNS cache not available, using default resolver");
+            HttpClientBuilder::new().build_with_connector_fn(move |_, _| {
+                Connector::builder()
+                    .proxy_config(proxy_config.clone())
+                    .tls_provider(Provider::rustls(CryptoMode::AwsLc))
+                    .tls_context(tls_context.clone())
+                    .build()
+            })
         };
 
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
@@ -111,207 +122,6 @@ impl WrappedS3Client {
         Ok(guard.1.clone())
     }
 
-    /// Lists objects using a provided client - use this when making multiple calls
-    /// to avoid repeated get_client() overhead
-    pub async fn get_matching_filenames_from_s3_with_client(
-        &self,
-        client: &Client,
-        bucket_config: &BucketConfig,
-        date: &DateString,
-        hour: &HourString,
-        will_filter: bool,
-    ) -> Result<S3FileList> {
-        let formatter = generate_path_formatter(bucket_config);
-        let prefix = formatter(date, hour)?;
-        let bucket = &bucket_config.bucket;
-
-        debug!("Get filenames for {} in {}", prefix, bucket);
-
-        let mut result = Vec::new();
-        let mut continuation_token = None;
-        let mut total_size: usize = 0;
-
-        // Build regex filters if needed
-        let filename_pattern_filter = if let Some(patterns) = &bucket_config.only_prefix_patterns {
-            let compiled_patterns = patterns
-                .iter()
-                .map(|pattern| Regex::new(pattern).unwrap())
-                .collect::<Vec<_>>();
-
-            Some(compiled_patterns)
-        } else {
-            None
-        };
-
-        // List objects in the bucket with the specified prefix
-        loop {
-            debug!(
-                "Listing objects for {} in {} with continuation token {:?}",
-                prefix, bucket, continuation_token
-            );
-
-            let list_objects_req = client.list_objects_v2().bucket(bucket).prefix(&prefix);
-
-            let list_objects_req = if let Some(token) = &continuation_token {
-                list_objects_req.continuation_token(token)
-            } else {
-                list_objects_req
-            };
-
-            let response = list_objects_req.send().await.map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
-
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    prefix = %prefix,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 list_objects_v2 failed"
-                );
-
-                if err_msg.contains("dispatch failure") {
-                    anyhow::anyhow!(
-                        "S3 request failed: {}. This often indicates expired AWS credentials. \
-                         Try running 'aws sso login' or check your AWS_* environment variables.",
-                        err_msg
-                    )
-                } else if err_msg.contains("service error") {
-                    // Extract more detail from service errors
-                    anyhow::anyhow!(
-                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
-                        bucket,
-                        prefix,
-                        err_msg
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "S3 list_objects_v2 to bucket '{}' prefix '{}' failed: {}",
-                        bucket,
-                        prefix,
-                        err_msg
-                    )
-                }
-            })?;
-            debug!(
-                "Got {} objects for {} in {}",
-                response.contents().len(),
-                prefix,
-                bucket
-            );
-
-            if !response.contents().is_empty() {
-                let mapped = response
-                    .contents()
-                    .iter()
-                    .map(|o| {
-                        // +1 to remove the trailing slash
-                        let filename = o.key().unwrap_or_default();
-                        let filename_only = if let Some(stripped) = filename.strip_prefix(&prefix) {
-                            if stripped.starts_with('/') {
-                                &stripped[1..]
-                            } else {
-                                stripped
-                            }
-                        } else {
-                            filename
-                        };
-
-                        (
-                            S3ObjectInfo {
-                                bucket: bucket.clone(),
-                                key: filename.to_string(),
-                                size: o.size().unwrap_or_default() as usize,
-                                last_modified: o
-                                    .last_modified()
-                                    .map(|dt| {
-                                        chrono::DateTime::from_timestamp_nanos(dt.as_nanos() as i64)
-                                    })
-                                    .unwrap_or_default(),
-                            },
-                            filename_only.to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                for (obj_info, _) in &mapped {
-                    total_size += obj_info.size;
-                }
-
-                result.extend(mapped);
-            }
-
-            continuation_token = response.next_continuation_token().map(|s| s.to_owned());
-
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        debug!(
-            "Before filter: Found {} files for {} in {} ({} bytes)",
-            result.len(),
-            prefix,
-            bucket,
-            total_size
-        );
-
-        // Apply filters if needed
-        let filtered = if will_filter {
-            let filtered_items = result
-                .into_iter()
-                .filter(|(obj_info, filename_only)| {
-                    // First check if it matches our extension filters
-                    let key = &obj_info.key;
-                    let ext_match = key.ends_with(".json.zst")
-                        || key.ends_with(".json.gz")
-                        || key.ends_with(".log.gz");
-
-                    // Then check if it matches any pattern filters if they exist
-                    let pattern_match = if let Some(patterns) = &filename_pattern_filter {
-                        patterns.iter().any(|regex| regex.is_match(filename_only))
-                    } else {
-                        true
-                    };
-
-                    ext_match && pattern_match
-                })
-                .map(|(obj_info, _)| obj_info)
-                .collect::<Vec<_>>();
-
-            let filtered_size = filtered_items.iter().map(|item| item.size).sum();
-
-            debug!(
-                "After filter: Found {} files for {} in {} ({} bytes)",
-                filtered_items.len(),
-                prefix,
-                bucket,
-                filtered_size
-            );
-
-            (filtered_items, filtered_size)
-        } else {
-            let items = result.into_iter().map(|(obj_info, _)| obj_info).collect();
-            (items, total_size)
-        };
-
-        // Calculate a checksum of all filenames to enable identifying changes in file lists
-        let files_checksum = {
-            let mut filenames = filtered.0.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
-            filenames.sort();
-            let joined = filenames.join("");
-            format!("{:x}", md5::compute(joined))
-        };
-
-        Ok(S3FileList {
-            bucket: bucket.clone(),
-            checksum: files_checksum.clone(),
-            files: filtered.0,
-            total_archives_size: filtered.1,
-        })
-    }
-
     /// Get matching files from S3 with simple parameters
     pub async fn get_matching_filenames_from_s3(
         &self,
@@ -321,13 +131,24 @@ impl WrappedS3Client {
     ) -> Result<Vec<S3ObjectInfo>> {
         let client = self.get_client().await?;
 
-        debug!("Listing objects in s3://{}/{}", bucket, prefix);
+        // Compile regex filter up front (before pagination loop)
+        let filter_regex = filter_pattern
+            .map(Regex::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid filter regex '{}': {}", filter_pattern.unwrap_or(""), e))?;
 
-        let mut result = Vec::new();
+        debug!(bucket = %bucket, prefix = %prefix, "Listing objects");
+
+        let mut all_keys = Vec::new();
+        let mut matched = Vec::new();
         let mut continuation_token = None;
+        let mut pages = 0u32;
 
         loop {
-            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+            let mut request = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix);
 
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
@@ -340,150 +161,84 @@ impl WrappedS3Client {
                     if let (Some(key), Some(size), Some(last_modified)) =
                         (obj.key, obj.size, obj.last_modified)
                     {
-                        // Apply filter if provided
-                        if let Some(pattern) = filter_pattern {
-                            if !key.contains(pattern) {
-                                continue;
-                            }
-                        }
-
-                        result.push(S3ObjectInfo {
+                        let obj_info = S3ObjectInfo {
                             bucket: bucket.to_string(),
                             key,
                             size: size as usize,
                             last_modified: chrono::DateTime::from_timestamp_nanos(
                                 last_modified.as_nanos() as i64,
                             ),
-                        });
+                            prefix: prefix.to_string(),
+                        };
+
+                        // Apply regex filter if provided
+                        if let Some(ref regex) = filter_regex {
+                            all_keys.push(obj_info.key.clone());
+                            if regex.is_match(&obj_info.key) {
+                                matched.push(obj_info);
+                            }
+                        } else {
+                            matched.push(obj_info);
+                        }
                     }
                 }
             }
 
+            pages += 1;
+
             if response.is_truncated.unwrap_or(false) {
                 continuation_token = response.next_continuation_token;
+                debug!(
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    page = pages,
+                    keys = matched.len(),
+                    "Listing page, continuing"
+                );
             } else {
                 break;
             }
         }
 
-        debug!(
-            "Found {} objects in s3://{}/{}",
-            result.len(),
-            bucket,
-            prefix
-        );
-        Ok(result)
+        if filter_pattern.is_some() {
+            debug!(
+                bucket = %bucket,
+                prefix = %prefix,
+                matched = matched.len(),
+                total = all_keys.len(),
+                pages = pages,
+                "Listed with filter"
+            );
+        } else {
+            debug!(
+                bucket = %bucket,
+                prefix = %prefix,
+                objects = matched.len(),
+                pages = pages,
+                "Listed"
+            );
+        }
+        Ok(matched)
     }
 
-    /// Downloads an object using a provided client - use this when making multiple downloads
-    /// to avoid repeated get_client() overhead and reduce DNS lookups
-    pub async fn download_object_with_client(
-        &self,
-        client: &Client,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Vec<u8>> {
-        debug!("Downloading object s3://{}/{}", bucket, key);
+}
 
-        let response = client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
+/// Build TLS context, adding a custom CA cert if `AWS_CA_BUNDLE` is set
+/// or auto-detecting `~/.mitmproxy/mitmproxy-ca-cert.pem` when a proxy env var is present.
+fn build_tls_context() -> Result<TlsContext> {
+    let mut trust_store = TrustStore::default();
 
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 get_object failed"
-                );
-
-                if err_msg.contains("dispatch failure") {
-                    anyhow::anyhow!(
-                        "S3 download failed: {}. This often indicates expired AWS credentials. \
-                         Try running 'aws sso login' or check your AWS_* environment variables.",
-                        err_msg
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "S3 get_object from bucket '{}' key '{}' failed: {}",
-                        bucket,
-                        key,
-                        err_msg
-                    )
-                }
-            })?;
-
-        let bytes = response.body.collect().await?.into_bytes().to_vec();
-
-        debug!(
-            "Downloaded {} bytes from s3://{}/{}",
-            bytes.len(),
-            bucket,
-            key
-        );
-
-        Ok(bytes)
+    if let Some(path) = crate::utils::proxy::resolve_ca_bundle_path() {
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("Failed to read CA bundle: {path}"))?;
+        info!(path = %path, "Loaded custom CA bundle for S3 client");
+        trust_store = trust_store.with_pem_certificate(pem);
     }
 
-    /// Uploads an object to S3
-    pub async fn upload_object(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
-        let client = self.get_client().await?;
-        self.upload_object_with_client(&client, bucket, key, data)
-            .await
-    }
-
-    /// Uploads an object using a provided client
-    pub async fn upload_object_with_client(
-        &self,
-        client: &Client,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        debug!("Uploading object to s3://{}/{}", bucket, key);
-
-        let body = aws_sdk_s3::primitives::ByteStream::from(data);
-
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body)
-            .content_type("application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{:#}", e); // Use alternate format for full error chain
-                let err_debug = format!("{:?}", e); // Debug format for maximum details
-
-                // Log detailed error information for debugging
-                warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    error_message = %err_msg,
-                    error_debug = %err_debug,
-                    "S3 put_object failed"
-                );
-
-                anyhow::anyhow!(
-                    "S3 put_object to bucket '{}' key '{}' failed: {}",
-                    bucket,
-                    key,
-                    err_msg
-                )
-            })?;
-
-        info!("Uploaded check result to s3://{}/{}", bucket, key);
-
-        Ok(())
-    }
+    TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build TLS context: {e}"))
 }
 
 /// Check if an S3 error is recoverable (can be skipped/retried) or fatal (should crash).
@@ -527,4 +282,64 @@ pub fn is_recoverable_s3_error(error_msg: &str) -> bool {
 
     // All other errors are considered recoverable (transient)
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fatal_s3_errors_are_not_recoverable() {
+        let fatal = [
+            "AccessDenied",
+            "Access Denied",
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "NoSuchBucket",
+            "InvalidBucketName",
+            "AccountProblem",
+            "InvalidSecurity",
+            "NotSignedUp",
+            "InvalidIdentityToken",
+            "MalformedPolicy",
+            "InvalidClientTokenId",
+        ];
+        for pattern in &fatal {
+            assert!(
+                !is_recoverable_s3_error(pattern),
+                "'{pattern}' should be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_s3_errors_are_recoverable() {
+        let transient = [
+            "Throttling",
+            "SlowDown",
+            "ServiceUnavailable",
+            "InternalError",
+            "connection reset",
+            "timeout",
+        ];
+        for pattern in &transient {
+            assert!(
+                is_recoverable_s3_error(pattern),
+                "'{pattern}' should be recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_error_is_recoverable() {
+        assert!(is_recoverable_s3_error(""));
+    }
+
+    #[test]
+    fn fatal_pattern_as_substring() {
+        assert!(!is_recoverable_s3_error("Something AccessDenied happened"));
+        assert!(!is_recoverable_s3_error("Error: NoSuchBucket for arn:..."));
+    }
 }

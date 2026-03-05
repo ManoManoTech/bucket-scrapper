@@ -1,6 +1,6 @@
-// src/lib.rs
 pub mod config;
+pub mod matcher;
 pub mod s3;
-pub mod search;
-pub mod search_executor;
+pub mod pipeline;
+pub mod progress;
 pub mod utils;

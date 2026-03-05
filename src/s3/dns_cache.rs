@@ -1,4 +1,3 @@
-// src/s3/dns_cache.rs
 //! DNS caching layer to reduce load on CoreDNS when running many concurrent processes.
 //!
 //! Uses hickory-resolver with moka cache for application-level DNS caching.
@@ -34,7 +33,7 @@ impl CachingDnsResolver {
     /// * `ttl_seconds` - How long to cache DNS results (default: 300 = 5 minutes)
     pub async fn new(ttl_seconds: u64) -> Result<Self> {
         let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-            .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {e}"))?;
 
         let cache = Cache::builder()
             .max_capacity(10_000)
@@ -65,12 +64,12 @@ impl CachingDnsResolver {
             .resolver
             .lookup_ip(hostname)
             .await
-            .map_err(|e| anyhow::anyhow!("DNS lookup failed for {}: {}", hostname, e))?;
+            .map_err(|e| anyhow::anyhow!("DNS lookup failed for {hostname}: {e}"))?;
 
         let addresses: Vec<IpAddr> = lookup.iter().collect();
 
         if addresses.is_empty() {
-            return Err(anyhow::anyhow!("No addresses found for {}", hostname));
+            return Err(anyhow::anyhow!("No addresses found for {hostname}"));
         }
 
         // Cache the result
