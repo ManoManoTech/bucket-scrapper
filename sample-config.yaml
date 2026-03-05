@@ -1,32 +1,54 @@
-# Example configuration file for the log consolidator checker
-bucketsToConsolidate:
-  - bucket: source-logs-bucket-1
+# bucket-scrapper configuration
+#
+# Each bucket entry describes an S3 bucket and how its objects are organized.
+# The `path` array builds the S3 key prefix used to list objects for each
+# date/hour in the requested time range.
+#
+# Path components:
+#   - static_path: a literal prefix segment (e.g. "logs", "prod")
+#   - datefmt:     a date-templated segment. Two conventions are recognized:
+#
+#       Hive-style partitioning:
+#         datefmt: "dt=20060102/hour=15"
+#         Produces keys like:  logs/dt=20240315/hour=09/service-a.json.zst
+#
+#       Go reference-time layout (YYYY/MM/DD/HH):
+#         datefmt: "2006/01/02/15"
+#         Produces keys like:  logs/2024/03/15/09/service-a.json.gz
+#
+#       The placeholder values (2006, 01, 02, 15) come from Go's reference
+#       date "Mon Jan 2 15:04:05 MST 2006" and are replaced at runtime with
+#       the actual year, month, day, and hour being searched.
+#
+# Object filtering:
+#   only_prefix_patterns is an optional list of regexes matched against the
+#   object key *after* the generated prefix. Only objects whose suffix matches
+#   at least one pattern will be downloaded.
+
+buckets:
+  # Example: Hive-partitioned logs (dt=YYYYMMDD/hour=HH)
+  - bucket: my-logs-bucket
     path:
-      - static: logs
-      - datefmt: 2006/01/02/15
+      - static_path: application-logs/prod
+      - datefmt: "dt=20060102/hour=15"
     only_prefix_patterns:
-      - "^app-.*\\.json\\.gz$"
-      - "^api-.*\\.json\\.zst$"
-    proceed_without_matching_objects: false
-  - bucket: source-logs-bucket-2
+      - "^service-a.*\\.json\\.zst$"
+      - "^service-b.*\\.json\\.gz$"
+
+  # Example: date-path layout (YYYY/MM/DD/HH)
+  - bucket: my-other-logs-bucket
     path:
-      - static: application-logs
-      - static: prod
-      - datefmt: dt=20060102/hour=15
-    proceed_without_matching_objects: true
-bucketsConsolidated:
-  - bucket: destination-logs-bucket
-    path:
-      - static: consolidated-logs
-      - datefmt: dt=20060102/hour=15
-    proceed_without_matching_objects: false
-bucketsCheckerResults:
-  - bucket: logs-check-results-bucket
-    path:
-      - static: check-results
-      - datefmt: dt=20060102/hour=15
-    proceed_without_matching_objects: true
-# Additional configuration parameters
-continuousConsolidation:
-  minAge: 1h
-  maxAge: 72h
+      - static_path: raw
+      - datefmt: "2006/01/02/15"
+
+# Default AWS region (can be overridden with --region)
+region: eu-west-3
+
+# Output directory for file mode (written as zstd-compressed files grouped by date/hour)
+output_dir: ./scrapper-output
+
+# Optional: HTTP output defaults (activate with --http-output)
+http_output:
+  url: https://logs.example.com/api/v1/logs
+  bearer_auth: your-token
+  timeout_secs: 30
