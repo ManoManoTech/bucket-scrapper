@@ -384,7 +384,7 @@ impl Default for UploaderCounters {
 
 /// Manages streaming writes of search results to an HTTP API
 pub struct HttpResultWriter {
-    write_tx: flume::Sender<String>,
+    write_tx: flume::Sender<Vec<u8>>,
     /// Kept for `observer()` — dropped in `finish()` before joining compressors
     batch_tx: flume::Sender<CompressedBatch>,
     compressor_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -417,7 +417,7 @@ impl HttpResultWriter {
             .context("Failed to create HTTP client")?;
 
         // Line channel: searchers → compressors
-        let (write_tx, line_rx) = flume::bounded::<String>(config.channel_buffer_size);
+        let (write_tx, line_rx) = flume::bounded::<Vec<u8>>(config.channel_buffer_size);
         // Batch channel: compressors → uploaders
         let (batch_tx, batch_rx) = flume::bounded::<CompressedBatch>(config.upload_channel_size);
 
@@ -486,7 +486,7 @@ impl HttpResultWriter {
     }
 
     /// Get a sender that can be cloned for use in multiple tasks
-    pub fn get_sender(&self) -> flume::Sender<String> {
+    pub fn get_sender(&self) -> flume::Sender<Vec<u8>> {
         self.write_tx.clone()
     }
 
@@ -511,7 +511,7 @@ impl HttpResultWriter {
     /// zstd batches, and sends CompressedBatch to the batch channel for uploaders.
     async fn compressor_task(
         task_id: usize,
-        line_rx: flume::Receiver<String>,
+        line_rx: flume::Receiver<Vec<u8>>,
         batch_tx: flume::Sender<CompressedBatch>,
         config: HttpWriterConfig,
         lines_dropped: Arc<AtomicUsize>,
@@ -545,7 +545,7 @@ impl HttpResultWriter {
             let mut batch_plaintext_bytes = 0usize;
 
             // Write first line (Vec<u8> writes are infallible barring OOM)
-            encoder.write_all(first_line.as_bytes()).expect("write to Vec");
+            encoder.write_all(&first_line).expect("write to Vec");
             batch_lines += 1;
             batch_plaintext_bytes += first_line.len();
 
@@ -578,7 +578,7 @@ impl HttpResultWriter {
                     }
                 };
 
-                encoder.write_all(line.as_bytes()).expect("write to Vec");
+                encoder.write_all(&line).expect("write to Vec");
                 batch_lines += 1;
                 batch_plaintext_bytes += line.len();
             }
@@ -1159,7 +1159,7 @@ mod tests {
         let num_lines = 50;
         for i in 0..num_lines {
             sender
-                .send_async(format!("{{\"msg\": \"test line {i}\"}}\n"))
+                .send_async(format!("{{\"msg\": \"test line {i}\"}}\n").into_bytes())
                 .await
                 .expect("send should succeed");
         }

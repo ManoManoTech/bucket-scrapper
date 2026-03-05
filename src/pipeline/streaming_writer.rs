@@ -51,11 +51,11 @@ impl SharedFileWriter {
 
     /// Write a single match to the appropriate zstd file.
     /// Called from spawn_blocking search tasks — fully synchronous.
-    pub fn write_match(&self, prefix: &str, content: &str) -> Result<()> {
+    pub fn write_match(&self, prefix: &str, content: &[u8]) -> Result<()> {
         let encoder_arc = self.get_or_create_encoder(prefix)?;
 
         let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
-        encoder.write_all(content.as_bytes())?;
+        encoder.write_all(content)?;
 
         self.lines_written.fetch_add(1, Ordering::Relaxed);
         self.bytes_written.fetch_add(content.len(), Ordering::Relaxed);
@@ -161,7 +161,7 @@ mod tests {
 
         let line = "{\"msg\":\"hello\"}\n";
         for _ in 0..10 {
-            writer.write_match("2025-02-23/14", line).unwrap();
+            writer.write_match("2025-02-23/14", line.as_bytes()).unwrap();
         }
 
         let stats = writer.finish().unwrap();
@@ -187,7 +187,7 @@ mod tests {
 
         let prefixes = ["2025-02-23/10", "2025-02-23/11", "2025-02-23/12"];
         for prefix in &prefixes {
-            writer.write_match(prefix, "line\n").unwrap();
+            writer.write_match(prefix, b"line\n").unwrap();
         }
 
         let stats = writer.finish().unwrap();
@@ -207,7 +207,7 @@ mod tests {
         // Write enough repeated data that zstd compresses well
         let line = "{\"timestamp\":\"2025-02-23T14:00:00Z\",\"level\":\"INFO\",\"msg\":\"test\"}\n";
         for _ in 0..100 {
-            writer.write_match("2025-02-23/14", line).unwrap();
+            writer.write_match("2025-02-23/14", line.as_bytes()).unwrap();
         }
 
         let stats = writer.finish().unwrap();

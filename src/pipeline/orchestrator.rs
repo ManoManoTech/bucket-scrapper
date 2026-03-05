@@ -22,13 +22,13 @@ use tracing::{debug, info, warn};
 
 /// A single decompressed line tagged with its source file.
 struct DecompressedLine {
-    text: String,
+    data: Vec<u8>,
     source: Arc<S3ObjectInfo>,
 }
 
 /// Where filter workers send their matches.
 enum FilterOutput {
-    Http(flume::Sender<String>),
+    Http(flume::Sender<Vec<u8>>),
     File(SharedFileWriter),
 }
 
@@ -94,7 +94,7 @@ impl StreamingDownloader {
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<LineMatcher>,
-        http_sender: flume::Sender<String>,
+        http_sender: flume::Sender<Vec<u8>>,
         observer: PipelineObserver,
         fatal_error: Arc<AtomicBool>,
     ) -> Result<(usize, usize)> {
@@ -462,7 +462,7 @@ impl StreamingDownloader {
         };
 
         let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut buf = Vec::new();
         let mut lines_emitted = 0u64;
         loop {
             // Check fatal error every 1024 lines (AtomicBool load is cheap but
@@ -475,13 +475,13 @@ impl StreamingDownloader {
                 }
             }
 
-            line.clear();
-            if buf_reader.read_line(&mut line)? == 0 {
+            buf.clear();
+            if buf_reader.read_until(b'\n', &mut buf)? == 0 {
                 break;
             }
             line_tx
                 .send(DecompressedLine {
-                    text: line.clone(),
+                    data: buf.clone(),
                     source: source.clone(),
                 })
                 .map_err(|_| anyhow::anyhow!("Filter workers gone, channel closed"))?;
@@ -599,15 +599,15 @@ impl StreamingDownloader {
                     }
                 }
 
-                if searcher.matches_line(line.text.as_bytes()) {
+                if searcher.matches_line(&line.data) {
                     match output.as_ref() {
                         FilterOutput::Http(sender) => {
                             sender
-                                .send(line.text)
+                                .send(line.data)
                                 .map_err(|_| anyhow::anyhow!("HTTP consumer gone, channel closed"))?;
                         }
                         FilterOutput::File(writer) => {
-                            writer.write_match(&line.source.prefix, &line.text)?;
+                            writer.write_match(&line.source.prefix, &line.data)?;
                         }
                     }
                     local += 1;
