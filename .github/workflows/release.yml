@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            arch: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar czf ../../bucket-scrapper-${{ matrix.target }}.tar.gz bucket-scrapper
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-scrapper-${{ matrix.target }}
+          path: bucket-scrapper-${{ matrix.target }}.tar.gz
+
+      - name: Upload raw binary (Linux only)
+        if: matrix.arch == 'amd64' || matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: target/release/bucket-scrapper
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bucket-scrapper-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: bucket-scrapper-*.tar.gz
+
+  docker:
+    name: Docker (${{ matrix.arch }})
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: infra/docker/
+
+      - name: Rename binary for Dockerfile
+        run: mv infra/docker/bucket-scrapper infra/docker/bucket-scrapper-${{ matrix.arch }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push single-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: infra/docker
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ matrix.arch }}
+          build-args: TARGETARCH=${{ matrix.arch }}
+
+  docker-manifest:
+    name: Docker manifest
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAG=${{ github.ref_name }}
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          docker manifest create ${IMAGE}:${TAG} \
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
+          docker manifest push ${IMAGE}:${TAG}
+
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
+          docker manifest push ${IMAGE}:latest
