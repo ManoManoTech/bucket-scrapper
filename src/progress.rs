@@ -76,10 +76,9 @@ impl PipelineProgress {
     }
 
     pub fn report(&mut self) {
-        let pct = (self.bytes_processed * 100) / self.total_bytes.max(1);
-        let interval_s = self.last_report_time.elapsed().as_secs_f64();
-
         let dl_now = self.download_observer.bytes();
+        let pct = ((dl_now * 100) / self.total_bytes.max(1)).min(100);
+        let interval_s = self.last_report_time.elapsed().as_secs_f64();
         let download_delta = dl_now - self.prev_downloaded_bytes;
         let download_mbps = if interval_s > 0.0 {
             download_delta as f64 / 1_000_000.0 / interval_s
@@ -121,7 +120,7 @@ impl PipelineProgress {
                 files_done = self.files_processed,
                 files_total = self.total_files,
                 pct = pct,
-                input_mb_done = self.bytes_processed / 1_000_000,
+                input_mb_done = dl_now / 1_000_000,
                 input_mb_total = self.total_bytes / 1_000_000,
                 download_mbps = format_args!("{download_mbps:.1}"),
                 matches = self.match_count.load(Ordering::Relaxed),
@@ -149,7 +148,7 @@ impl PipelineProgress {
                 files_done = self.files_processed,
                 files_total = self.total_files,
                 pct = pct,
-                input_mb_done = self.bytes_processed / 1_000_000,
+                input_mb_done = dl_now / 1_000_000,
                 input_mb_total = self.total_bytes / 1_000_000,
                 download_mbps = format_args!("{download_mbps:.1}"),
                 matches = self.match_count.load(Ordering::Relaxed),
