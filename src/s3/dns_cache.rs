@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 /// Cache entries have a configurable TTL (default 5 minutes).
 #[derive(Clone)]
 pub struct CachingDnsResolver {
-    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
+    resolver: Arc<hickory_resolver::TokioResolver>,
     cache: Cache<String, Vec<IpAddr>>,
     ttl_seconds: u64,
 }
@@ -32,8 +32,9 @@ impl CachingDnsResolver {
     /// # Arguments
     /// * `ttl_seconds` - How long to cache DNS results (default: 300 = 5 minutes)
     pub async fn new(ttl_seconds: u64) -> Result<Self> {
-        let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-            .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {e}"))?;
+        let resolver = hickory_resolver::TokioResolver::builder_tokio()
+            .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {e}"))?
+            .build();
 
         let cache = Cache::builder()
             .max_capacity(10_000)
