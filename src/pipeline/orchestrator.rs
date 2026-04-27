@@ -192,6 +192,9 @@ impl StreamingDownloader {
 
         let download_observer = DownloadObserver::new();
         let match_count = Arc::new(AtomicUsize::new(0));
+        let match_bytes = Arc::new(AtomicUsize::new(0));
+        let filter_lines_in = Arc::new(AtomicUsize::new(0));
+        let filter_bytes_in = Arc::new(AtomicUsize::new(0));
         let workers_alive = Arc::new(AtomicUsize::new(self.config.filter_tasks));
 
         let progress = Arc::new(Mutex::new(PipelineProgress::new(
@@ -202,6 +205,9 @@ impl StreamingDownloader {
             ChannelObserver::from_sender(&line_tx),
             download_observer.clone(),
             match_count.clone(),
+            match_bytes.clone(),
+            filter_lines_in.clone(),
+            filter_bytes_in.clone(),
             workers_alive.clone(),
         )));
 
@@ -247,12 +253,25 @@ impl StreamingDownloader {
             let searcher = searcher.clone();
             let output = output.clone();
             let match_count = match_count.clone();
+            let match_bytes = match_bytes.clone();
+            let filter_lines_in = filter_lines_in.clone();
+            let filter_bytes_in = filter_bytes_in.clone();
             let fe = fatal_error.clone();
             let wa = workers_alive.clone();
 
             worker_set.spawn(async move {
-                let result =
-                    Self::filter_worker(worker_id, rx, searcher, output, match_count, fe).await;
+                let result = Self::filter_worker(
+                    worker_id,
+                    rx,
+                    searcher,
+                    output,
+                    match_count,
+                    match_bytes,
+                    filter_lines_in,
+                    filter_bytes_in,
+                    fe,
+                )
+                .await;
                 wa.fetch_sub(1, Ordering::Relaxed);
                 match &result {
                     Ok(matches) => {
@@ -352,8 +371,14 @@ impl StreamingDownloader {
         // Stop the progress ticker
         progress_ticker.abort();
 
-        // files_searched = total files processed by coordinator
-        let files_searched = progress.lock().await.files_processed;
+        // Emit a final progress report so the last log line carries the accurate
+        // end-of-run totals (filter input volume, matched ratios, etc.) — useful
+        // for short runs where the periodic ticker may only have fired at t=0.
+        let files_searched = {
+            let mut prog = progress.lock().await;
+            prog.report();
+            prog.files_processed
+        };
 
         Ok((files_searched, total_matches))
     }
@@ -736,12 +761,16 @@ impl StreamingDownloader {
     /// Checks `fatal_error` every 1024 lines so the worker exits promptly when
     /// the HTTP pipeline is dead, even with low match rates where the send-side
     /// error would not be hit often.
+    #[allow(clippy::too_many_arguments)]
     async fn filter_worker(
         worker_id: usize,
         rx: flume::Receiver<DecompressedLine>,
         searcher: Arc<LineMatcher>,
         output: Arc<FilterOutput>,
         match_count: Arc<AtomicUsize>,
+        match_bytes: Arc<AtomicUsize>,
+        filter_lines_in: Arc<AtomicUsize>,
+        filter_bytes_in: Arc<AtomicUsize>,
         fatal_error: Option<Arc<AtomicBool>>,
     ) -> Result<usize> {
         let result = tokio::task::spawn_blocking(move || -> Result<usize> {
@@ -759,6 +788,10 @@ impl StreamingDownloader {
                     }
                 }
 
+                let line_len = line.data.len();
+                filter_lines_in.fetch_add(1, Ordering::Relaxed);
+                filter_bytes_in.fetch_add(line_len, Ordering::Relaxed);
+
                 if searcher.matches_line(&line.data) {
                     match output.as_ref() {
                         FilterOutput::Http(sender) => {
@@ -772,6 +805,7 @@ impl StreamingDownloader {
                     }
                     local += 1;
                     match_count.fetch_add(1, Ordering::Relaxed);
+                    match_bytes.fetch_add(line_len, Ordering::Relaxed);
                 }
             }
             Ok(local)

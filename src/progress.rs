@@ -31,6 +31,12 @@ pub struct PipelineProgress {
     pub bytes_processed: usize,
     /// Shared atomic counter incremented by filter workers.
     pub match_count: Arc<AtomicUsize>,
+    /// Total bytes of matching lines (for byte-level selectivity).
+    pub match_bytes: Arc<AtomicUsize>,
+    /// Total lines that entered the filter stage (regardless of pattern).
+    pub filter_lines_in: Arc<AtomicUsize>,
+    /// Total bytes that entered the filter stage (regardless of pattern).
+    pub filter_bytes_in: Arc<AtomicUsize>,
     pub start_time: std::time::Instant,
     pub last_report_time: std::time::Instant,
     pub report_interval: Duration,
@@ -41,6 +47,8 @@ pub struct PipelineProgress {
     pub prev_downloaded_bytes: usize,
     /// Snapshot of compressed_bytes_sent at last report (for upload_mbps)
     pub prev_uploaded_bytes: usize,
+    /// Snapshot of filter_bytes_in at last report (for filter_in_mbps)
+    pub prev_filter_bytes_in: usize,
     /// Number of filter workers still alive (decremented on worker exit).
     pub workers_alive: Arc<AtomicUsize>,
 }
@@ -55,6 +63,9 @@ impl PipelineProgress {
         decompressed_ch: ChannelObserver,
         download_observer: DownloadObserver,
         match_count: Arc<AtomicUsize>,
+        match_bytes: Arc<AtomicUsize>,
+        filter_lines_in: Arc<AtomicUsize>,
+        filter_bytes_in: Arc<AtomicUsize>,
         workers_alive: Arc<AtomicUsize>,
     ) -> Self {
         let now = std::time::Instant::now();
@@ -64,6 +75,9 @@ impl PipelineProgress {
             total_bytes,
             bytes_processed: 0,
             match_count,
+            match_bytes,
+            filter_lines_in,
+            filter_bytes_in,
             start_time: now,
             last_report_time: now,
             report_interval,
@@ -72,6 +86,7 @@ impl PipelineProgress {
             download_observer,
             prev_downloaded_bytes: 0,
             prev_uploaded_bytes: 0,
+            prev_filter_bytes_in: 0,
             workers_alive,
         }
     }
@@ -95,6 +110,19 @@ impl PipelineProgress {
         } else {
             0.0
         };
+
+        let matches_now = self.match_count.load(Ordering::Relaxed);
+        let match_bytes_now = self.match_bytes.load(Ordering::Relaxed);
+        let filter_lines_now = self.filter_lines_in.load(Ordering::Relaxed);
+        let filter_bytes_now = self.filter_bytes_in.load(Ordering::Relaxed);
+        let filter_in_delta = filter_bytes_now.saturating_sub(self.prev_filter_bytes_in);
+        let filter_in_mbps = if interval_s > 0.0 {
+            filter_in_delta as f64 / 1_000_000.0 / interval_s
+        } else {
+            0.0
+        };
+        let matched_ratio_lines = matches_now as f64 / filter_lines_now.max(1) as f64;
+        let matched_ratio_bytes = match_bytes_now as f64 / filter_bytes_now.max(1) as f64;
 
         let dc_cap = self.decompressed_ch.capacity().max(1);
         let dc_len = self.decompressed_ch.len();
@@ -125,7 +153,13 @@ impl PipelineProgress {
                 input_mb_done = dl_now / 1_000_000,
                 input_mb_total = self.total_bytes / 1_000_000,
                 download_mbps = format_args!("{download_mbps:.1}"),
-                matches = self.match_count.load(Ordering::Relaxed),
+                matches = matches_now,
+                match_mb = match_bytes_now / 1_000_000,
+                filter_lines_in = filter_lines_now,
+                filter_in_mb = filter_bytes_now / 1_000_000,
+                filter_in_mbps = format_args!("{filter_in_mbps:.1}"),
+                matched_ratio_lines = format_args!("{matched_ratio_lines:.4}"),
+                matched_ratio_bytes = format_args!("{matched_ratio_bytes:.4}"),
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
                 line_ch_len = pipe.line_len(),
                 line_ch_cap = pipe.line_capacity(),
@@ -155,7 +189,13 @@ impl PipelineProgress {
                 input_mb_done = dl_now / 1_000_000,
                 input_mb_total = self.total_bytes / 1_000_000,
                 download_mbps = format_args!("{download_mbps:.1}"),
-                matches = self.match_count.load(Ordering::Relaxed),
+                matches = matches_now,
+                match_mb = match_bytes_now / 1_000_000,
+                filter_lines_in = filter_lines_now,
+                filter_in_mb = filter_bytes_now / 1_000_000,
+                filter_in_mbps = format_args!("{filter_in_mbps:.1}"),
+                matched_ratio_lines = format_args!("{matched_ratio_lines:.4}"),
+                matched_ratio_bytes = format_args!("{matched_ratio_bytes:.4}"),
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
                 workers_alive = self.workers_alive.load(Ordering::Relaxed),
                 open_fds = open_fds(),
@@ -167,6 +207,7 @@ impl PipelineProgress {
         }
 
         self.prev_downloaded_bytes = dl_now;
+        self.prev_filter_bytes_in = filter_bytes_now;
         self.last_report_time = std::time::Instant::now();
     }
 }
