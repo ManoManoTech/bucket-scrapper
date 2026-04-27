@@ -46,13 +46,32 @@ pub struct ChannelObserver {
 impl ChannelObserver {
     /// Create an observer from any `flume::Receiver<T>`.
     ///
-    /// Uses the receiver side so that holding this observer does not prevent
-    /// channel closure (which requires all *senders* to be dropped).
+    /// **Warning:** clones the receiver, which keeps the channel alive even if
+    /// all "real" receivers are dropped.  Prefer [`from_sender`](Self::from_sender)
+    /// when possible — it observes the same `len()` without affecting channel
+    /// lifetime.
+    #[deprecated(
+        note = "use from_sender; from_receiver clones the receiver and keeps the channel alive"
+    )]
     pub fn from_receiver<T: Send + 'static>(rx: &flume::Receiver<T>) -> Self {
         let rx = rx.clone();
         let cap = rx.capacity().unwrap_or(0);
         Self {
             len: Box::new(move || rx.len()),
+            cap,
+        }
+    }
+
+    /// Create an observer from any `flume::Sender<T>`.
+    ///
+    /// Observes the same `len()` / `capacity()` as the receiver side but does
+    /// **not** keep the channel alive — when all real receivers drop, senders
+    /// get `SendError` as expected.
+    pub fn from_sender<T: Send + 'static>(tx: &flume::Sender<T>) -> Self {
+        let tx = tx.clone();
+        let cap = tx.capacity().unwrap_or(0);
+        Self {
+            len: Box::new(move || tx.len()),
             cap,
         }
     }
@@ -156,5 +175,59 @@ impl PipelineObserver {
         } else {
             Some(rate / 1_000_000.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_sender_allows_channel_close_on_receiver_drop() {
+        let (tx, rx) = flume::bounded::<u8>(4);
+        let _observer = ChannelObserver::from_sender(&tx);
+
+        // Drop the only real receiver.
+        drop(rx);
+
+        // The channel should be closed — send must fail immediately.
+        assert!(
+            tx.send(1).is_err(),
+            "from_sender observer must not keep the channel alive"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn from_receiver_keeps_channel_alive_after_receiver_drop() {
+        let (tx, rx) = flume::bounded::<u8>(4);
+        let _observer = ChannelObserver::from_receiver(&rx);
+
+        // Drop the "real" receiver.
+        drop(rx);
+
+        // The observer still holds a cloned receiver, so the channel stays
+        // open and send succeeds (this is the bug that from_sender fixes).
+        assert!(
+            tx.send(1).is_ok(),
+            "from_receiver observer should keep the channel alive (demonstrating the bug)"
+        );
+    }
+
+    #[test]
+    fn from_sender_observes_len_and_capacity() {
+        let (tx, rx) = flume::bounded::<u8>(8);
+        let observer = ChannelObserver::from_sender(&tx);
+
+        assert_eq!(observer.capacity(), 8);
+        assert_eq!(observer.len(), 0);
+        assert!(observer.is_empty());
+
+        tx.send(42).unwrap();
+        tx.send(43).unwrap();
+        assert_eq!(observer.len(), 2);
+
+        let _ = rx.recv().unwrap();
+        assert_eq!(observer.len(), 1);
     }
 }

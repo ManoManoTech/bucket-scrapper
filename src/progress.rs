@@ -15,6 +15,11 @@ fn rss_mb() -> usize {
         .unwrap_or(0)
 }
 
+// Linux-only: reads /proc/self/fd. Returns 0 on non-Linux (diagnostic only).
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count())
+}
+
 /// Progress tracking for search operations.
 ///
 /// Observes all pipeline stages (download, decompress channel, compress, upload)
@@ -36,9 +41,12 @@ pub struct PipelineProgress {
     pub prev_downloaded_bytes: usize,
     /// Snapshot of compressed_bytes_sent at last report (for upload_mbps)
     pub prev_uploaded_bytes: usize,
+    /// Number of filter workers still alive (decremented on worker exit).
+    pub workers_alive: Arc<AtomicUsize>,
 }
 
 impl PipelineProgress {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         total_files: usize,
         total_bytes: usize,
@@ -47,6 +55,7 @@ impl PipelineProgress {
         decompressed_ch: ChannelObserver,
         download_observer: DownloadObserver,
         match_count: Arc<AtomicUsize>,
+        workers_alive: Arc<AtomicUsize>,
     ) -> Self {
         let now = std::time::Instant::now();
         Self {
@@ -63,6 +72,7 @@ impl PipelineProgress {
             download_observer,
             prev_downloaded_bytes: 0,
             prev_uploaded_bytes: 0,
+            workers_alive,
         }
     }
 
@@ -134,6 +144,8 @@ impl PipelineProgress {
                 throttle_mbps = throttle_mbps.map(|r| format!("{r:.1}")),
                 batches = pipe.batches_uploaded(),
                 avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
+                workers_alive = self.workers_alive.load(Ordering::Relaxed),
+                open_fds = open_fds(),
                 rss_mb = rss_mb(),
                 bottleneck = bottleneck,
                 elapsed_s = self.start_time.elapsed().as_secs_f32(),
@@ -153,6 +165,8 @@ impl PipelineProgress {
                 download_mbps = format_args!("{download_mbps:.1}"),
                 matches = self.match_count.load(Ordering::Relaxed),
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
+                workers_alive = self.workers_alive.load(Ordering::Relaxed),
+                open_fds = open_fds(),
                 rss_mb = rss_mb(),
                 bottleneck = bottleneck,
                 elapsed_s = self.start_time.elapsed().as_secs_f32(),

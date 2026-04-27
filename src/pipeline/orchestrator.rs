@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 /// A single decompressed line tagged with its source file.
@@ -191,15 +192,17 @@ impl StreamingDownloader {
 
         let download_observer = DownloadObserver::new();
         let match_count = Arc::new(AtomicUsize::new(0));
+        let workers_alive = Arc::new(AtomicUsize::new(self.config.filter_tasks));
 
         let progress = Arc::new(Mutex::new(PipelineProgress::new(
             objects.len(),
             total_bytes,
             self.config.progress_interval,
             pipeline,
-            ChannelObserver::from_receiver(&line_rx),
+            ChannelObserver::from_sender(&line_tx),
             download_observer.clone(),
             match_count.clone(),
+            workers_alive.clone(),
         )));
 
         // Emit initial progress at t=0 so charts always have a starting point
@@ -209,7 +212,7 @@ impl StreamingDownloader {
         }
 
         // --- Spawn download coordinator ---
-        let download_handle = {
+        let mut download_handle = {
             let client = self.client.clone();
             let config = self.config.clone();
             let semaphore = self.download_semaphore.clone();
@@ -237,8 +240,7 @@ impl StreamingDownloader {
 
         // --- Spawn filter workers ---
         let output = Arc::new(output);
-        let mut worker_handles: Vec<tokio::task::JoinHandle<Result<usize>>> =
-            Vec::with_capacity(self.config.filter_tasks);
+        let mut worker_set: JoinSet<Result<usize>> = JoinSet::new();
 
         for worker_id in 0..self.config.filter_tasks {
             let rx = line_rx.clone();
@@ -246,10 +248,22 @@ impl StreamingDownloader {
             let output = output.clone();
             let match_count = match_count.clone();
             let fe = fatal_error.clone();
+            let wa = workers_alive.clone();
 
-            worker_handles.push(tokio::spawn(async move {
-                Self::filter_worker(worker_id, rx, searcher, output, match_count, fe).await
-            }));
+            worker_set.spawn(async move {
+                let result =
+                    Self::filter_worker(worker_id, rx, searcher, output, match_count, fe).await;
+                wa.fetch_sub(1, Ordering::Relaxed);
+                match &result {
+                    Ok(matches) => {
+                        info!(worker = worker_id, matches, "Filter worker exited");
+                    }
+                    Err(e) => {
+                        warn!(worker = worker_id, error = %e, "Filter worker failed");
+                    }
+                }
+                result
+            });
         }
 
         // Drop our clone of line_rx so channel closes when coordinator drops tx
@@ -271,37 +285,67 @@ impl StreamingDownloader {
             })
         };
 
-        // --- Join download coordinator ---
-        match download_handle.await {
-            Ok(Ok(files_processed)) => {
-                debug!(files = files_processed, "Download coordinator finished");
-            }
-            Ok(Err(e)) => {
-                progress_ticker.abort();
-                for h in &worker_handles {
-                    h.abort();
-                }
-                return Err(e);
-            }
-            Err(e) => {
-                progress_ticker.abort();
-                for h in &worker_handles {
-                    h.abort();
-                }
-                return Err(anyhow::anyhow!("Download coordinator panicked: {e}"));
-            }
-        }
-
-        // --- Join filter workers ---
+        // --- Join download coordinator + watch for early worker death ---
+        // Use select! so that if any filter worker dies before the download
+        // coordinator finishes, we detect it immediately instead of deadlocking
+        // (the coordinator would block on a full line channel forever).
+        //
+        // Invariant: if all workers exit before the coordinator, the line
+        // channel's receivers are gone, so the next `emit_lines` send returns
+        // SendError, which `download_coordinator` propagates as Err (see
+        // `emit_lines` — "Filter workers gone, channel closed"). The
+        // coordinator therefore exits promptly; this loop will not hang.
+        let mut download_done = false;
         let mut total_matches = 0usize;
 
-        for handle in worker_handles {
-            match handle.await {
-                Ok(Ok(matches)) => {
-                    total_matches += matches;
+        let total_workers = self.config.filter_tasks;
+        let mut workers_finished = 0usize;
+
+        loop {
+            tokio::select! {
+                dl_result = &mut download_handle, if !download_done => {
+                    match dl_result {
+                        Ok(Ok(files_processed)) => {
+                            debug!(files = files_processed, "Download coordinator finished");
+                            download_done = true;
+                        }
+                        Ok(Err(e)) => {
+                            progress_ticker.abort();
+                            worker_set.abort_all();
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            progress_ticker.abort();
+                            worker_set.abort_all();
+                            return Err(anyhow::anyhow!("Download coordinator panicked: {e}"));
+                        }
+                    }
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(anyhow::anyhow!("Filter worker panicked: {e}")),
+                Some(worker_result) = worker_set.join_next() => {
+                    workers_finished += 1;
+                    match worker_result {
+                        Ok(Ok(matches)) => {
+                            total_matches += matches;
+                        }
+                        Ok(Err(e)) => {
+                            progress_ticker.abort();
+                            download_handle.abort();
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            progress_ticker.abort();
+                            download_handle.abort();
+                            return Err(anyhow::anyhow!("Filter worker panicked: {e}"));
+                        }
+                    }
+                    if workers_finished == total_workers && !download_done {
+                        warn!("All filter workers exited before download coordinator finished");
+                    }
+                }
+            }
+
+            if download_done && workers_finished == total_workers {
+                break;
             }
         }
 
