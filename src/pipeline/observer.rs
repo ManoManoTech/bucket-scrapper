@@ -214,6 +214,106 @@ mod tests {
         );
     }
 
+    #[allow(clippy::type_complexity)]
+    fn make_pipeline_observer(
+        line_cap: usize,
+        batch_cap: usize,
+        throttle: Option<f64>,
+    ) -> (
+        flume::Sender<u8>,
+        flume::Receiver<u8>,
+        flume::Sender<u32>,
+        flume::Receiver<u32>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        PipelineObserver,
+    ) {
+        let (line_tx, line_rx) = flume::bounded::<u8>(line_cap);
+        let (batch_tx, batch_rx) = flume::bounded::<u32>(batch_cap);
+        let batches_uploaded = Arc::new(AtomicUsize::new(0));
+        let upload_time_us = Arc::new(AtomicUsize::new(0));
+        let compressed = Arc::new(AtomicUsize::new(0));
+        let throttle_arc = throttle.map(|r| Arc::new(AtomicU64::new(r.to_bits())));
+        let obs = PipelineObserver::new(
+            &line_tx,
+            &batch_tx,
+            batches_uploaded.clone(),
+            upload_time_us.clone(),
+            compressed.clone(),
+            throttle_arc,
+        );
+        (
+            line_tx,
+            line_rx,
+            batch_tx,
+            batch_rx,
+            batches_uploaded,
+            upload_time_us,
+            compressed,
+            obs,
+        )
+    }
+
+    #[test]
+    fn pipeline_observer_avg_upload_ms_zero_when_no_batches() {
+        let (_lt, _lr, _bt, _br, _bu, _ut, _c, obs) = make_pipeline_observer(4, 4, None);
+        assert_eq!(obs.avg_upload_ms(), 0.0);
+    }
+
+    #[test]
+    fn pipeline_observer_avg_upload_ms_computed_from_atomics() {
+        let (_lt, _lr, _bt, _br, batches, upload_us, _c, obs) =
+            make_pipeline_observer(4, 4, None);
+        batches.store(4, Ordering::Relaxed);
+        upload_us.store(20_000, Ordering::Relaxed); // 20_000 us total = 20 ms total => 5 ms avg
+        assert!((obs.avg_upload_ms() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pipeline_observer_throttle_none_when_disabled() {
+        let (_lt, _lr, _bt, _br, _bu, _ut, _c, obs) = make_pipeline_observer(4, 4, None);
+        assert_eq!(obs.throttle_rate_mbps(), None);
+    }
+
+    #[test]
+    fn pipeline_observer_throttle_none_when_infinite() {
+        let (_lt, _lr, _bt, _br, _bu, _ut, _c, obs) =
+            make_pipeline_observer(4, 4, Some(f64::INFINITY));
+        assert_eq!(obs.throttle_rate_mbps(), None);
+    }
+
+    #[test]
+    fn pipeline_observer_throttle_some_when_finite_in_mbps() {
+        // 8_000_000 bits/s = 8 Mbit/s -> divided by 1e6 => 8.0
+        let (_lt, _lr, _bt, _br, _bu, _ut, _c, obs) =
+            make_pipeline_observer(4, 4, Some(8_000_000.0));
+        let mbps = obs.throttle_rate_mbps().unwrap();
+        assert!((mbps - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pipeline_observer_tracks_channel_lengths_and_counters() {
+        let (line_tx, _line_rx, batch_tx, _batch_rx, batches, _ut, compressed, obs) =
+            make_pipeline_observer(8, 4, None);
+
+        assert_eq!(obs.line_capacity(), 8);
+        assert_eq!(obs.batch_capacity(), 4);
+        assert_eq!(obs.line_len(), 0);
+        assert_eq!(obs.batch_len(), 0);
+
+        line_tx.send(1).unwrap();
+        line_tx.send(2).unwrap();
+        batch_tx.send(7).unwrap();
+        assert_eq!(obs.line_len(), 2);
+        assert_eq!(obs.batch_len(), 1);
+
+        batches.store(3, Ordering::Relaxed);
+        compressed.store(123_456, Ordering::Relaxed);
+        assert_eq!(obs.batches_uploaded(), 3);
+        assert_eq!(obs.compressed_bytes_sent(), 123_456);
+    }
+
     #[test]
     fn from_sender_observes_len_and_capacity() {
         let (tx, rx) = flume::bounded::<u8>(8);

@@ -787,3 +787,91 @@ impl StreamingDownloader {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::thread;
+
+    #[test]
+    fn chunk_reader_returns_eof_when_sender_dropped() {
+        let (tx, rx) = flume::bounded::<Bytes>(4);
+        drop(tx);
+        let mut reader = ChunkReader::new(rx);
+        let mut buf = [0u8; 16];
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn chunk_reader_reads_single_chunk_in_one_call() {
+        let (tx, rx) = flume::bounded::<Bytes>(4);
+        tx.send(Bytes::from_static(b"hello")).unwrap();
+        drop(tx);
+        let mut reader = ChunkReader::new(rx);
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"hello");
+        // Next read hits EOF.
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn chunk_reader_serves_remainder_when_buf_smaller_than_chunk() {
+        let (tx, rx) = flume::bounded::<Bytes>(4);
+        tx.send(Bytes::from_static(b"abcdef")).unwrap();
+        drop(tx);
+        let mut reader = ChunkReader::new(rx);
+        let mut buf = [0u8; 2];
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"ab");
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"cd");
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"ef");
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn chunk_reader_concatenates_multiple_chunks_via_bufreader_lines() {
+        let (tx, rx) = flume::bounded::<Bytes>(4);
+        // Producer thread: split a multi-line payload across chunk boundaries
+        // that don't align with newlines, exercising the remainder path.
+        let producer = thread::spawn(move || {
+            tx.send(Bytes::from_static(b"line-one\nlin")).unwrap();
+            tx.send(Bytes::from_static(b"e-two\nline-th")).unwrap();
+            tx.send(Bytes::from_static(b"ree\n")).unwrap();
+            // tx dropped here -> EOF
+        });
+
+        let reader = ChunkReader::new(rx);
+        let lines: Vec<String> = BufReader::new(reader)
+            .lines()
+            .collect::<io::Result<_>>()
+            .unwrap();
+        producer.join().unwrap();
+        assert_eq!(lines, vec!["line-one", "line-two", "line-three"]);
+    }
+
+    /// Documents a quirk: an empty `Bytes` chunk mid-stream is currently
+    /// treated as EOF by `ChunkReader::read` (since `remainder` stays empty
+    /// and `n = 0`, which `Read` callers interpret as EOF). S3 streams don't
+    /// emit empty chunks in practice, so this hasn't bitten us — but if it
+    /// ever does, the fix is to loop on empty `recv()` results.
+    #[test]
+    fn chunk_reader_treats_empty_chunk_as_premature_eof() {
+        let (tx, rx) = flume::bounded::<Bytes>(4);
+        tx.send(Bytes::from_static(b"foo")).unwrap();
+        tx.send(Bytes::new()).unwrap();
+        tx.send(Bytes::from_static(b"bar")).unwrap();
+        drop(tx);
+        let mut reader = ChunkReader::new(rx);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(
+            out, b"foo",
+            "current behavior: empty chunk short-circuits to EOF"
+        );
+    }
+}

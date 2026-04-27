@@ -225,6 +225,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_resolver_adapter_debug_renders_stats() {
+        let cache = CachingDnsResolver::new(42).await.unwrap();
+        let adapter = AwsDnsResolverAdapter::new(cache);
+        let rendered = format!("{adapter:?}");
+        assert!(
+            rendered.contains("AwsDnsResolverAdapter"),
+            "missing struct name: {rendered}"
+        );
+        assert!(
+            rendered.contains("ttl_seconds: 42"),
+            "missing ttl: {rendered}"
+        );
+        assert!(
+            rendered.contains("cache_entries"),
+            "missing cache_entries field: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_resolver_stores_configured_ttl() {
+        // ttl_seconds is read directly from the struct (it's pub(crate)
+        // through the test module). Verifies the constructor wires the value
+        // through to both the moka cache and the field used for logging.
+        let cache = CachingDnsResolver::new(123).await.unwrap();
+        assert_eq!(cache.ttl_seconds, 123);
+    }
+
+    #[tokio::test]
+    async fn prewarm_completes_even_when_dns_unavailable() {
+        // Use a deliberately-bogus region name so endpoint hostnames don't
+        // resolve. The function is documented to log warnings and continue;
+        // it must not panic or hang.
+        let cache = CachingDnsResolver::new(1).await.unwrap();
+        // Wrap in a timeout to catch any future regression that introduces a
+        // hang on resolver failure.
+        let fut = cache.prewarm_aws_endpoints("invalid-region-zzz");
+        tokio::time::timeout(Duration::from_secs(15), fut)
+            .await
+            .expect("prewarm must return promptly even when DNS fails");
+    }
+
+    #[tokio::test]
     async fn test_dns_cache_resolve() {
         let cache = CachingDnsResolver::new(300).await.unwrap();
 
