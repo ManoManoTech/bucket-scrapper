@@ -70,9 +70,7 @@ impl NginxHandle {
             .exec(ExecCommand::new([
                 "sh".to_string(),
                 "-c".to_string(),
-                format!(
-                    "chmod -R a+rX /var/dumps && chown -R {host_uid}:{host_uid} /var/dumps",
-                ),
+                format!("chmod -R a+rX /var/dumps && chown -R {host_uid}:{host_uid} /var/dumps",),
             ]))
             .await
             .context("chmod/chown /var/dumps in container")?;
@@ -90,9 +88,7 @@ impl NginxHandle {
         let mut out = Vec::new();
         for e in entries {
             let p = e.path();
-            out.push(
-                std::fs::read(&p).with_context(|| format!("reading dump {}", p.display()))?,
-            );
+            out.push(std::fs::read(&p).with_context(|| format!("reading dump {}", p.display()))?);
         }
         Ok(out)
     }

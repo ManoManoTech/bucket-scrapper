@@ -263,8 +263,7 @@ mod tests {
 
     #[test]
     fn pipeline_observer_avg_upload_ms_computed_from_atomics() {
-        let (_lt, _lr, _bt, _br, batches, upload_us, _c, obs) =
-            make_pipeline_observer(4, 4, None);
+        let (_lt, _lr, _bt, _br, batches, upload_us, _c, obs) = make_pipeline_observer(4, 4, None);
         batches.store(4, Ordering::Relaxed);
         upload_us.store(20_000, Ordering::Relaxed); // 20_000 us total = 20 ms total => 5 ms avg
         assert!((obs.avg_upload_ms() - 5.0).abs() < 1e-9);

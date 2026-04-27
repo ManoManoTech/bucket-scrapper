@@ -94,9 +94,7 @@ pub async fn start_garage(bucket_name: &str) -> Result<GarageHandle> {
     let image = GenericImage::new(GARAGE_IMAGE, GARAGE_TAG)
         .with_exposed_port(ContainerPort::Tcp(S3_PORT))
         .with_exposed_port(ContainerPort::Tcp(ADMIN_PORT))
-        .with_wait_for(WaitFor::message_on_stderr(
-            "S3 API server listening on",
-        ));
+        .with_wait_for(WaitFor::message_on_stderr("S3 API server listening on"));
 
     let container = image
         .with_mount(Mount::bind_mount(
@@ -196,10 +194,7 @@ fn parse_key_create(stdout: &str) -> Option<(String, String)> {
     Some((access?, secret?))
 }
 
-async fn exec_capture(
-    container: &ContainerAsync<GenericImage>,
-    cmd: &[&str],
-) -> Result<String> {
+async fn exec_capture(container: &ContainerAsync<GenericImage>, cmd: &[&str]) -> Result<String> {
     let mut result = container
         .exec(ExecCommand::new(cmd.iter().map(|s| s.to_string())))
         .await

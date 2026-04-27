@@ -1,0 +1,18 @@
+# Lefthook git hooks. Install once with: lefthook install
+# https://github.com/evilmartians/lefthook
+#
+# Mirrors what CI enforces (.github/workflows/ci.yml):
+#   - cargo fmt --check       → pre-commit (fast, runs on every commit)
+#   - cargo clippy -D warnings → pre-push   (slower, runs once before push)
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --check
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --all-targets -- -D warnings
