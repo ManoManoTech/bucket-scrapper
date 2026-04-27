@@ -64,14 +64,14 @@ impl ChannelObserver {
 
     /// Create an observer from any `flume::Sender<T>`.
     ///
-    /// Observes the same `len()` / `capacity()` as the receiver side but does
-    /// **not** keep the channel alive — when all real receivers drop, senders
-    /// get `SendError` as expected.
+    /// Holds a `WeakSender` so the channel can still close once the last real
+    /// `Sender` is dropped — without this the observer would keep the channel
+    /// alive and downstream receivers would block forever.
     pub fn from_sender<T: Send + 'static>(tx: &flume::Sender<T>) -> Self {
-        let tx = tx.clone();
         let cap = tx.capacity().unwrap_or(0);
+        let weak = tx.downgrade();
         Self {
-            len: Box::new(move || tx.len()),
+            len: Box::new(move || weak.upgrade().map(|s| s.len()).unwrap_or(0)),
             cap,
         }
     }

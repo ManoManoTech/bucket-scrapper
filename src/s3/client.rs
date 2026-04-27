@@ -3,7 +3,7 @@ use crate::s3::dns_cache::{self, AwsDnsResolverAdapter};
 use anyhow::{Context, Result};
 use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::ResponseChecksumValidation;
+use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::Client;
 use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
@@ -93,9 +93,20 @@ impl WrappedS3Client {
         // Build S3 client with disabled response checksum validation
         // This avoids warnings about part-level checksums from multipart uploads
         // which the SDK cannot validate
-        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
-            .build();
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
+
+        // Path-style addressing: required when pointing at S3-compatible backends on
+        // localhost (Garage, MinIO, …) since vhost-style would resolve `bucket.127.0.0.1`.
+        if std::env::var("AWS_S3_FORCE_PATH_STYLE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false)
+        {
+            s3_config_builder = s3_config_builder.force_path_style(true);
+        }
+
+        let s3_config = s3_config_builder.build();
 
         Ok(Client::from_conf(s3_config))
     }

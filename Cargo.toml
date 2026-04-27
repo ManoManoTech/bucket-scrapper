@@ -44,6 +44,9 @@ dhat-heap = ["dep:dhat"]
 tempfile = "3.8"
 tokio-test = "0.4"
 wiremock = "0.6"
+testcontainers = "0.23"
+assert_cmd = "2"
+predicates = "3"
 
 [package]
 name = "bucket-scrapper"
