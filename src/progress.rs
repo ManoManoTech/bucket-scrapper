@@ -114,15 +114,7 @@ impl PipelineProgress {
             let batch_pct = pipe.batch_len() * 100 / batch_cap;
             let line_pct = pipe.line_len() * 100 / line_cap;
 
-            let bottleneck = if batch_pct > 80 {
-                "upload"
-            } else if line_pct > 80 {
-                "compress"
-            } else if dc_pct > 80 {
-                "filter"
-            } else {
-                "download"
-            };
+            let bottleneck = classify_bottleneck_http(batch_pct, line_pct, dc_pct);
 
             let throttle_mbps = pipe.throttle_rate_mbps();
 
@@ -154,7 +146,7 @@ impl PipelineProgress {
 
             self.prev_uploaded_bytes = uploaded_now;
         } else {
-            let bottleneck = if dc_pct > 80 { "filter" } else { "download" };
+            let bottleneck = classify_bottleneck_file(dc_pct);
 
             info!(
                 files_done = self.files_processed,
@@ -176,5 +168,62 @@ impl PipelineProgress {
 
         self.prev_downloaded_bytes = dl_now;
         self.last_report_time = std::time::Instant::now();
+    }
+}
+
+/// Classify the dominant pipeline bottleneck for the HTTP-output path.
+///
+/// Inputs are channel fill percentages (0–100). The priority order matches
+/// production wiring: a full *downstream* channel means upstream stages can't
+/// drain, so we report the most-downstream-saturated stage first.
+fn classify_bottleneck_http(batch_pct: usize, line_pct: usize, dc_pct: usize) -> &'static str {
+    if batch_pct > 80 {
+        "upload"
+    } else if line_pct > 80 {
+        "compress"
+    } else if dc_pct > 80 {
+        "filter"
+    } else {
+        "download"
+    }
+}
+
+/// Classify bottleneck for the file-output path (no compress/upload stages).
+fn classify_bottleneck_file(dc_pct: usize) -> &'static str {
+    if dc_pct > 80 {
+        "filter"
+    } else {
+        "download"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottleneck_http_priority_order() {
+        // Most-downstream wins: upload > compress > filter > download.
+        assert_eq!(classify_bottleneck_http(90, 90, 90), "upload");
+        assert_eq!(classify_bottleneck_http(0, 90, 90), "compress");
+        assert_eq!(classify_bottleneck_http(0, 0, 90), "filter");
+        assert_eq!(classify_bottleneck_http(0, 0, 0), "download");
+    }
+
+    #[test]
+    fn bottleneck_http_threshold_is_strict_gt_80() {
+        // Exactly 80 should NOT trigger; 81 should.
+        assert_eq!(classify_bottleneck_http(80, 80, 80), "download");
+        assert_eq!(classify_bottleneck_http(81, 0, 0), "upload");
+        assert_eq!(classify_bottleneck_http(0, 81, 0), "compress");
+        assert_eq!(classify_bottleneck_http(0, 0, 81), "filter");
+    }
+
+    #[test]
+    fn bottleneck_file_only_distinguishes_filter_vs_download() {
+        assert_eq!(classify_bottleneck_file(0), "download");
+        assert_eq!(classify_bottleneck_file(80), "download");
+        assert_eq!(classify_bottleneck_file(81), "filter");
+        assert_eq!(classify_bottleneck_file(100), "filter");
     }
 }
