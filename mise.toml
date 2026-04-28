@@ -1,4 +1,5 @@
 [tools]
+"cargo:cargo-audit" = "latest"
 "cargo:samply" = "latest"
 lefthook = "latest"
 rust = "latest"
