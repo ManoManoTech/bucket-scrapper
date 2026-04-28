@@ -1,3 +1,4 @@
 [tools]
 "cargo:samply" = "latest"
+lefthook = "latest"
 rust = "latest"

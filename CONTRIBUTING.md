@@ -9,4 +9,4 @@ This repo ships a [lefthook](https://github.com/evilmartians/lefthook) config (`
 - `pre-commit`: `cargo fmt --check`
 - `pre-push`: `cargo clippy --all-targets -- -D warnings`
 
-Install lefthook once (`brew install lefthook` / `go install github.com/evilmartians/lefthook@latest`) then run `lefthook install` in the repo to wire up `.git/hooks/`.
+Lefthook is pinned in `mise.toml`. After cloning, run `mise install` then `mise exec -- lefthook install` once to wire `.git/hooks/`. See `AGENTS.md` for why every dev tool lives in `mise.toml`.
