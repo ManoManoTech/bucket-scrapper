@@ -70,6 +70,20 @@ impl GarageHandle {
         S3Client::from_conf(conf)
     }
 
+    /// Create an additional bucket on this Garage instance and grant the
+    /// test key read+write access. Used by tests that need a separate
+    /// destination bucket on the same instance (e.g. S3 output target).
+    pub async fn create_bucket(&self, name: &str) -> Result<()> {
+        exec_check(&self.container, &["/garage", "bucket", "create", name]).await?;
+        exec_check(
+            &self.container,
+            &[
+                "/garage", "bucket", "allow", "--read", "--write", name, "--key", "testkey",
+            ],
+        )
+        .await
+    }
+
     pub fn env_for_scrapper(&self) -> Vec<(String, String)> {
         vec![
             ("AWS_ENDPOINT_URL_S3".into(), self.endpoint.clone()),

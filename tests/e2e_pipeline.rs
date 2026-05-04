@@ -7,6 +7,7 @@ mod e2e;
 
 use anyhow::Result;
 use assert_cmd::Command;
+use aws_sdk_s3::Client as S3Client;
 use e2e::fixtures::{build_fixture, expected_matches, seed_bucket};
 use e2e::garage::start_garage;
 use e2e::nginx::start_nginx;
@@ -16,6 +17,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 const BUCKET: &str = "logs-bucket";
+const RESULTS_BUCKET: &str = "results-bucket";
 const DATE: &str = "20260101"; // 2026-01-01
 const HOURS: &[&str] = &["10", "11"];
 const PATTERN: &str = "ERROR";
@@ -206,6 +208,118 @@ async fn run_http_test() -> Result<()> {
 
     drop(dump_root); // keep TempDir alive until end
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end() {
+    skip_unless_docker!();
+    if let Err(e) = run_s3_test().await {
+        panic!("s3_output_end_to_end failed: {e:#}");
+    }
+}
+
+async fn run_s3_test() -> Result<()> {
+    // Single Garage instance, two buckets: one source, one destination.
+    // Same credentials, so the scrapper's source S3 client also reaches the
+    // destination — no per-output endpoint/credentials override needed.
+    let garage = start_garage(BUCKET).await?;
+    garage.create_bucket(RESULTS_BUCKET).await?;
+
+    let s3 = garage.s3_client();
+    let staged = build_fixture(DATE, HOURS);
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("s3")
+        .arg("--s3-output-bucket")
+        .arg(RESULTS_BUCKET)
+        .arg("--s3-output-batch-max-mb")
+        .arg("1")
+        .arg("--s3-output-key-template")
+        .arg("out/{prefix}/{run_id}-{seq}.ndjson.zst")
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let (received, keys) = list_and_decode_zst(&s3, RESULTS_BUCKET, "out/").await?;
+    let expected = expected_matches(&staged, PATTERN);
+    assert_multiset_eq(&received, &expected);
+
+    // At least one returned object key matches the configured template shape:
+    //   out/<prefix-with-slashes>/<8-hex-run-id>-<5-digit-seq>.ndjson.zst
+    let template_re = regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson\.zst$").unwrap();
+    assert!(
+        keys.iter().any(|k| template_re.is_match(k)),
+        "no destination key matched template `out/{{prefix}}/{{run_id}}-{{seq}}.ndjson.zst`; got: {keys:?}"
+    );
+    Ok(())
+}
+
+/// List every object under `prefix` in `bucket`, fetch each, zstd-decode it,
+/// and return the concatenated NDJSON lines along with the object keys.
+async fn list_and_decode_zst(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut keys = Vec::new();
+    let mut continuation = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = continuation.take() {
+            req = req.continuation_token(token);
+        }
+        let resp = req.send().await?;
+        if let Some(contents) = resp.contents {
+            for obj in contents {
+                if let Some(k) = obj.key {
+                    keys.push(k);
+                }
+            }
+        }
+        if resp.is_truncated.unwrap_or(false) {
+            continuation = resp.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    let mut lines = Vec::new();
+    for key in &keys {
+        let resp = client.get_object().bucket(bucket).key(key).send().await?;
+        let body = resp.body.collect().await?.to_vec();
+        let plain = zstd::stream::decode_all(body.as_slice())?;
+        for line in String::from_utf8(plain)?.lines() {
+            if !line.is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    Ok((lines, keys))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
