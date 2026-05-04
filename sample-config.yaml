@@ -44,11 +44,54 @@ buckets:
 # Default AWS region (can be overridden with --region)
 region: eu-west-3
 
-# Output directory for file mode (written as zstd-compressed files grouped by date/hour)
-output_dir: ./scrapper-output
+# ─── Output ────────────────────────────────────────────────────────────────
+#
+# `outputs:` is a list of one entry today; multi-output fan-out is reserved
+# for a future release. Pick exactly one of the four types below.
+#
+# When `outputs:` is present, the CLI per-output flags (--output, --output-dir,
+# --http-*, --s3-output-*) must NOT be passed — mixing CLI and config is a
+# hard error. Drop `outputs:` and use the CLI flags instead, or keep config
+# and stop passing those flags.
+#
+# String fields support `${VAR}` and `${VAR:-default}` interpolation so
+# secrets stay out of the YAML.
 
-# Optional: HTTP output defaults (activate with --http-output)
-http_output:
-  url: https://logs.example.com/api/v1/logs
-  bearer_auth: your-token
-  timeout_secs: 30
+outputs:
+  # ── File output: per-prefix zstd files under `dir` ───────────────────────
+  - type: file
+    dir: ./scrapper-output
+    # compression_level: 3   # optional, 1–22
+
+  # ── HTTP output: NDJSON-zstd POSTs with AIMD throttle ────────────────────
+  # - type: http
+  #   url: https://logs.example.com/api/v1/logs
+  #   bearer_auth: ${HTTP_BEARER_AUTH}
+  #   timeout_secs: 30
+  #   batch_max_mb: 2
+  #   compressor_tasks: null     # null = auto (cpu_count / 8, min 1)
+  #   upload_tasks: null         # null = 4 × compressor_tasks
+  #   upload_channel_size: 4
+  #   line_channel_size: 1000
+  #   compression_level: 3
+  #   max_retries: 3
+  #   max_upload_rate_mbps: 0    # 0 = unlimited
+  #   aimd:
+  #     decrease_factor: 0.15
+  #     increase_mbps: 1.0
+  #     max_submission_time_s: 4.0   # 0 = AIMD disabled
+
+  # ── S3 output: per-prefix batched zstd objects ───────────────────────────
+  # - type: s3
+  #   bucket: my-results-bucket
+  #   region: eu-west-3                                           # optional
+  #   endpoint_url: null                                          # optional
+  #   key_template: "results/{prefix}/{run_id}-{seq}.ndjson.zst"
+  #   batch_max_mb: 16
+  #   compression_level: 3
+  #   multipart_threshold_mb: 64    # informational; multipart not yet implemented
+  #   multipart_part_mb: 16
+  #   upload_tasks: null            # null = auto
+
+  # ── Void output: drop all matches (benchmarking only) ────────────────────
+  # - type: void

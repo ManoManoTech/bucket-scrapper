@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::output::OutputConfig;
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum PathSchema {
@@ -40,25 +42,9 @@ impl BucketConfig {
     }
 }
 
-/// HTTP output configuration for sending logs to a REST API
-#[derive(Debug, Deserialize, Clone)]
-pub struct HttpOutputConfig {
-    /// The URL to send logs to (e.g., https://logs.example.com/api/v1/logs)
-    pub url: String,
-    /// Bearer token for authentication (can also be set via HTTP_BEARER_AUTH env var)
-    #[serde(default)]
-    pub bearer_auth: Option<String>,
-    /// Timeout for HTTP requests in seconds (default: 30)
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-fn default_timeout_secs() -> u64 {
-    30
-}
-
 /// Simplified config schema for bucket scrapper
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigSchema {
     /// List of buckets to search
     #[serde(default)]
@@ -68,17 +54,30 @@ pub struct ConfigSchema {
     #[serde(default)]
     pub region: Option<String>,
 
-    /// Output directory for search results (file mode)
+    /// Output configuration: one (and, today, only one) entry describing
+    /// where matched lines should be written. When this list is non-empty
+    /// the CLI per-output flags must be unset (config-driven mode).
+    /// When omitted or empty, the output is built entirely from CLI flags
+    /// (CLI-driven mode).
     #[serde(default)]
-    pub output_dir: Option<String>,
+    pub outputs: Vec<OutputConfig>,
+}
 
-    /// HTTP output configuration (for sending to REST API)
-    #[serde(default)]
-    pub http_output: Option<HttpOutputConfig>,
-
-    /// Captures unknown YAML keys for forward-compatibility.
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_yaml::Value>,
+impl ConfigSchema {
+    /// Validate the `outputs:` list. Today the rule is exactly-one entry; when
+    /// concurrent fan-out lands, this validator relaxes to "1 or more".
+    ///
+    /// Returns `Ok(())` when the list is *empty* — that just means the user is
+    /// driving the output from the CLI; the resolver will catch missing flags.
+    pub fn validate_outputs(&self) -> Result<(), String> {
+        match self.outputs.len() {
+            0 | 1 => Ok(()),
+            n => Err(format!(
+                "outputs: list has {n} entries but only 1 is supported today \
+                 (multi-output fan-out is not yet implemented)",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +122,41 @@ mod tests {
     fn validate_rejects_empty_path() {
         let cfg = bucket_config(vec![]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_schema_accepts_empty_outputs() {
+        let cfg = ConfigSchema::default();
+        cfg.validate_outputs().unwrap();
+    }
+
+    #[test]
+    fn config_schema_rejects_legacy_output_dir_key() {
+        // Hard-break: legacy keys must error out
+        let yaml = r#"
+buckets: []
+output_dir: /tmp/out
+"#;
+        let err = serde_yaml::from_str::<ConfigSchema>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("output_dir") || msg.contains("unknown field"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_schema_rejects_legacy_http_output_key() {
+        let yaml = r#"
+buckets: []
+http_output:
+  url: https://example.com
+"#;
+        let err = serde_yaml::from_str::<ConfigSchema>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("http_output") || msg.contains("unknown field"),
+            "got: {msg}"
+        );
     }
 }

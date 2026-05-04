@@ -14,11 +14,15 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use bucket_scrapper::config::loader::load_config;
+use bucket_scrapper::config::output::OutputConfig;
 use bucket_scrapper::config::path_formatter::generate_path_formatter;
-use bucket_scrapper::config::types::BucketConfig;
+use bucket_scrapper::config::resolve::{resolve_output, OutputCli, OutputKind};
+use bucket_scrapper::config::types::{BucketConfig, ConfigSchema};
 use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
-use bucket_scrapper::pipeline::{HttpResultWriter, HttpWriterConfig, SharedFileWriter};
-use bucket_scrapper::pipeline::{StreamingDownloader, StreamingDownloaderConfig};
+use bucket_scrapper::pipeline::{
+    FileOutputSink, HttpOutputSink, HttpResultWriter, HttpWriterConfig, OutputSink, OutputStats,
+    S3OutputSink, SharedFileWriter, StreamingDownloader, StreamingDownloaderConfig, VoidOutputSink,
+};
 use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::S3ObjectInfo;
@@ -28,6 +32,7 @@ use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 #[derive(Parser)]
 #[command(name = "bucket-scrapper")]
 #[command(about = "Search through S3 bucket contents using ripgrep patterns")]
+#[command(version)]
 struct Cli {
     /// Path to the config file (optional, for AWS credentials and default buckets)
     #[arg(long, default_value = "config-scrapper.yml")]
@@ -69,10 +74,6 @@ struct Cli {
     #[arg(long, default_value = "32")]
     max_parallel: usize,
 
-    /// HTTP line channel capacity (max matched lines buffered before compressors)
-    #[arg(long, default_value = "1000")]
-    http_line_channel_size: usize,
-
     /// Maximum retry attempts for failed downloads
     #[arg(long, default_value = "10")]
     max_retries: u32,
@@ -89,42 +90,6 @@ struct Cli {
     #[arg(long, default_value = "60")]
     client_max_age: u64,
 
-    /// Zstd compression level (1-22, higher = smaller but slower)
-    #[arg(long, default_value = "3")]
-    compression_level: i32,
-
-    /// Send results to HTTP API instead of writing to files
-    #[arg(long)]
-    http_output: bool,
-
-    /// HTTP API URL for log ingestion (e.g., https://logs.example.com/api/v1/logs)
-    #[arg(long, env = "HTTP_URL")]
-    http_url: Option<String>,
-
-    /// Bearer token for HTTP authentication (can also use HTTP_BEARER_AUTH env var)
-    #[arg(long, env = "HTTP_BEARER_AUTH")]
-    http_bearer_auth: Option<String>,
-
-    /// Maximum batch size in MB for HTTP requests.
-    #[arg(long, default_value = "2")]
-    http_batch_max_mb: f64,
-
-    /// Timeout for HTTP requests in seconds
-    #[arg(long, default_value = "30")]
-    http_timeout: u64,
-
-    /// Number of concurrent HTTP upload tasks (default: 4× compressor tasks)
-    #[arg(long)]
-    http_upload_tasks: Option<usize>,
-
-    /// Number of concurrent HTTP compressor tasks (default: cpu_count / 8, minimum 1)
-    #[arg(long)]
-    http_compressor_tasks: Option<usize>,
-
-    /// Batch channel buffer between compressors and uploaders (RAM ≈ this × batch_max_bytes)
-    #[arg(long, default_value = "4")]
-    http_upload_channel_size: usize,
-
     /// Number of filter worker tasks (default: cpu_count / 2)
     #[arg(long)]
     filter_tasks: Option<usize>,
@@ -138,27 +103,151 @@ struct Cli {
     #[arg(long, default_value = "0")]
     memory_limit_gb: u64,
 
+    // ── Output selection / per-output overrides ────────────────────────────
+    //
+    // These are per-output settings. Either every flag is unset (the active
+    // output is then taken from the config file's `outputs:` block) or you
+    // supply `--output <type>` and the flags relevant to that type. Mixing
+    // CLI per-output flags with a config `outputs:` block is a hard error;
+    // see `crate::config::resolve` for the rules.
+    /// Active output: `file`, `http`, `s3`, or `void`. Required when the
+    /// config file has no `outputs:` block.
+    #[arg(long, value_enum)]
+    output: Option<OutputKind>,
+
+    /// Directory for the file output.
+    #[arg(long)]
+    output_dir: Option<String>,
+
+    /// Default zstd compression level for outputs that compress (file/http/s3).
+    #[arg(long)]
+    compression_level: Option<i32>,
+
+    /// HTTP API URL for log ingestion (e.g., https://logs.example.com/api/v1/logs)
+    #[arg(long, env = "HTTP_URL")]
+    http_url: Option<String>,
+
+    /// Bearer token for HTTP authentication
+    #[arg(long, env = "HTTP_BEARER_AUTH")]
+    http_bearer_auth: Option<String>,
+
+    /// Maximum batch size in MB for HTTP requests.
+    #[arg(long)]
+    http_batch_max_mb: Option<f64>,
+
+    /// Timeout for HTTP requests in seconds
+    #[arg(long = "http-timeout")]
+    http_timeout_secs: Option<u64>,
+
+    /// Number of concurrent HTTP upload tasks
+    #[arg(long)]
+    http_upload_tasks: Option<usize>,
+
+    /// Number of concurrent HTTP compressor tasks
+    #[arg(long)]
+    http_compressor_tasks: Option<usize>,
+
+    /// Batch channel buffer between compressors and uploaders
+    #[arg(long)]
+    http_upload_channel_size: Option<usize>,
+
+    /// HTTP line channel capacity (max matched lines buffered before compressors)
+    #[arg(long)]
+    http_line_channel_size: Option<usize>,
+
+    /// Max retries on HTTP send failures (capped at 10)
+    #[arg(long)]
+    http_max_retries: Option<u32>,
+
     /// Per-batch submission time threshold in seconds for AIMD upload throttle (0 = disabled)
-    #[arg(long, default_value = "4.0")]
-    max_submission_time: f64,
+    #[arg(long)]
+    max_submission_time: Option<f64>,
 
     /// AIMD multiplicative decrease factor (0.15 = reduce rate by 15% on congestion)
-    #[arg(long, default_value = "0.15")]
-    http_aimd_decrease_factor: f64,
+    #[arg(long)]
+    http_aimd_decrease_factor: Option<f64>,
 
     /// AIMD additive increase in MB/s per healthy batch
-    #[arg(long, default_value = "1.0")]
-    http_aimd_increase: f64,
+    #[arg(long)]
+    http_aimd_increase: Option<f64>,
 
     /// Global upload rate limit in MB/s (0 = unlimited)
-    #[arg(long, default_value = "0")]
-    max_upload_rate: f64,
+    #[arg(long)]
+    max_upload_rate: Option<f64>,
+
+    /// Destination bucket for the s3 output.
+    #[arg(long)]
+    s3_output_bucket: Option<String>,
+
+    /// Region for the s3 output (defaults to global --region).
+    #[arg(long)]
+    s3_output_region: Option<String>,
+
+    /// Endpoint URL for non-AWS S3 backends (Garage, MinIO, …).
+    #[arg(long)]
+    s3_output_endpoint_url: Option<String>,
+
+    /// Key template for the s3 output. Supports {prefix}, {prefix_hash}, {seq}, {run_id}.
+    #[arg(long)]
+    s3_output_key_template: Option<String>,
+
+    /// Per-prefix batch rollover threshold in MB for the s3 output.
+    #[arg(long)]
+    s3_output_batch_max_mb: Option<f64>,
+
+    /// Multipart upload threshold in MB (currently informational; not yet implemented).
+    #[arg(long)]
+    s3_output_multipart_threshold_mb: Option<u64>,
+
+    /// Multipart upload part size in MB (currently informational; not yet implemented).
+    #[arg(long)]
+    s3_output_multipart_part_mb: Option<u64>,
+
+    /// Number of concurrent uploader tasks for the s3 output.
+    #[arg(long)]
+    s3_output_upload_tasks: Option<usize>,
+
+    /// Compression level override for the s3 output.
+    #[arg(long)]
+    s3_output_compression_level: Option<i32>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum LogFormat {
     Text,
     Json,
+}
+
+impl Cli {
+    fn to_output_cli(&self) -> OutputCli {
+        OutputCli {
+            output: self.output,
+            output_dir: self.output_dir.clone(),
+            http_url: self.http_url.clone(),
+            http_bearer_auth: self.http_bearer_auth.clone(),
+            http_timeout_secs: self.http_timeout_secs,
+            http_batch_max_mb: self.http_batch_max_mb,
+            http_compressor_tasks: self.http_compressor_tasks,
+            http_upload_tasks: self.http_upload_tasks,
+            http_upload_channel_size: self.http_upload_channel_size,
+            http_line_channel_size: self.http_line_channel_size,
+            http_max_retries: self.http_max_retries,
+            http_max_upload_rate_mbps: self.max_upload_rate,
+            http_aimd_decrease_factor: self.http_aimd_decrease_factor,
+            http_aimd_increase_mbps: self.http_aimd_increase,
+            http_aimd_max_submission_time_s: self.max_submission_time,
+            s3_bucket: self.s3_output_bucket.clone(),
+            s3_region: self.s3_output_region.clone(),
+            s3_endpoint_url: self.s3_output_endpoint_url.clone(),
+            s3_key_template: self.s3_output_key_template.clone(),
+            s3_batch_max_mb: self.s3_output_batch_max_mb,
+            s3_multipart_threshold_mb: self.s3_output_multipart_threshold_mb,
+            s3_multipart_part_mb: self.s3_output_multipart_part_mb,
+            s3_upload_tasks: self.s3_output_upload_tasks,
+            s3_compression_level: self.s3_output_compression_level,
+            compression_level: self.compression_level,
+        }
+    }
 }
 
 #[tokio::main]
@@ -171,11 +260,8 @@ async fn main() -> Result<()> {
     {
         unsafe {
             let current_priority = libc::getpriority(libc::PRIO_PROCESS, 0);
-            if current_priority < 10 {
-                // Set to nice 10 if we're running at higher priority
-                if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
-                    eprintln!("Warning: Could not set nice priority to 10");
-                }
+            if current_priority < 10 && libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                eprintln!("Warning: Could not set nice priority to 10");
             }
         }
     }
@@ -199,7 +285,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize logging
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
@@ -212,11 +297,9 @@ async fn main() -> Result<()> {
         LogFormat::Text => fmt().with_env_filter(env_filter).with_target(false).init(),
     }
 
-    // Set up DNS cache with 5 minute TTL
     dns_cache::init_global_dns_cache(300).await.ok();
 
-    // Load config if file exists
-    let config = if cli.config.exists() {
+    let config: Option<ConfigSchema> = if cli.config.exists() {
         match load_config(&cli.config) {
             Ok(cfg) => {
                 info!(path = %cli.config.display(), "Loaded config");
@@ -235,7 +318,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let end_date = if let Some(end) = cli.end {
+    let end_date = if let Some(end) = cli.end.clone() {
         end.parse::<DateTime<Utc>>()
             .context("Invalid end date format")?
     } else {
@@ -247,16 +330,13 @@ async fn main() -> Result<()> {
         .parse::<DateTime<Utc>>()
         .context("Invalid start date format")?;
 
-    // Create S3 client (Arc for sharing across spawned listing tasks)
     let s3_client = Arc::new(WrappedS3Client::new(&cli.region, cli.client_max_age, None).await?);
 
-    // Configure search
     let matcher_config = MatcherConfig {
         pattern: cli.line_pattern_regex.clone(),
         ignore_case: cli.ignore_case,
     };
 
-    // Get buckets from config
     let config_buckets: Vec<&BucketConfig> = if let Some(ref cfg) = config {
         cfg.buckets.iter().collect()
     } else {
@@ -278,7 +358,6 @@ async fn main() -> Result<()> {
 
     let searcher = Arc::new(LineMatcher::new(matcher_config)?);
 
-    // Configure downloader
     let filter_tasks = cli.filter_tasks.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get() / 2)
@@ -297,90 +376,15 @@ async fn main() -> Result<()> {
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
 
-    // Check if we're using HTTP streaming output
-    let http_streaming = if cli.http_output {
-        // Validate HTTP config early
-        let api_url = cli
-            .http_url
-            .clone()
-            .or_else(|| {
-                config
-                    .as_ref()
-                    .and_then(|c| c.http_output.as_ref().map(|h| h.url.clone()))
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                "HTTP output enabled but no URL specified. Use --http-url or set HTTP_URL env var"
-            )
-            })?;
+    // Resolve output configuration before listing — fail fast if misconfigured.
+    let resolved_output = resolve_output(
+        &cli.to_output_cli(),
+        config.as_ref().unwrap_or(&ConfigSchema::default()),
+    )?;
 
-        let bearer_token = cli.http_bearer_auth.clone().or_else(|| {
-            config
-                .as_ref()
-                .and_then(|c| c.http_output.as_ref().and_then(|h| h.bearer_auth.clone()))
-        });
+    let sink = build_sink(&resolved_output, &s3_client, cli.max_retries).await?;
 
-        let timeout_secs = config
-            .as_ref()
-            .and_then(|c| c.http_output.as_ref().map(|h| h.timeout_secs))
-            .unwrap_or(cli.http_timeout);
-
-        let batch_max_bytes = (cli.http_batch_max_mb * 1024.0 * 1024.0) as usize;
-
-        let num_compressor_tasks = cli.http_compressor_tasks.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get() / 8)
-                .unwrap_or(1)
-                .max(1)
-        });
-        let num_upload_tasks = cli.http_upload_tasks.unwrap_or(4 * num_compressor_tasks);
-
-        let max_submission_time = if cli.max_submission_time > 0.0 {
-            Some(Duration::from_secs_f64(cli.max_submission_time))
-        } else {
-            None
-        };
-
-        let max_upload_rate = if cli.max_upload_rate > 0.0 {
-            Some(cli.max_upload_rate * 1_000_000.0)
-        } else {
-            None
-        };
-
-        info!(
-            url = %api_url,
-            batch_max_mb = cli.http_batch_max_mb,
-            compressor_tasks = num_compressor_tasks,
-            upload_tasks = num_upload_tasks,
-            upload_channel_size = cli.http_upload_channel_size,
-            max_submission_time_s = cli.max_submission_time,
-            aimd_decrease_factor = cli.http_aimd_decrease_factor,
-            aimd_increase_mbps = cli.http_aimd_increase,
-            max_upload_rate_mbps = cli.max_upload_rate,
-            "HTTP streaming mode enabled"
-        );
-
-        let http_config = HttpWriterConfig {
-            url: api_url,
-            bearer_token,
-            batch_max_bytes,
-            timeout_secs,
-            max_retries: cli.max_retries.min(10),
-            channel_buffer_size: cli.http_line_channel_size,
-            num_compressor_tasks,
-            num_upload_tasks,
-            upload_channel_size: cli.http_upload_channel_size,
-            compression_level: cli.compression_level,
-            max_submission_time,
-            max_upload_rate,
-            aimd_decrease_factor: cli.http_aimd_decrease_factor,
-            aimd_increase_bytes: cli.http_aimd_increase * 1_000_000.0,
-        };
-
-        Some(HttpResultWriter::new(http_config)?)
-    } else {
-        None
-    };
+    info!(output = sink.type_name(), "Output configured");
 
     // List all objects in parallel across all buckets × hourly prefixes
     let all_bucket_objects = {
@@ -428,10 +432,8 @@ async fn main() -> Result<()> {
             "Spawned listing tasks"
         );
 
-        // Drain results — abort all remaining tasks on first failure
         let mut all_objects = Vec::new();
         let mut successful = 0usize;
-
         let listing_start = std::time::Instant::now();
         let mut last_report = listing_start;
 
@@ -473,98 +475,166 @@ async fn main() -> Result<()> {
             "Listing complete"
         );
 
-        // Sort by size for better load balancing
         all_objects.sort_by_key(|o| o.size);
         all_objects
     };
 
     if all_bucket_objects.is_empty() {
         anyhow::bail!("No objects found to search");
-    } else {
-        let total_compressed_input: usize = all_bucket_objects.iter().map(|o| o.size).sum();
-        info!(
-            objects = all_bucket_objects.len(),
-            mb = total_compressed_input / 1_000_000,
-            "Processing objects"
-        );
-
-        let batch_start = std::time::Instant::now();
-
-        if let Some(http_writer) = http_streaming {
-            let http_sender = http_writer.get_sender();
-            let observer = http_writer.observer();
-            let fatal_error = http_writer.fatal_error_flag();
-            let (files_searched, matched_lines) = downloader
-                .search_objects_to_http(
-                    &all_bucket_objects,
-                    searcher.clone(),
-                    http_sender,
-                    observer,
-                    fatal_error,
-                )
-                .await?;
-
-            let api_url = http_writer.url().to_string();
-            let stats = http_writer.finish().await?;
-
-            if stats.lines_dropped > 0 {
-                warn!(
-                    lines_dropped = stats.lines_dropped,
-                    "Some lines were dropped due to HTTP send failures"
-                );
-            }
-
-            let elapsed = batch_start.elapsed().as_secs_f64();
-            let read_compressed_mb = total_compressed_input as f64 / 1_000_000.0;
-            let wrote_compressed_mb = stats.compressed_bytes_sent as f64 / 1_000_000.0;
-            let plaintext_mb = stats.plaintext_bytes_sent as f64 / 1_000_000.0;
-            info!(
-                elapsed_s = elapsed,
-                files = files_searched,
-                matched_lines = matched_lines,
-                lines_sent = stats.lines_sent,
-                lines_dropped = stats.lines_dropped,
-                read_compressed_mb = read_compressed_mb,
-                wrote_compressed_mb = wrote_compressed_mb,
-                plaintext_mb = plaintext_mb,
-                compression_ratio = if wrote_compressed_mb > 0.0 { plaintext_mb / wrote_compressed_mb } else { 0.0 },
-                pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
-                url = %api_url,
-                "Search completed"
-            );
-        } else {
-            let output_dir = config
-                .as_ref()
-                .and_then(|c| c.output_dir.clone())
-                .unwrap_or_else(|| "./scrapper-output".to_string());
-
-            let file_writer = SharedFileWriter::new(output_dir.clone(), cli.compression_level)?;
-
-            let (files_searched, matched_lines) = downloader
-                .search_objects_to_file(&all_bucket_objects, searcher.clone(), file_writer.clone())
-                .await?;
-
-            let stats = file_writer.finish()?;
-            let elapsed = batch_start.elapsed().as_secs_f64();
-            let plaintext_mb = stats.plaintext_bytes as f64 / 1_000_000.0;
-            let compressed_mb = stats.compressed_bytes as f64 / 1_000_000.0;
-
-            info!(
-                elapsed_s = elapsed,
-                files = files_searched,
-                matched_lines = matched_lines,
-                output_files = stats.files_written,
-                plaintext_mb = plaintext_mb,
-                compressed_mb = compressed_mb,
-                plaintext_mbps = plaintext_mb / elapsed,
-                compressed_mbps = compressed_mb / elapsed,
-                compression_ratio = if compressed_mb > 0.0 { plaintext_mb / compressed_mb } else { 0.0 },
-                pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
-                output_dir = %output_dir,
-                "Search completed"
-            );
-        }
     }
 
+    let total_compressed_input: usize = all_bucket_objects.iter().map(|o| o.size).sum();
+    info!(
+        objects = all_bucket_objects.len(),
+        mb = total_compressed_input / 1_000_000,
+        "Processing objects"
+    );
+
+    let batch_start = std::time::Instant::now();
+    let (files_searched, matched_lines) = downloader
+        .search_objects(&all_bucket_objects, searcher.clone(), sink.clone())
+        .await?;
+
+    let stats = sink.finish().await?;
+    report_completion(
+        &cli,
+        sink.type_name(),
+        files_searched,
+        matched_lines,
+        total_compressed_input,
+        batch_start.elapsed().as_secs_f64(),
+        &stats,
+    );
+
     Ok(())
+}
+
+/// Build an [`OutputSink`] from the resolved [`OutputConfig`].
+async fn build_sink(
+    cfg: &OutputConfig,
+    s3_client: &Arc<WrappedS3Client>,
+    cli_max_retries: u32,
+) -> Result<Arc<dyn OutputSink>> {
+    Ok(match cfg {
+        OutputConfig::File(file_cfg) => {
+            let level = file_cfg.compression_level.unwrap_or(3);
+            let writer = SharedFileWriter::new(file_cfg.dir.clone(), level)?;
+            Arc::new(FileOutputSink::new(Arc::new(writer)))
+        }
+        OutputConfig::Http(http_cfg) => {
+            let num_compressor_tasks = http_cfg.compressor_tasks.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() / 8)
+                    .unwrap_or(1)
+                    .max(1)
+            });
+            let num_upload_tasks = http_cfg.upload_tasks.unwrap_or(4 * num_compressor_tasks);
+            let max_submission_time = if http_cfg.aimd.max_submission_time_s > 0.0 {
+                Some(Duration::from_secs_f64(http_cfg.aimd.max_submission_time_s))
+            } else {
+                None
+            };
+            let max_upload_rate = if http_cfg.max_upload_rate_mbps > 0.0 {
+                Some(http_cfg.max_upload_rate_mbps * 1_000_000.0)
+            } else {
+                None
+            };
+
+            let writer_cfg = HttpWriterConfig {
+                url: http_cfg.url.clone(),
+                bearer_token: http_cfg.bearer_auth.clone(),
+                batch_max_bytes: (http_cfg.batch_max_mb * 1_000_000.0) as usize,
+                timeout_secs: http_cfg.timeout_secs,
+                max_retries: http_cfg.max_retries.min(cli_max_retries.max(1)).min(10),
+                channel_buffer_size: http_cfg.line_channel_size,
+                num_compressor_tasks,
+                num_upload_tasks,
+                upload_channel_size: http_cfg.upload_channel_size,
+                compression_level: http_cfg.compression_level.unwrap_or(3),
+                max_submission_time,
+                max_upload_rate,
+                aimd_decrease_factor: http_cfg.aimd.decrease_factor,
+                aimd_increase_bytes: http_cfg.aimd.increase_mbps * 1_000_000.0,
+            };
+
+            info!(
+                url = %http_cfg.url,
+                batch_max_mb = http_cfg.batch_max_mb,
+                compressor_tasks = num_compressor_tasks,
+                upload_tasks = num_upload_tasks,
+                "HTTP output configured"
+            );
+
+            Arc::new(HttpOutputSink::new(HttpResultWriter::new(writer_cfg)?))
+        }
+        OutputConfig::S3(s3_cfg) => {
+            if s3_cfg.region.is_some() {
+                warn!(
+                    "outputs[].region override is not yet wired through; \
+                     using the global S3 client's region"
+                );
+            }
+            if s3_cfg.endpoint_url.is_some() {
+                warn!(
+                    "outputs[].endpoint_url override is not yet wired through; \
+                     using the global S3 client's endpoint"
+                );
+            }
+            let client = s3_client.get_client().await?;
+            info!(
+                bucket = %s3_cfg.bucket,
+                key_template = %s3_cfg.key_template,
+                batch_max_mb = s3_cfg.batch_max_mb,
+                "S3 output configured"
+            );
+            Arc::new(S3OutputSink::new(client, s3_cfg)?)
+        }
+        OutputConfig::Void => {
+            info!("Void output configured (matches will be counted, not stored)");
+            Arc::new(VoidOutputSink::new())
+        }
+    })
+}
+
+fn report_completion(
+    cli: &Cli,
+    output_kind: &str,
+    files_searched: usize,
+    matched_lines: usize,
+    total_compressed_input: usize,
+    elapsed_s: f64,
+    stats: &OutputStats,
+) {
+    if stats.lines_dropped > 0 {
+        warn!(
+            lines_dropped = stats.lines_dropped,
+            "Some lines were dropped due to output failures"
+        );
+    }
+
+    let read_compressed_mb = total_compressed_input as f64 / 1_000_000.0;
+    let plaintext_mb = stats.plaintext_bytes as f64 / 1_000_000.0;
+    let compressed_mb = stats.compressed_bytes as f64 / 1_000_000.0;
+    let compression_ratio = if compressed_mb > 0.0 {
+        plaintext_mb / compressed_mb
+    } else {
+        0.0
+    };
+
+    info!(
+        output = output_kind,
+        elapsed_s = elapsed_s,
+        files = files_searched,
+        matched_lines = matched_lines,
+        lines_recorded = stats.matched_lines,
+        lines_dropped = stats.lines_dropped,
+        read_compressed_mb = read_compressed_mb,
+        wrote_compressed_mb = compressed_mb,
+        plaintext_mb = plaintext_mb,
+        compression_ratio = compression_ratio,
+        plaintext_mbps = if elapsed_s > 0.0 { plaintext_mb / elapsed_s } else { 0.0 },
+        pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
+        extras = ?stats.extras,
+        "Search completed"
+    );
 }

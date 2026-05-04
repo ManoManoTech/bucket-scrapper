@@ -4,8 +4,8 @@
 //! bounded channel (`ChunkReader`), avoiding full-object buffering.  Retries
 //! resume mid-object using S3 range requests (`bytes=N-`).
 
-use super::observer::{ChannelObserver, DownloadObserver, PipelineObserver};
-use super::SharedFileWriter;
+use super::observer::{ChannelObserver, DownloadObserver};
+use super::output::OutputSink;
 use crate::matcher::LineMatcher;
 use crate::progress::PipelineProgress;
 use crate::s3::{self, S3ObjectInfo};
@@ -24,12 +24,6 @@ use tracing::{debug, info, warn};
 struct DecompressedLine {
     data: Vec<u8>,
     source: Arc<S3ObjectInfo>,
-}
-
-/// Where filter workers send their matches.
-enum FilterOutput {
-    Http(flume::Sender<Vec<u8>>),
-    File(SharedFileWriter),
 }
 
 /// Bridges async S3 `ByteStream` chunks into synchronous [`Read`] for
@@ -117,40 +111,6 @@ impl StreamingDownloader {
         }
     }
 
-    /// Process a batch of S3 objects, streaming results directly to HTTP API.
-    ///
-    /// `fatal_error` is the flag from [`HttpResultWriter::fatal_error_flag`].
-    /// When it becomes `true` the download coordinator, filter workers and line
-    /// emitters bail out early so we stop wasting bandwidth on data that will
-    /// never be uploaded.
-    ///
-    /// Returns (files_searched, total_matches)
-    pub async fn search_objects_to_http(
-        &self,
-        objects: &[S3ObjectInfo],
-        searcher: Arc<LineMatcher>,
-        http_sender: flume::Sender<Vec<u8>>,
-        observer: PipelineObserver,
-        fatal_error: Arc<AtomicBool>,
-    ) -> Result<(usize, usize)> {
-        let output = FilterOutput::Http(http_sender);
-        self.search_objects(objects, searcher, Some(observer), output, Some(fatal_error))
-            .await
-    }
-
-    /// Process a batch of S3 objects, streaming results to file writer.
-    /// Returns (files_searched, total_matches)
-    pub async fn search_objects_to_file(
-        &self,
-        objects: &[S3ObjectInfo],
-        searcher: Arc<LineMatcher>,
-        writer: SharedFileWriter,
-    ) -> Result<(usize, usize)> {
-        let output = FilterOutput::File(writer);
-        self.search_objects(objects, searcher, None, output, None)
-            .await
-    }
-
     /// Generic batch processor with decoupled download+decompress and filter stages.
     ///
     /// Architecture:
@@ -165,14 +125,14 @@ impl StreamingDownloader {
     /// On transient errors, range-based resume retries from the last byte offset.
     ///
     /// Returns (files_searched, total_matches)
-    async fn search_objects(
+    pub async fn search_objects(
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<LineMatcher>,
-        pipeline: Option<PipelineObserver>,
-        output: FilterOutput,
-        fatal_error: Option<Arc<AtomicBool>>,
+        sink: Arc<dyn OutputSink>,
     ) -> Result<(usize, usize)> {
+        let pipeline = sink.observer();
+        let fatal_error = sink.fatal_error_flag();
         if objects.is_empty() {
             return Ok((0, 0));
         }
@@ -245,13 +205,12 @@ impl StreamingDownloader {
         };
 
         // --- Spawn filter workers ---
-        let output = Arc::new(output);
         let mut worker_set: JoinSet<Result<usize>> = JoinSet::new();
 
         for worker_id in 0..self.config.filter_tasks {
             let rx = line_rx.clone();
             let searcher = searcher.clone();
-            let output = output.clone();
+            let sink = sink.clone();
             let match_count = match_count.clone();
             let match_bytes = match_bytes.clone();
             let filter_lines_in = filter_lines_in.clone();
@@ -264,7 +223,7 @@ impl StreamingDownloader {
                     worker_id,
                     rx,
                     searcher,
-                    output,
+                    sink,
                     match_count,
                     match_bytes,
                     filter_lines_in,
@@ -766,7 +725,7 @@ impl StreamingDownloader {
         worker_id: usize,
         rx: flume::Receiver<DecompressedLine>,
         searcher: Arc<LineMatcher>,
-        output: Arc<FilterOutput>,
+        sink: Arc<dyn OutputSink>,
         match_count: Arc<AtomicUsize>,
         match_bytes: Arc<AtomicUsize>,
         filter_lines_in: Arc<AtomicUsize>,
@@ -793,16 +752,7 @@ impl StreamingDownloader {
                 filter_bytes_in.fetch_add(line_len, Ordering::Relaxed);
 
                 if searcher.matches_line(&line.data) {
-                    match output.as_ref() {
-                        FilterOutput::Http(sender) => {
-                            sender.send(line.data).map_err(|_| {
-                                anyhow::anyhow!("HTTP consumer gone, channel closed")
-                            })?;
-                        }
-                        FilterOutput::File(writer) => {
-                            writer.write_match(&line.source.prefix, &line.data)?;
-                        }
-                    }
+                    sink.ingest(&line.source.prefix, &line.data)?;
                     local += 1;
                     match_count.fetch_add(1, Ordering::Relaxed);
                     match_bytes.fetch_add(line_len, Ordering::Relaxed);

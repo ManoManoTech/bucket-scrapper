@@ -34,7 +34,10 @@ region: garage
 "#,
     );
     if let Some(dir) = output_dir {
-        yaml.push_str(&format!("output_dir: {}\n", dir.display()));
+        yaml.push_str(&format!(
+            "outputs:\n  - type: file\n    dir: {}\n",
+            dir.display()
+        ));
     }
     std::fs::write(path, yaml)?;
     Ok(())
@@ -169,7 +172,8 @@ async fn run_http_test() -> Result<()> {
         .arg(PATTERN)
         .arg("--filter")
         .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
-        .arg("--http-output")
+        .arg("--output")
+        .arg("http")
         .arg("--http-url")
         .arg(&nginx.url)
         .arg("--http-bearer-auth")
