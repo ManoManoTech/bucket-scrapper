@@ -323,6 +323,105 @@ async fn list_and_decode_zst(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn void_output_end_to_end() {
+    skip_unless_docker!();
+    if let Err(e) = run_void_test().await {
+        panic!("void_output_end_to_end failed: {e:#}");
+    }
+}
+
+async fn run_void_test() -> Result<()> {
+    // Void output writes nothing; the only observable signal is the structured
+    // "Search completed" log line. Capture stdout, parse it, assert counters.
+    let garage = start_garage(BUCKET).await?;
+    let s3 = garage.s3_client();
+    let staged = build_fixture(DATE, HOURS);
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    let output = cmd
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("void")
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        .timeout(std::time::Duration::from_secs(120))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "scrapper exited non-zero ({:?}); stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let logs = String::from_utf8(output.stdout)?;
+    let completion = logs
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| {
+            v.get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+                == Some("Search completed")
+        })
+        .expect("Search completed record not found in JSON logs");
+
+    let fields = completion.get("fields").expect("fields object");
+    let expected = expected_matches(&staged, PATTERN);
+    assert_eq!(expected.len(), 16, "fixture sanity check");
+
+    assert_eq!(
+        fields.get("output").and_then(|v| v.as_str()),
+        Some("void"),
+        "output should be `void` in completion record: {completion}"
+    );
+    assert_eq!(
+        fields.get("matched_lines").and_then(|v| v.as_u64()),
+        Some(16),
+        "matched_lines should be 16: {completion}"
+    );
+    assert_eq!(
+        fields.get("lines_recorded").and_then(|v| v.as_u64()),
+        Some(16),
+        "lines_recorded should be 16 (every match counted): {completion}"
+    );
+    assert_eq!(
+        fields.get("lines_dropped").and_then(|v| v.as_u64()),
+        Some(0),
+        "lines_dropped should be 0 for void output: {completion}"
+    );
+    let wrote_mb = fields
+        .get("wrote_compressed_mb")
+        .and_then(|v| v.as_f64())
+        .expect("wrote_compressed_mb missing");
+    assert_eq!(
+        wrote_mb, 0.0,
+        "void output must not produce compressed bytes: {completion}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn progress_reports_filter_volume_metrics() {
     skip_unless_docker!();
     if let Err(e) = run_progress_metrics_test().await {
