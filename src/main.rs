@@ -37,7 +37,7 @@ use std::collections::HashMap;
 #[command(version)]
 struct Cli {
     /// Path to the config file (optional, for AWS credentials and default buckets)
-    #[arg(long, default_value = "config-scrapper.yml")]
+    #[arg(long, default_value = "sample-config.yaml")]
     config: PathBuf,
 
     /// AWS region
