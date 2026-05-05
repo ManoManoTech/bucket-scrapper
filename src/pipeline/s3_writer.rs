@@ -1,17 +1,78 @@
-//! S3 output sink: per-prefix zstd uploads.
+//! S3 output sink: per-prefix codec-encoded uploads.
 //!
-//! For each source S3 prefix the sink keeps an in-memory zstd encoder. By
-//! default (no `batch_max_mb` set), each prefix produces exactly one output
-//! object on `finish()` — N input objects collapse to 1 output object per
-//! prefix, mirroring file sink semantics.
+//! ## Batching model
 //!
-//! When `batch_max_mb` is set, batch rollover is enabled: as soon as a
-//! prefix's compressed buffer exceeds the threshold, the batch is finalized,
-//! the destination key is rendered from `key_template`, the `{seq}` for
-//! that prefix is incremented, and the bytes are handed to a bounded
-//! uploader pool. Use rollover when output objects must stay under a size
-//! cap (e.g. downstream import limits); leave it off for simple N:1
-//! consolidation.
+//! One *batch* is one `PutObject` call. Every batch carries lines from a
+//! single source prefix — there is no cross-prefix mixing or
+//! consolidation. The user-facing axis is how many batches per source
+//! prefix.
+//!
+//! Per-prefix encoder lifecycle:
+//!
+//! 1. The first matched line for a prefix lazily creates a
+//!    [`CodecEncoder<Vec<u8>>`] for that prefix (zstd / gzip / identity,
+//!    per `compression.format`). Different prefixes have independent
+//!    encoders and never block each other.
+//! 2. Subsequent matched lines for the same prefix write into that
+//!    encoder's output buffer.
+//! 3. The encoder is finalized either when its buffered compressed size
+//!    crosses `batch_max_mb` (only if set) or, unconditionally, at
+//!    end-of-run. Finalization produces a finished compressed frame.
+//! 4. The frame is rendered into a destination key from `key_template`
+//!    (with the current `{seq}` substituted) and pushed onto a bounded
+//!    upload queue drained by `upload_tasks` worker tasks running
+//!    concurrent `PutObject` calls.
+//! 5. After a mid-run flush, `{seq}` for that prefix is incremented and
+//!    a fresh encoder is constructed in place.
+//!
+//! Default mode (no `batch_max_mb`): each prefix produces exactly one
+//! batch with `{seq}=00000`, finalized at end-of-run — N source objects
+//! collapse to 1 destination object per prefix.
+//!
+//! Batched mode (`batch_max_mb` set): a prefix that crosses the
+//! threshold N times produces N+1 batches (`00000`..`N`), the last one
+//! emitted by the end-of-run flush.
+//!
+//! Caveats worth knowing before tuning `batch_max_mb`:
+//!
+//! - The threshold is checked against the encoder's *output* buffer
+//!   (compressed bytes), not plaintext, and only after each ingest call.
+//!   The flush therefore lands a little *above* the threshold rather
+//!   than at it.
+//! - zstd / gzip buffer internally and only emit compressed bytes when
+//!   they have a full block to encode efficiently. A trickle of small,
+//!   highly-compressible lines can keep the *output* buffer at zero for
+//!   a long time, so no threshold crossing fires and end-of-run produces
+//!   a single batch. Use `compression.format: none` for size-driven
+//!   batching with predictable thresholds, or feed enough volume per
+//!   prefix to force several internal block flushes.
+//! - Concurrent uploaders mean batches within a prefix can land out of
+//!   order on S3. `{seq}` reflects sink finalization order, not
+//!   upload-completion order.
+//! - `{seq}` is an in-memory counter, so two runs hitting the same
+//!   prefix produce overlapping `{seq}` values; `{run_id}` (unique per
+//!   process) is the disambiguator.
+//!
+//! ## Key template placeholders
+//!
+//! - `{prefix}` — the source S3 prefix (e.g. `logs/dt=20240315/hour=09`).
+//! - `{prefix_hash}` — 8-char hex hash of the prefix. Useful when the
+//!   source prefix contains characters you don't want in the destination
+//!   key.
+//! - `{seq}` — zero-padded 5-digit per-prefix sequence number.
+//! - `{run_id}` — 8-char hex hash unique to this process invocation.
+//! - `{ext}` — codec-derived file extension (`zst` / `gz` / empty).
+//!
+//! ## Multipart uploads
+//!
+//! Currently every batch is uploaded via a single `PutObject` request.
+//! AWS supports up to 5 GB per single PUT, so configurations with
+//! batches under that limit work as-is. True multipart support
+//! (chunking a single batch into parts) is left as future work — the
+//! `multipart_threshold_mb` and `multipart_part_mb` config fields are
+//! accepted but not yet acted upon, and the sink emits a warning at
+//! startup if you set them away from the defaults so the gap is
+//! explicit.
 //!
 //! ## Key template placeholders
 //!
@@ -33,15 +94,17 @@
 //! and the sink emits a warning at startup if you set them away from the
 //! defaults so the gap is explicit.
 
+use super::codec::{Codec, CodecEncoder};
 use super::output::{BoxFinishFuture, OutputSink, OutputStats};
+use super::path_template::{
+    make_run_id, render_template, CollisionResult, CollisionTracker, TemplateValues,
+};
 use crate::config::output::S3OutputConfig;
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,7 +113,7 @@ use tracing::{debug, error, warn};
 
 /// In-flight per-prefix batch state.
 struct PrefixBatch {
-    encoder: zstd::Encoder<'static, Vec<u8>>,
+    encoder: CodecEncoder<Vec<u8>>,
     lines: u64,
     plaintext: u64,
     seq: u64,
@@ -61,10 +124,10 @@ struct Inner {
     client: Client,
     bucket: String,
     key_template: String,
-    /// `Some(n)` enables size-based rollover at `n` compressed bytes per
+    /// `Some(n)` enables size-based mid-run flushes at `n` compressed bytes per
     /// prefix. `None` disables rollover — each prefix produces one object.
     batch_max_bytes: Option<u64>,
-    compression_level: i32,
+    codec: Codec,
     run_id: String,
     /// Per-prefix mutable state. Outer Mutex protects map insertion only;
     /// per-prefix entries are `Mutex<PrefixBatch>` so different prefixes
@@ -72,6 +135,13 @@ struct Inner {
     prefixes: Mutex<HashMap<String, Arc<Mutex<PrefixBatch>>>>,
     /// Bounded queue for finalized batches awaiting upload.
     upload_tx: Mutex<Option<flume::Sender<UploadJob>>>,
+    /// Defence-in-depth: warn (don't error) when two distinct source
+    /// prefixes render to the same destination key. Static validation
+    /// catches the common cases at config-resolve time; this catches the
+    /// residual case (e.g. `{prefix_hash}` collisions on real inputs).
+    /// Per upload, since each PutObject silently overwrites the previous,
+    /// the run still completes — we just want the operator to know.
+    collisions: Mutex<CollisionTracker>,
     /// Counters for end-of-run stats.
     matched_lines: AtomicU64,
     plaintext_bytes: AtomicU64,
@@ -127,16 +197,18 @@ impl S3OutputSink {
         let (upload_tx, upload_rx) = flume::bounded::<UploadJob>(upload_tasks * 2);
 
         let run_id = make_run_id();
+        let codec = Codec::from_config(&cfg.compression)?;
 
         let inner = Arc::new(Inner {
             client,
             bucket: cfg.bucket.clone(),
             key_template: cfg.key_template.clone(),
             batch_max_bytes: cfg.batch_max_mb.map(|mb| (mb * 1_000_000.0) as u64),
-            compression_level: cfg.compression_level.unwrap_or(3),
+            codec,
             run_id,
             prefixes: Mutex::new(HashMap::new()),
             upload_tx: Mutex::new(Some(upload_tx)),
+            collisions: Mutex::new(CollisionTracker::new()),
             matched_lines: AtomicU64::new(0),
             plaintext_bytes: AtomicU64::new(0),
             compressed_bytes: AtomicU64::new(0),
@@ -172,16 +244,17 @@ impl S3OutputSink {
             let body_len = body.len() as u64;
             let body_stream = ByteStream::from(body);
 
-            let result = inner
+            let mut req = inner
                 .client
                 .put_object()
                 .bucket(&inner.bucket)
                 .key(&key)
                 .body(body_stream)
-                .content_type("application/x-ndjson")
-                .content_encoding("zstd")
-                .send()
-                .await;
+                .content_type("application/x-ndjson");
+            if let Some(enc) = inner.codec.content_encoding() {
+                req = req.content_encoding(enc);
+            }
+            let result = req.send().await;
 
             match result {
                 Ok(_) => {
@@ -232,10 +305,12 @@ impl S3OutputSink {
     fn flush_batch(inner: &Inner, prefix: &str, batch: &mut PrefixBatch) -> Result<()> {
         let encoder = std::mem::replace(
             &mut batch.encoder,
-            zstd::Encoder::new(Vec::new(), inner.compression_level)
-                .context("create replacement zstd encoder")?,
+            inner
+                .codec
+                .encoder(Vec::new())
+                .context("create replacement encoder")?,
         );
-        let body = encoder.finish().context("finalize zstd batch")?;
+        let body = encoder.finish().context("finalize batch encoder")?;
         let lines = std::mem::replace(&mut batch.lines, 0);
         let plaintext = std::mem::replace(&mut batch.plaintext, 0);
 
@@ -243,8 +318,34 @@ impl S3OutputSink {
             return Ok(());
         }
 
-        let key = render_key(&inner.key_template, prefix, batch.seq, &inner.run_id);
+        let key = render_template(
+            &inner.key_template,
+            &TemplateValues {
+                prefix,
+                run_id: &inner.run_id,
+                seq: batch.seq,
+                ext: inner.codec.extension(),
+            },
+        );
         batch.seq += 1;
+
+        // Defence-in-depth collision check. Static validation forbids
+        // templates without `{prefix}`/`{prefix_hash}`, so this only
+        // fires on residual cases (hash collisions, weird literals).
+        // Warn-only — the upload still goes through.
+        {
+            let mut tracker = inner.collisions.lock().unwrap_or_else(|e| e.into_inner());
+            if let CollisionResult::Collision { existing_prefix } = tracker.record(prefix, &key) {
+                warn!(
+                    bucket = %inner.bucket,
+                    key = %key,
+                    existing_prefix = %existing_prefix,
+                    new_prefix = %prefix,
+                    "S3 output: distinct source prefixes render to the same destination key — \
+                     the second upload will overwrite the first"
+                );
+            }
+        }
 
         let tx_guard = inner.upload_tx.lock().unwrap_or_else(|e| e.into_inner());
         match tx_guard.as_ref() {
@@ -273,8 +374,11 @@ impl OutputSink for S3OutputSink {
                 .unwrap_or_else(|e| e.into_inner());
             map.entry(prefix.to_string())
                 .or_insert_with(|| {
-                    let encoder = zstd::Encoder::new(Vec::new(), self.inner.compression_level)
-                        .expect("zstd encoder creation must succeed");
+                    let encoder = self
+                        .inner
+                        .codec
+                        .encoder(Vec::new())
+                        .expect("encoder creation must succeed");
                     Arc::new(Mutex::new(PrefixBatch {
                         encoder,
                         lines: 0,
@@ -286,7 +390,7 @@ impl OutputSink for S3OutputSink {
         };
 
         let mut batch = entry.lock().unwrap_or_else(|e| e.into_inner());
-        batch.encoder.write_all(line).context("zstd write")?;
+        batch.encoder.write_all(line).context("encoder write")?;
         batch.lines += 1;
         batch.plaintext += line.len() as u64;
 
@@ -296,7 +400,7 @@ impl OutputSink for S3OutputSink {
             .fetch_add(line.len() as u64, Ordering::Relaxed);
 
         if let Some(threshold) = self.inner.batch_max_bytes {
-            let approx_compressed = batch.encoder.get_ref().len() as u64;
+            let approx_compressed = batch.encoder.buffered_len() as u64;
             if approx_compressed >= threshold {
                 Self::flush_batch(&self.inner, prefix, &mut batch)?;
             }
@@ -387,43 +491,21 @@ impl OutputSink for S3OutputSink {
     }
 }
 
-fn render_key(template: &str, prefix: &str, seq: u64, run_id: &str) -> String {
-    let prefix_hash = short_hash(prefix);
-    template
-        .replace("{prefix}", prefix)
-        .replace("{prefix_hash}", &prefix_hash)
-        .replace("{seq}", &format!("{seq:05}"))
-        .replace("{run_id}", run_id)
-}
-
-fn short_hash(s: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    format!("{:08x}", hasher.finish() as u32)
-}
-
-fn make_run_id() -> String {
-    let mut hasher = DefaultHasher::new();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    nanos.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    format!("{:08x}", hasher.finish() as u32)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::path_template::short_hash;
 
     #[test]
     fn render_key_substitutes_all_placeholders() {
-        let key = render_key(
-            "out/{prefix}/{prefix_hash}-{seq}-{run_id}.zst",
-            "logs/dt=20240101",
-            7,
-            "abcd1234",
+        let key = render_template(
+            "out/{prefix}/{prefix_hash}-{seq}-{run_id}.{ext}",
+            &TemplateValues {
+                prefix: "logs/dt=20240101",
+                run_id: "abcd1234",
+                seq: 7,
+                ext: "zst",
+            },
         );
         assert!(key.starts_with("out/logs/dt=20240101/"));
         assert!(key.contains("00007"));

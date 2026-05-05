@@ -8,6 +8,8 @@
 //! plumbing are designed so a future fan-out implementation can drop the
 //! single-entry restriction without breaking changes.
 
+use crate::pipeline::codec::{Codec, CompressionConfig};
+use crate::pipeline::path_template::{validate_template, TemplateRules};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +42,15 @@ impl OutputConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileOutputConfig {
     pub dir: String,
+    /// Per-prefix output filename, relative to `dir`. Supports
+    /// `{prefix}`, `{prefix_hash}`, `{run_id}`, `{ext}`. Default
+    /// `"{prefix}.{ext}"` matches the historic layout. Must contain
+    /// `{prefix}` or `{prefix_hash}` so distinct source prefixes don't
+    /// collide.
+    #[serde(default = "default_file_path_template")]
+    pub path_template: String,
     #[serde(default)]
-    pub compression_level: Option<i32>,
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -63,7 +72,7 @@ pub struct HttpOutputConfig {
     #[serde(default = "default_http_line_channel_size")]
     pub line_channel_size: usize,
     #[serde(default)]
-    pub compression_level: Option<i32>,
+    pub compression: CompressionConfig,
     #[serde(default = "default_http_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_http_max_upload_rate_mbps")]
@@ -104,15 +113,26 @@ pub struct S3OutputConfig {
     pub endpoint_url: Option<String>,
     #[serde(default = "default_s3_key_template")]
     pub key_template: String,
-    /// Optional size threshold (MB) for per-prefix batch rollover. When unset,
-    /// each source prefix produces exactly one output object (N:1 reduction,
-    /// matching file sink semantics). When set, a prefix's compressed buffer
-    /// is finalized and uploaded once it crosses this size, and a new
-    /// `{seq}` is started for that prefix.
+    /// Optional per-prefix mid-run flush threshold (MB).
+    ///
+    /// Unset (default) → one PutObject per source prefix, finalized at
+    /// end-of-run. `{seq}` always renders to `00000`.
+    ///
+    /// Set → after every ingested line the per-prefix encoder's compressed
+    /// output buffer is compared to this threshold. On crossing, the
+    /// encoder is finalized, the resulting frame is uploaded as one batch
+    /// (`{seq}` substituted into `key_template`, then incremented), and a
+    /// fresh encoder is started for that prefix. End-of-run still emits
+    /// one final flush per prefix to capture the trailing partial. Use
+    /// when output objects must stay under a size cap (e.g. downstream
+    /// import limits). The threshold is on *compressed* bytes and is
+    /// checked after each line, so individual batches land slightly above
+    /// the configured size rather than at it. `key_template` must contain
+    /// `{seq}` when this field is set.
     #[serde(default)]
     pub batch_max_mb: Option<f64>,
     #[serde(default)]
-    pub compression_level: Option<i32>,
+    pub compression: CompressionConfig,
     #[serde(default = "default_s3_multipart_threshold_mb")]
     pub multipart_threshold_mb: u64,
     #[serde(default = "default_s3_multipart_part_mb")]
@@ -149,7 +169,11 @@ fn default_aimd_max_submission_time_s() -> f64 {
     4.0
 }
 fn default_s3_key_template() -> String {
-    "results/{date}/{hour}/{prefix_hash}-{seq}.ndjson.zst".to_string()
+    "results/{prefix}/{run_id}-{seq}.ndjson.{ext}".to_string()
+}
+
+fn default_file_path_template() -> String {
+    "{prefix}.{ext}".to_string()
 }
 fn default_s3_multipart_threshold_mb() -> u64 {
     64
@@ -184,6 +208,45 @@ pub fn expand_env(cfg: &mut OutputConfig) -> Result<()> {
                 expand_in_place(s, "outputs[].endpoint_url")?;
             }
             expand_in_place(&mut c.key_template, "outputs[].key_template")?;
+        }
+        OutputConfig::Void => {}
+    }
+    Ok(())
+}
+
+/// Validate configuration that depends on placeholder content or
+/// codec-level ranges. Runs after `expand_env` so the validator sees the
+/// final resolved strings. Errors are field-named so the user can locate
+/// the offending YAML / CLI flag.
+pub fn validate_output(cfg: &OutputConfig) -> Result<()> {
+    match cfg {
+        OutputConfig::File(c) => {
+            Codec::from_config(&c.compression)
+                .map_err(|e| anyhow!("outputs[].compression: {e}"))?;
+            validate_template(
+                &c.path_template,
+                "outputs[].path_template",
+                TemplateRules {
+                    require_seq: false,
+                    allow_seq: false,
+                },
+            )?;
+        }
+        OutputConfig::Http(c) => {
+            Codec::from_config(&c.compression)
+                .map_err(|e| anyhow!("outputs[].compression: {e}"))?;
+        }
+        OutputConfig::S3(c) => {
+            Codec::from_config(&c.compression)
+                .map_err(|e| anyhow!("outputs[].compression: {e}"))?;
+            validate_template(
+                &c.key_template,
+                "outputs[].key_template",
+                TemplateRules {
+                    require_seq: c.batch_max_mb.is_some(),
+                    allow_seq: true,
+                },
+            )?;
         }
         OutputConfig::Void => {}
     }
@@ -254,6 +317,7 @@ fn expand_str(s: &str, field_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::codec::CodecFormat;
 
     #[test]
     fn expand_passthrough_when_no_placeholders() {
@@ -336,5 +400,157 @@ mystery: 42
 "#;
         let err = serde_yaml::from_str::<OutputConfig>(yaml).unwrap_err();
         assert!(format!("{err}").contains("mystery"));
+    }
+
+    #[test]
+    fn file_output_default_path_template_validates() {
+        let cfg = OutputConfig::File(FileOutputConfig {
+            dir: "/tmp/out".into(),
+            path_template: default_file_path_template(),
+            compression: CompressionConfig::default(),
+        });
+        validate_output(&cfg).unwrap();
+    }
+
+    #[test]
+    fn s3_output_default_key_template_validates() {
+        let cfg = OutputConfig::S3(S3OutputConfig {
+            bucket: "results".into(),
+            region: None,
+            endpoint_url: None,
+            key_template: default_s3_key_template(),
+            batch_max_mb: None,
+            compression: CompressionConfig::default(),
+            multipart_threshold_mb: 64,
+            multipart_part_mb: 16,
+            upload_tasks: None,
+        });
+        validate_output(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_file_template_without_prefix() {
+        let cfg = OutputConfig::File(FileOutputConfig {
+            dir: "/tmp/out".into(),
+            path_template: "results.{ext}".into(),
+            compression: CompressionConfig::default(),
+        });
+        let err = validate_output(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("path_template"), "{msg}");
+        assert!(msg.contains("{prefix}"), "{msg}");
+    }
+
+    #[test]
+    fn validate_rejects_file_template_with_seq() {
+        let cfg = OutputConfig::File(FileOutputConfig {
+            dir: "/tmp/out".into(),
+            path_template: "{prefix}-{seq}.{ext}".into(),
+            compression: CompressionConfig::default(),
+        });
+        let err = validate_output(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("{seq}"));
+    }
+
+    #[test]
+    fn validate_rejects_s3_rollover_without_seq() {
+        let cfg = OutputConfig::S3(S3OutputConfig {
+            bucket: "results".into(),
+            region: None,
+            endpoint_url: None,
+            key_template: "out/{prefix}.ndjson.{ext}".into(),
+            batch_max_mb: Some(10.0),
+            compression: CompressionConfig::default(),
+            multipart_threshold_mb: 64,
+            multipart_part_mb: 16,
+            upload_tasks: None,
+        });
+        let err = validate_output(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("{seq}"));
+    }
+
+    #[test]
+    fn validate_rejects_s3_template_without_prefix() {
+        let cfg = OutputConfig::S3(S3OutputConfig {
+            bucket: "results".into(),
+            region: None,
+            endpoint_url: None,
+            key_template: "out/{run_id}.ndjson.{ext}".into(),
+            batch_max_mb: None,
+            compression: CompressionConfig::default(),
+            multipart_threshold_mb: 64,
+            multipart_part_mb: 16,
+            upload_tasks: None,
+        });
+        let err = validate_output(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("{prefix}"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_compression_level() {
+        let cfg = OutputConfig::File(FileOutputConfig {
+            dir: "/tmp/out".into(),
+            path_template: default_file_path_template(),
+            compression: CompressionConfig {
+                format: CodecFormat::Zstd,
+                level: Some(99),
+            },
+        });
+        let err = validate_output(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("zstd"));
+    }
+
+    #[test]
+    fn compression_block_deserializes() {
+        let yaml = r#"
+type: file
+dir: /tmp/out
+compression:
+  format: gzip
+  level: 5
+"#;
+        let cfg: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            OutputConfig::File(f) => {
+                assert_eq!(f.compression.format, CodecFormat::Gzip);
+                assert_eq!(f.compression.level, Some(5));
+            }
+            other => panic!("expected file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_format_none_works() {
+        let yaml = r#"
+type: http
+url: https://example.com/api
+compression:
+  format: none
+"#;
+        let cfg: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            OutputConfig::Http(h) => {
+                assert_eq!(h.compression.format, CodecFormat::None);
+                assert!(h.compression.level.is_none());
+                validate_output(&OutputConfig::Http(h)).unwrap();
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_block_omitted_uses_zstd_default() {
+        let yaml = r#"
+type: file
+dir: /tmp/out
+"#;
+        let cfg: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            OutputConfig::File(f) => {
+                assert_eq!(f.compression.format, CodecFormat::Zstd);
+                assert!(f.compression.level.is_none());
+            }
+            other => panic!("expected file, got {other:?}"),
+        }
     }
 }

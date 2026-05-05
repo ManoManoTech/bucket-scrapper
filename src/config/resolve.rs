@@ -14,9 +14,11 @@
 //! No per-field merge, no precedence puzzles.
 
 use crate::config::output::{
-    expand_env, FileOutputConfig, HttpAimdConfig, HttpOutputConfig, OutputConfig, S3OutputConfig,
+    expand_env, validate_output, FileOutputConfig, HttpAimdConfig, HttpOutputConfig, OutputConfig,
+    S3OutputConfig,
 };
 use crate::config::types::ConfigSchema;
+use crate::pipeline::codec::{CodecFormat, CompressionConfig};
 use anyhow::{anyhow, Result};
 
 /// Selectable output type on the CLI.
@@ -75,10 +77,11 @@ pub struct OutputCli {
     pub s3_multipart_threshold_mb: Option<u64>,
     pub s3_multipart_part_mb: Option<u64>,
     pub s3_upload_tasks: Option<usize>,
-    pub s3_compression_level: Option<i32>,
 
     // shared
+    pub compression_format: Option<CodecFormat>,
     pub compression_level: Option<i32>,
+    pub file_path_template: Option<String>,
 }
 
 impl OutputCli {
@@ -120,8 +123,9 @@ impl OutputCli {
         );
         check!(s3_multipart_part_mb, "--s3-output-multipart-part-mb");
         check!(s3_upload_tasks, "--s3-output-upload-tasks");
-        check!(s3_compression_level, "--s3-output-compression-level");
+        check!(compression_format, "--compression-format");
         check!(compression_level, "--compression-level");
+        check!(file_path_template, "--output-path-template");
         v
     }
 
@@ -149,9 +153,19 @@ pub fn resolve_output(cli: &OutputCli, schema: &ConfigSchema) -> Result<OutputCo
         }
         let mut chosen = schema.outputs[0].clone();
         expand_env(&mut chosen)?;
+        validate_output(&chosen)?;
         Ok(chosen)
     } else {
-        build_from_cli(cli)
+        let chosen = build_from_cli(cli)?;
+        validate_output(&chosen)?;
+        Ok(chosen)
+    }
+}
+
+fn cli_compression(cli: &OutputCli) -> CompressionConfig {
+    CompressionConfig {
+        format: cli.compression_format.unwrap_or_default(),
+        level: cli.compression_level,
     }
 }
 
@@ -172,7 +186,11 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 .output_dir
                 .clone()
                 .ok_or_else(|| anyhow!("--output file requires --output-dir <path>"))?,
-            compression_level: cli.compression_level,
+            path_template: cli
+                .file_path_template
+                .clone()
+                .unwrap_or_else(|| "{prefix}.{ext}".to_string()),
+            compression: cli_compression(cli),
         }),
         OutputKind::Http => {
             let url = cli
@@ -188,7 +206,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 upload_tasks: cli.http_upload_tasks,
                 upload_channel_size: cli.http_upload_channel_size.unwrap_or(4),
                 line_channel_size: cli.http_line_channel_size.unwrap_or(1000),
-                compression_level: cli.compression_level,
+                compression: cli_compression(cli),
                 max_retries: cli.http_max_retries.unwrap_or(3),
                 max_upload_rate_mbps: cli.http_max_upload_rate_mbps.unwrap_or(0.0),
                 aimd: HttpAimdConfig {
@@ -210,9 +228,9 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 key_template: cli
                     .s3_key_template
                     .clone()
-                    .unwrap_or_else(|| "results/{prefix}/part-{seq}.ndjson.zst".to_string()),
+                    .unwrap_or_else(|| "results/{prefix}/part-{seq}.ndjson.{ext}".to_string()),
                 batch_max_mb: cli.s3_batch_max_mb,
-                compression_level: cli.s3_compression_level.or(cli.compression_level),
+                compression: cli_compression(cli),
                 multipart_threshold_mb: cli.s3_multipart_threshold_mb.unwrap_or(64),
                 multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(16),
                 upload_tasks: cli.s3_upload_tasks,
@@ -276,7 +294,7 @@ fn reject_inactive_flags(kind: OutputKind, cli: &OutputCli) -> Result<()> {
     );
     reject_unless!(is_s3, s3_multipart_part_mb, "--s3-output-multipart-part-mb");
     reject_unless!(is_s3, s3_upload_tasks, "--s3-output-upload-tasks");
-    reject_unless!(is_s3, s3_compression_level, "--s3-output-compression-level");
+    reject_unless!(is_file, file_path_template, "--output-path-template");
 
     if !bad.is_empty() {
         return Err(anyhow!(
@@ -383,7 +401,7 @@ mod tests {
             upload_tasks: None,
             upload_channel_size: 4,
             line_channel_size: 1000,
-            compression_level: None,
+            compression: CompressionConfig::default(),
             max_retries: 1,
             max_upload_rate_mbps: 0.0,
             aimd: HttpAimdConfig::default(),

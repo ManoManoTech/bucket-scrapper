@@ -1,3 +1,4 @@
+use super::codec::Codec;
 use super::observer::PipelineObserver;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -313,8 +314,10 @@ pub struct HttpWriterConfig {
     pub num_upload_tasks: usize,
     /// Batch channel capacity between compressors and uploaders (RAM ≈ this × batch_max_bytes)
     pub upload_channel_size: usize,
-    /// Zstd compression level (1-22)
-    pub compression_level: i32,
+    /// Compression codec for outgoing batches (zstd / gzip / none).
+    /// Drives both the encoder used by compressor tasks and the
+    /// `Content-Encoding` header on the wire (omitted for `none`).
+    pub codec: Codec,
     /// Per-batch submission time threshold for AIMD throttle.
     /// `None` = no AIMD throttling.  Default: `Some(2.5s)`.
     pub max_submission_time: Option<Duration>,
@@ -345,7 +348,7 @@ impl Default for HttpWriterConfig {
             num_compressor_tasks,
             num_upload_tasks: 4 * num_compressor_tasks,
             upload_channel_size: 4,
-            compression_level: 3,
+            codec: Codec::Zstd { level: 3 },
             max_submission_time: Some(Duration::from_secs(4)),
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
@@ -536,10 +539,10 @@ impl HttpResultWriter {
             };
 
             // 2. Compress lines into buffer
-            let mut encoder = match zstd::Encoder::new(Vec::new(), config.compression_level) {
+            let mut encoder = match config.codec.encoder(Vec::new()) {
                 Ok(enc) => enc,
                 Err(e) => {
-                    error!(task = task_id, error = %e, "Failed to create zstd encoder");
+                    error!(task = task_id, error = %e, "Failed to create encoder");
                     break 'outer;
                 }
             };
@@ -554,7 +557,7 @@ impl HttpResultWriter {
 
             // Fill batch until compressed output reaches batch_max_bytes or channel closes
             loop {
-                if encoder.get_ref().len() >= config.batch_max_bytes {
+                if encoder.buffered_len() >= config.batch_max_bytes {
                     break;
                 }
 
@@ -583,11 +586,11 @@ impl HttpResultWriter {
                 batch_plaintext_bytes += line.len();
             }
 
-            // 3. Finalize zstd frame → CompressedBatch
+            // 3. Finalize encoder frame → CompressedBatch
             let compressed = match encoder.finish() {
                 Ok(buf) => buf,
                 Err(e) => {
-                    error!(task = task_id, error = %e, lines = batch_lines, "Failed to finalize zstd frame");
+                    error!(task = task_id, error = %e, lines = batch_lines, "Failed to finalize encoder frame");
                     lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
                     if channel_closed {
                         break 'outer;
@@ -800,8 +803,10 @@ impl HttpResultWriter {
 
             let mut request = client
                 .post(&config.url)
-                .header("Content-Type", "application/x-ndjson")
-                .header("Content-Encoding", "zstd");
+                .header("Content-Type", "application/x-ndjson");
+            if let Some(enc) = config.codec.content_encoding() {
+                request = request.header("Content-Encoding", enc);
+            }
             if let Some(token) = &config.bearer_token {
                 request = request.header("Authorization", format!("Bearer {}", token));
             }
@@ -1148,6 +1153,92 @@ mod tests {
         );
     }
 
+    /// One-shot wiremock test: send a single batch through the writer and
+    /// return whatever requests the mock server received. Used to assert
+    /// codec-driven Content-Encoding behavior without re-validating the
+    /// entire pipeline for each codec.
+    async fn capture_one_request(codec: Codec) -> Vec<wiremock::Request> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let cfg = HttpWriterConfig {
+            url: format!("{}/api/v1/logs", mock_server.uri()),
+            bearer_token: None,
+            batch_max_bytes: 4 * 1024,
+            timeout_secs: 5,
+            max_retries: 0,
+            channel_buffer_size: 4,
+            num_compressor_tasks: 1,
+            num_upload_tasks: 1,
+            upload_channel_size: 1,
+            codec,
+            max_submission_time: None,
+            max_upload_rate: None,
+            aimd_decrease_factor: 0.15,
+            aimd_increase_bytes: 1_000_000.0,
+        };
+        let writer = HttpResultWriter::new(cfg).expect("writer creation");
+        let sender = writer.get_sender();
+        for i in 0..5 {
+            sender
+                .send_async(format!("{{\"i\":{i}}}\n").into_bytes())
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let _ = writer.finish().await.expect("finish");
+        mock_server.received_requests().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_request_carries_zstd_content_encoding() {
+        let reqs = capture_one_request(Codec::Zstd { level: 1 }).await;
+        assert!(!reqs.is_empty(), "no request received");
+        let ce = reqs[0]
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(ce, Some("zstd"), "expected Content-Encoding: zstd");
+        // Body must round-trip through zstd.
+        let plain = zstd::stream::decode_all(reqs[0].body.as_slice()).expect("zstd decode");
+        assert!(!plain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_request_carries_gzip_content_encoding() {
+        let reqs = capture_one_request(Codec::Gzip { level: 6 }).await;
+        assert!(!reqs.is_empty(), "no request received");
+        let ce = reqs[0]
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(ce, Some("gzip"), "expected Content-Encoding: gzip");
+        let mut decoder = flate2::read::GzDecoder::new(reqs[0].body.as_slice());
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut plain).expect("gzip decode");
+        assert!(!plain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_request_omits_content_encoding_for_plaintext_codec() {
+        let reqs = capture_one_request(Codec::None).await;
+        assert!(!reqs.is_empty(), "no request received");
+        assert!(
+            reqs[0].headers.get("content-encoding").is_none(),
+            "plaintext codec must not set Content-Encoding header"
+        );
+        // Body is raw NDJSON, no decompression needed.
+        let s = std::str::from_utf8(&reqs[0].body).expect("utf8");
+        assert!(s.contains("{\"i\":0}"));
+    }
+
     #[tokio::test]
     async fn pipeline_handles_429_and_recovers() {
         use wiremock::matchers::{method, path};
@@ -1182,7 +1273,7 @@ mod tests {
             num_compressor_tasks: 1,
             num_upload_tasks: 1,
             upload_channel_size: 4,
-            compression_level: 1,
+            codec: Codec::Zstd { level: 1 },
             // Enable AIMD so force_decrease fires on 429
             max_submission_time: Some(Duration::from_secs(3)),
             max_upload_rate: None,

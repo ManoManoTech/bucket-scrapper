@@ -5,7 +5,7 @@
 
 mod e2e;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use assert_cmd::Command;
 use aws_sdk_s3::Client as S3Client;
 use e2e::fixtures::{build_fixture, expected_matches, seed_bucket, Encoding, StagedObject};
@@ -22,7 +22,70 @@ const DATE: &str = "20260101"; // 2026-01-01
 const HOURS: &[&str] = &["10", "11"];
 const PATTERN: &str = "ERROR";
 
+/// Output codec under test in an e2e run. Mirrors the production
+/// `Codec`/`CodecFormat` axis without depending on the lib's tagged
+/// enum (which would force the test to import private fields).
+#[derive(Clone, Copy, Debug)]
+enum TestCodec {
+    Zstd,
+    Gzip,
+    None,
+}
+
+impl TestCodec {
+    fn cli_format(self) -> &'static str {
+        match self {
+            TestCodec::Zstd => "zstd",
+            TestCodec::Gzip => "gzip",
+            TestCodec::None => "none",
+        }
+    }
+
+    /// File extension the codec produces (no leading dot). Empty for plaintext.
+    fn extension(self) -> &'static str {
+        match self {
+            TestCodec::Zstd => "zst",
+            TestCodec::Gzip => "gz",
+            TestCodec::None => "",
+        }
+    }
+
+    /// Wire `Content-Encoding` value, or `None` for plaintext.
+    fn content_encoding(self) -> Option<&'static str> {
+        match self {
+            TestCodec::Zstd => Some("zstd"),
+            TestCodec::Gzip => Some("gzip"),
+            TestCodec::None => None,
+        }
+    }
+
+    fn decode(self, body: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            TestCodec::Zstd => Ok(zstd::stream::decode_all(body)?),
+            TestCodec::Gzip => {
+                let mut decoder = flate2::read::GzDecoder::new(body);
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)?;
+                Ok(out)
+            }
+            TestCodec::None => Ok(body.to_vec()),
+        }
+    }
+}
+
 fn write_config_yaml(path: &Path, output_dir: Option<&Path>) -> Result<()> {
+    write_config_yaml_with_codec(path, output_dir, None)
+}
+
+/// Like [`write_config_yaml`] but bakes the compression block into the
+/// config-file `outputs:` entry. Needed for the file e2e tests, where
+/// the YAML carries `outputs:` and CLI codec flags would be rejected by
+/// the resolver (config-driven mode forbids per-output CLI flags).
+fn write_config_yaml_with_codec(
+    path: &Path,
+    output_dir: Option<&Path>,
+    codec: Option<TestCodec>,
+) -> Result<()> {
     let mut yaml = format!(
         r#"buckets:
   - bucket: {BUCKET}
@@ -40,20 +103,28 @@ region: garage
             "outputs:\n  - type: file\n    dir: {}\n",
             dir.display()
         ));
+        if let Some(c) = codec {
+            yaml.push_str(&format!(
+                "    compression:\n      format: {}\n",
+                c.cli_format()
+            ));
+        }
     }
     std::fs::write(path, yaml)?;
     Ok(())
 }
 
-fn read_zst_file(path: &Path) -> Result<String> {
-    let f = std::fs::File::open(path)?;
-    let mut decoder = zstd::Decoder::new(f)?;
-    let mut s = String::new();
-    decoder.read_to_string(&mut s)?;
-    Ok(s)
+fn decode_file(path: &Path, codec: TestCodec) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    let plain = codec.decode(&bytes)?;
+    Ok(String::from_utf8(plain)?)
 }
 
-fn collect_zst_files(root: &Path) -> Vec<std::path::PathBuf> {
+/// Walk `root` and collect every file whose name ends with the codec's
+/// extension. For `TestCodec::None` (no extension) we accept any
+/// extension-less file, which works for the test fixture's templates
+/// (`{prefix}.{ext}` collapses to `{prefix}`).
+fn collect_outputs(root: &Path, codec: TestCodec) -> Vec<std::path::PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -62,25 +133,47 @@ fn collect_zst_files(root: &Path) -> Vec<std::path::PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("zst") {
+            } else {
                 out.push(p);
             }
         }
     }
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out
+    let ext = codec.extension();
+    let mut all = Vec::new();
+    walk(root, &mut all);
+    all.into_iter()
+        .filter(|p| {
+            let actual = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            actual == ext
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn file_output_end_to_end() {
+async fn file_output_end_to_end_zstd() {
     skip_unless_docker!();
-    if let Err(e) = run_file_test().await {
-        panic!("file_output_end_to_end failed: {e:#}");
+    if let Err(e) = run_file_test(TestCodec::Zstd).await {
+        panic!("file_output_end_to_end_zstd failed: {e:#}");
     }
 }
 
-async fn run_file_test() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_output_end_to_end_gzip() {
+    skip_unless_docker!();
+    if let Err(e) = run_file_test(TestCodec::Gzip).await {
+        panic!("file_output_end_to_end_gzip failed: {e:#}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_output_end_to_end_plaintext() {
+    skip_unless_docker!();
+    if let Err(e) = run_file_test(TestCodec::None).await {
+        panic!("file_output_end_to_end_plaintext failed: {e:#}");
+    }
+}
+
+async fn run_file_test(codec: TestCodec) -> Result<()> {
     let garage = start_garage(BUCKET).await?;
     let s3 = garage.s3_client();
     let staged = build_fixture(DATE, HOURS);
@@ -90,7 +183,9 @@ async fn run_file_test() -> Result<()> {
     let output_dir = workdir.path().join("out");
     std::fs::create_dir_all(&output_dir)?;
     let config_path = workdir.path().join("config.yaml");
-    write_config_yaml(&config_path, Some(&output_dir))?;
+    // The codec must live in the YAML, not on the CLI: config-driven
+    // mode (an `outputs:` block is present) forbids per-output CLI flags.
+    write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(codec))?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
     for (k, v) in garage.env_for_scrapper() {
@@ -116,16 +211,17 @@ async fn run_file_test() -> Result<()> {
         .assert()
         .success();
 
-    let zsts = collect_zst_files(&output_dir);
+    let outputs = collect_outputs(&output_dir, codec);
     assert!(
-        !zsts.is_empty(),
-        "no .zst output files written under {}",
+        !outputs.is_empty(),
+        "no outputs (ext={:?}) written under {}",
+        codec.extension(),
         output_dir.display()
     );
 
     let mut received: Vec<String> = Vec::new();
-    for f in &zsts {
-        let s = read_zst_file(f)?;
+    for f in &outputs {
+        let s = decode_file(f, codec)?;
         for line in s.lines() {
             if !line.is_empty() {
                 received.push(line.to_string());
@@ -139,14 +235,30 @@ async fn run_file_test() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn http_output_end_to_end() {
+async fn http_output_end_to_end_zstd() {
     skip_unless_docker!();
-    if let Err(e) = run_http_test().await {
-        panic!("http_output_end_to_end failed: {e:#}");
+    if let Err(e) = run_http_test(TestCodec::Zstd).await {
+        panic!("http_output_end_to_end_zstd failed: {e:#}");
     }
 }
 
-async fn run_http_test() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_output_end_to_end_gzip() {
+    skip_unless_docker!();
+    if let Err(e) = run_http_test(TestCodec::Gzip).await {
+        panic!("http_output_end_to_end_gzip failed: {e:#}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_output_end_to_end_plaintext() {
+    skip_unless_docker!();
+    if let Err(e) = run_http_test(TestCodec::None).await {
+        panic!("http_output_end_to_end_plaintext failed: {e:#}");
+    }
+}
+
+async fn run_http_test(codec: TestCodec) -> Result<()> {
     let garage = start_garage(BUCKET).await?;
     let s3 = garage.s3_client();
     let staged = build_fixture(DATE, HOURS);
@@ -186,6 +298,8 @@ async fn run_http_test() -> Result<()> {
         .arg("4")
         .arg("--log-format")
         .arg("json")
+        .arg("--compression-format")
+        .arg(codec.cli_format())
         .timeout(std::time::Duration::from_secs(120))
         .assert()
         .success();
@@ -193,8 +307,7 @@ async fn run_http_test() -> Result<()> {
     let dumps = nginx.collect_dumps().await?;
     let mut received: Vec<String> = Vec::new();
     for body in &dumps {
-        // Body is zstd-compressed NDJSON.
-        let plain = zstd::stream::decode_all(body.as_slice())?;
+        let plain = codec.decode(body)?;
         let s = String::from_utf8(plain)?;
         for line in s.lines() {
             if !line.is_empty() {
@@ -215,7 +328,7 @@ async fn s3_output_end_to_end_no_batching() {
     skip_unless_docker!();
     // Default mode: --s3-output-batch-max-mb omitted. Each source prefix
     // (one per hour in the fixture) collapses to exactly one output object.
-    if let Err(e) = run_s3_test(None, HOURS.len()).await {
+    if let Err(e) = run_s3_test(TestCodec::Zstd, None, HOURS.len()).await {
         panic!("s3_output_end_to_end_no_batching failed: {e:#}");
     }
 }
@@ -225,12 +338,32 @@ async fn s3_output_end_to_end_batched() {
     skip_unless_docker!();
     // Tiny rollover threshold: each prefix splits into multiple sequence
     // numbers, so we expect strictly more output objects than source prefixes.
-    if let Err(e) = run_s3_test(Some("0.00001"), HOURS.len() + 1).await {
+    if let Err(e) = run_s3_test(TestCodec::Zstd, Some("0.00001"), HOURS.len() + 1).await {
         panic!("s3_output_end_to_end_batched failed: {e:#}");
     }
 }
 
-async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end_gzip() {
+    skip_unless_docker!();
+    if let Err(e) = run_s3_test(TestCodec::Gzip, None, HOURS.len()).await {
+        panic!("s3_output_end_to_end_gzip failed: {e:#}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end_plaintext() {
+    skip_unless_docker!();
+    if let Err(e) = run_s3_test(TestCodec::None, None, HOURS.len()).await {
+        panic!("s3_output_end_to_end_plaintext failed: {e:#}");
+    }
+}
+
+async fn run_s3_test(
+    codec: TestCodec,
+    batch_max_mb: Option<&str>,
+    min_expected_objects: usize,
+) -> Result<()> {
     // Single Garage instance, two buckets: one source, one destination.
     // Same credentials, so the scrapper's source S3 client also reaches the
     // destination — no per-output endpoint/credentials override needed.
@@ -255,6 +388,9 @@ async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) ->
     let config_path = workdir.path().join("config.yaml");
     write_config_yaml(&config_path, None)?;
 
+    // Use {ext} so the same template adapts to whatever codec the test uses.
+    let key_template = "out/{prefix}/{run_id}-{seq}.ndjson.{ext}";
+
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
@@ -276,11 +412,13 @@ async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) ->
         .arg("--s3-output-bucket")
         .arg(RESULTS_BUCKET)
         .arg("--s3-output-key-template")
-        .arg("out/{prefix}/{run_id}-{seq}.ndjson.zst")
+        .arg(key_template)
         .arg("--max-parallel")
         .arg("4")
         .arg("--log-format")
-        .arg("json");
+        .arg("json")
+        .arg("--compression-format")
+        .arg(codec.cli_format());
     if let Some(mb) = batch_max_mb {
         cmd.arg("--s3-output-batch-max-mb").arg(mb);
     }
@@ -288,18 +426,47 @@ async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) ->
         .assert()
         .success();
 
-    let (received, keys) = list_and_decode_zst(&s3, RESULTS_BUCKET, "out/").await?;
+    let (received, keys) = list_and_decode(&s3, RESULTS_BUCKET, "out/", codec).await?;
     let expected = expected_matches(&staged, PATTERN);
     assert_multiset_eq(&received, &expected);
 
-    // Every returned object key matches the configured template shape:
-    //   out/<prefix-with-slashes>/<8-hex-run-id>-<5-digit-seq>.ndjson.zst
-    let template_re = regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson\.zst$").unwrap();
+    // Each returned key should match the rendered template. With codec
+    // `none` the trailing `.{ext}` collapses, so the suffix is `.ndjson`.
+    let suffix_re = match codec {
+        TestCodec::None => regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson$").unwrap(),
+        TestCodec::Zstd => regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson\.zst$").unwrap(),
+        TestCodec::Gzip => regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson\.gz$").unwrap(),
+    };
     for key in &keys {
         assert!(
-            template_re.is_match(key),
-            "destination key did not match template: {key}"
+            suffix_re.is_match(key),
+            "destination key did not match template (codec={:?}): {key}",
+            codec
         );
+    }
+
+    // Verify the wire `Content-Encoding` reflects the codec. For plaintext
+    // it must be absent (not `identity`).
+    for key in &keys {
+        let head = s3
+            .head_object()
+            .bucket(RESULTS_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("head_object {key}: {e}"))?;
+        let actual = head.content_encoding();
+        match codec.content_encoding() {
+            Some(expected) => assert_eq!(
+                actual,
+                Some(expected),
+                "object {key} should carry Content-Encoding: {expected}, got {actual:?}"
+            ),
+            None => assert!(
+                actual.is_none() || actual == Some(""),
+                "object {key} should have no Content-Encoding for plaintext codec, got {actual:?}"
+            ),
+        }
     }
 
     match batch_max_mb {
@@ -358,12 +525,14 @@ fn bulk_match_object(date: &str, hour: &str, n_lines: usize) -> StagedObject {
     }
 }
 
-/// List every object under `prefix` in `bucket`, fetch each, zstd-decode it,
-/// and return the concatenated NDJSON lines along with the object keys.
-async fn list_and_decode_zst(
+/// List every object under `prefix` in `bucket`, fetch each, decode it
+/// with the given codec, and return the concatenated NDJSON lines along
+/// with the object keys.
+async fn list_and_decode(
     client: &S3Client,
     bucket: &str,
     prefix: &str,
+    codec: TestCodec,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut keys = Vec::new();
     let mut continuation = None;
@@ -391,7 +560,7 @@ async fn list_and_decode_zst(
     for key in &keys {
         let resp = client.get_object().bucket(bucket).key(key).send().await?;
         let body = resp.body.collect().await?.to_vec();
-        let plain = zstd::stream::decode_all(body.as_slice())?;
+        let plain = codec.decode(&body)?;
         for line in String::from_utf8(plain)?.lines() {
             if !line.is_empty() {
                 lines.push(line.to_string());

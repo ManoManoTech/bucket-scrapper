@@ -19,6 +19,8 @@ use bucket_scrapper::config::path_formatter::generate_path_formatter;
 use bucket_scrapper::config::resolve::{resolve_output, OutputCli, OutputKind};
 use bucket_scrapper::config::types::{BucketConfig, ConfigSchema};
 use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
+use bucket_scrapper::pipeline::codec::Codec;
+use bucket_scrapper::pipeline::codec::CodecFormat;
 use bucket_scrapper::pipeline::{
     FileOutputSink, HttpOutputSink, HttpResultWriter, HttpWriterConfig, OutputSink, OutputStats,
     S3OutputSink, SharedFileWriter, StreamingDownloader, StreamingDownloaderConfig, VoidOutputSink,
@@ -132,7 +134,18 @@ struct Cli {
     #[arg(long)]
     output_dir: Option<String>,
 
-    /// Default zstd compression level for outputs that compress (file/http/s3).
+    /// Per-prefix output filename template for the file output. Supports
+    /// `{prefix}`, `{prefix_hash}`, `{run_id}`, `{ext}`. Default `{prefix}.{ext}`.
+    /// Must contain `{prefix}` or `{prefix_hash}` to avoid collisions.
+    #[arg(long)]
+    output_path_template: Option<String>,
+
+    /// Compression format for outputs that compress (file/http/s3).
+    #[arg(long, value_enum)]
+    compression_format: Option<CodecFormatArg>,
+
+    /// Compression level. Codec-dependent: zstd 1–22 (default 3),
+    /// gzip 0–9 (default 6). Must be unset when `--compression-format=none`.
     #[arg(long)]
     compression_level: Option<i32>,
 
@@ -204,7 +217,11 @@ struct Cli {
     #[arg(long)]
     s3_output_key_template: Option<String>,
 
-    /// Per-prefix batch rollover threshold in MB for the s3 output.
+    /// Per-prefix mid-run flush threshold in MB for the s3 output. When set,
+    /// each prefix's encoder is finalized and uploaded as soon as its
+    /// compressed buffer crosses this size, then a fresh encoder starts with
+    /// `{seq}` incremented; end-of-run flushes the trailing partial. Omit for
+    /// one object per prefix (default).
     #[arg(long)]
     s3_output_batch_max_mb: Option<f64>,
 
@@ -219,10 +236,25 @@ struct Cli {
     /// Number of concurrent uploader tasks for the s3 output.
     #[arg(long)]
     s3_output_upload_tasks: Option<usize>,
+}
 
-    /// Compression level override for the s3 output.
-    #[arg(long)]
-    s3_output_compression_level: Option<i32>,
+/// CLI mirror of [`CodecFormat`] — kept separate so clap's `ValueEnum`
+/// derive lives in the binary crate and doesn't leak into the library.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CodecFormatArg {
+    Zstd,
+    Gzip,
+    None,
+}
+
+impl From<CodecFormatArg> for CodecFormat {
+    fn from(v: CodecFormatArg) -> Self {
+        match v {
+            CodecFormatArg::Zstd => CodecFormat::Zstd,
+            CodecFormatArg::Gzip => CodecFormat::Gzip,
+            CodecFormatArg::None => CodecFormat::None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -257,8 +289,9 @@ impl Cli {
             s3_multipart_threshold_mb: self.s3_output_multipart_threshold_mb,
             s3_multipart_part_mb: self.s3_output_multipart_part_mb,
             s3_upload_tasks: self.s3_output_upload_tasks,
-            s3_compression_level: self.s3_output_compression_level,
+            compression_format: self.compression_format.map(Into::into),
             compression_level: self.compression_level,
+            file_path_template: self.output_path_template.clone(),
         }
     }
 }
@@ -555,8 +588,9 @@ async fn build_sink(
 ) -> Result<Arc<dyn OutputSink>> {
     Ok(match cfg {
         OutputConfig::File(file_cfg) => {
-            let level = file_cfg.compression_level.unwrap_or(3);
-            let writer = SharedFileWriter::new(file_cfg.dir.clone(), level)?;
+            let codec = Codec::from_config(&file_cfg.compression)?;
+            let writer =
+                SharedFileWriter::new(file_cfg.dir.clone(), file_cfg.path_template.clone(), codec)?;
             Arc::new(FileOutputSink::new(Arc::new(writer)))
         }
         OutputConfig::Http(http_cfg) => {
@@ -578,6 +612,7 @@ async fn build_sink(
                 None
             };
 
+            let codec = Codec::from_config(&http_cfg.compression)?;
             let writer_cfg = HttpWriterConfig {
                 url: http_cfg.url.clone(),
                 bearer_token: http_cfg.bearer_auth.clone(),
@@ -588,7 +623,7 @@ async fn build_sink(
                 num_compressor_tasks,
                 num_upload_tasks,
                 upload_channel_size: http_cfg.upload_channel_size,
-                compression_level: http_cfg.compression_level.unwrap_or(3),
+                codec,
                 max_submission_time,
                 max_upload_rate,
                 aimd_decrease_factor: http_cfg.aimd.decrease_factor,

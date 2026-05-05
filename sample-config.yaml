@@ -72,12 +72,29 @@ region: eu-west-3
 # secrets stay out of the YAML.
 
 outputs:
-  # ── File output: per-prefix zstd files under `dir` ───────────────────────
+  # ── File output: per-prefix files under `dir` ────────────────────────────
+  #
+  # `compression`: { format: zstd|gzip|none, level: <int> }. Omit the block
+  # to default to zstd:3. `level` ranges: zstd 1–22, gzip 0–9. Must be
+  # unset when format=none.
+  #
+  # `path_template` is the per-prefix filename (joined with `dir`).
+  # Placeholders: `{prefix}`, `{prefix_hash}`, `{run_id}`, `{ext}` (codec
+  # extension — `zst`/`gz`/empty). Default `{prefix}.{ext}` matches the
+  # historic layout. The template MUST contain `{prefix}` or
+  # `{prefix_hash}`; otherwise distinct source prefixes collide and the
+  # second one fails with a fatal error (two encoders cannot share a file).
   - type: file
     dir: ./scrapper-output
-    # compression_level: 3   # optional, 1–22
+    # path_template: "{prefix}.{ext}"
+    # compression:
+    #   format: zstd
+    #   level: 3
 
-  # ── HTTP output: NDJSON-zstd POSTs with AIMD throttle ────────────────────
+  # ── HTTP output: NDJSON POSTs with AIMD throttle ─────────────────────────
+  #
+  # `Content-Encoding` follows `compression.format` automatically (zstd /
+  # gzip), or is omitted entirely when format=none.
   # - type: http
   #   url: https://logs.example.com/api/v1/logs
   #   bearer_auth: ${HTTP_BEARER_AUTH}
@@ -87,7 +104,9 @@ outputs:
   #   upload_tasks: null         # null = 4 × compressor_tasks
   #   upload_channel_size: 4
   #   line_channel_size: 1000
-  #   compression_level: 3
+  #   compression:
+  #     format: zstd
+  #     level: 3
   #   max_retries: 3
   #   max_upload_rate_mbps: 0    # 0 = unlimited
   #   aimd:
@@ -95,17 +114,58 @@ outputs:
   #     increase_mbps: 1.0
   #     max_submission_time_s: 4.0   # 0 = AIMD disabled
 
-  # ── S3 output: per-prefix zstd objects ───────────────────────────────────
-  # By default each source prefix collapses to exactly one output object
-  # (N:1, same shape as the file sink). Set `batch_max_mb` to opt into
-  # size-based rollover within a prefix.
+  # ── S3 output: per-prefix objects ────────────────────────────────────────
+  #
+  # Batching model. The s3 sink uploads "batches"; one batch is one
+  # PutObject call. Every batch carries lines from a single source
+  # prefix — no cross-prefix mixing. The configurable axis is how many
+  # batches per source prefix.
+  #
+  # Default mode (no `batch_max_mb`). One encoder per source prefix,
+  # finalized once at end-of-run → exactly one PutObject per prefix.
+  # `{seq}` is always 00000.
+  #
+  # Batched mode (`batch_max_mb` set). After every ingested line the
+  # sink reads the per-prefix encoder's compressed output buffer; when
+  # it crosses the threshold, that encoder is finalized, the resulting
+  # frame is rendered into a key (with `{seq}` substituted) and pushed
+  # onto the upload queue, and a fresh encoder is started for the same
+  # prefix with `{seq}` += 1. End-of-run runs one final flush per
+  # prefix to capture the trailing partial. So a prefix that crosses
+  # the threshold N times produces N+1 batches (00000..N).
+  #
+  # Caveats:
+  #   - The threshold is checked against compressed bytes, not plaintext,
+  #     so actual upload size sits a little above `batch_max_mb`.
+  #   - zstd/gzip buffer internally and only flush blocks periodically.
+  #     A small `batch_max_mb` paired with highly-compressible input may
+  #     never trigger a mid-run flush — every line gets buffered inside
+  #     the codec and end-of-run produces a single batch. Use
+  #     `compression.format: none` if you want size-driven batching with
+  #     predictable thresholds.
+  #   - `multipart_threshold_mb` / `multipart_part_mb` are accepted but
+  #     not yet implemented; every batch is a single PutObject (5 GB cap).
+  #
+  # When `batch_max_mb` is set, `key_template` MUST contain `{seq}`,
+  # otherwise every batch within a prefix would render to the same key
+  # and silently overwrite the previous one (rejected at startup).
+  #
+  # `key_template` placeholders: `{prefix}`, `{prefix_hash}`, `{seq}`,
+  # `{run_id}`, `{ext}` (codec extension). MUST contain `{prefix}` or
+  # `{prefix_hash}` — otherwise distinct source prefixes write to the same
+  # destination key. Static rejection at startup; a runtime warn fires
+  # as defence in depth (e.g. if two prefixes happen to share a
+  # `{prefix_hash}`). `{run_id}` is unique per process invocation; use
+  # it to disambiguate reruns, since `{seq}` resets to 0 each time.
   # - type: s3
   #   bucket: my-results-bucket
   #   region: eu-west-3                                           # optional
   #   endpoint_url: null                                          # optional
-  #   key_template: "results/{prefix}/{run_id}-{seq}.ndjson.zst"
+  #   key_template: "results/{prefix}/{run_id}-{seq}.ndjson.{ext}"
   #   # batch_max_mb: 16             # optional; omit for one object per prefix
-  #   compression_level: 3
+  #   compression:
+  #     format: zstd
+  #     level: 3
   #   multipart_threshold_mb: 64     # informational; multipart not yet implemented
   #   multipart_part_mb: 16
   #   upload_tasks: null             # null = auto

@@ -1,13 +1,16 @@
+pub mod codec;
 pub mod file_sink;
 pub mod http_sink;
 pub mod http_writer;
 pub mod observer;
 pub mod orchestrator;
 pub mod output;
+pub mod path_template;
 pub mod s3_writer;
 pub mod streaming_writer;
 pub mod void_writer;
 
+pub use codec::{Codec, CodecEncoder, CodecFormat, CompressionConfig};
 pub use file_sink::FileOutputSink;
 pub use http_sink::HttpOutputSink;
 pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats};
