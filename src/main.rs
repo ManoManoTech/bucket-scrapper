@@ -225,13 +225,22 @@ struct Cli {
     #[arg(long)]
     s3_output_batch_max_mb: Option<f64>,
 
-    /// Multipart upload threshold in MB (currently informational; not yet implemented).
+    /// Batch size threshold (MB) at which the s3 sink switches from a
+    /// single PutObject to multipart upload. Default 5 (AWS minimum
+    /// part size); values below 5 are rejected at startup.
     #[arg(long)]
     s3_output_multipart_threshold_mb: Option<u64>,
 
-    /// Multipart upload part size in MB (currently informational; not yet implemented).
+    /// Target multipart part size (MB). Default 5. Range 5..=5000;
+    /// AWS hard limits are 5 MiB per part and 5 GiB max.
     #[arg(long)]
     s3_output_multipart_part_mb: Option<u64>,
+
+    /// Concurrent multipart parts in flight across all uploads on the
+    /// s3 sink. Omit for the AWS transfer manager's auto-tuning;
+    /// pass a positive integer for an explicit cap.
+    #[arg(long)]
+    s3_output_multipart_concurrency: Option<usize>,
 
     /// Number of concurrent uploader tasks for the s3 output.
     #[arg(long)]
@@ -288,6 +297,7 @@ impl Cli {
             s3_batch_max_mb: self.s3_output_batch_max_mb,
             s3_multipart_threshold_mb: self.s3_output_multipart_threshold_mb,
             s3_multipart_part_mb: self.s3_output_multipart_part_mb,
+            s3_multipart_concurrency: self.s3_output_multipart_concurrency,
             s3_upload_tasks: self.s3_output_upload_tasks,
             compression_format: self.compression_format.map(Into::into),
             compression_level: self.compression_level,

@@ -359,6 +359,123 @@ async fn s3_output_end_to_end_plaintext() {
     }
 }
 
+/// Exercises the multipart upload path through the AWS transfer manager.
+///
+/// Strategy: feed enough plaintext per prefix that each per-prefix batch
+/// crosses the 5 MiB multipart threshold. With `compression.format=none`
+/// the encoder's output buffer grows 1:1 with input, so we can hit the
+/// threshold predictably without depending on zstd block-flush timing.
+///
+/// We can't directly observe Garage's wire calls from the test, but a
+/// broken multipart implementation would either fail the upload, reorder
+/// parts, or corrupt the resulting object. Round-tripping the body and
+/// asserting the line set is therefore a sufficient end-to-end check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end_multipart() {
+    skip_unless_docker!();
+    if let Err(e) = run_multipart_test().await {
+        panic!("s3_output_end_to_end_multipart failed: {e:#}");
+    }
+}
+
+async fn run_multipart_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    garage.create_bucket(RESULTS_BUCKET).await?;
+
+    let s3 = garage.s3_client();
+    // Each line is ~140 bytes; 50_000 ERROR lines per hour ≈ 7 MB plaintext.
+    // With format=none the per-prefix encoder buffer is plaintext bytes,
+    // so each prefix's single batch sits comfortably above the 5 MiB
+    // multipart threshold and the upload goes through TM's multipart path.
+    let mut staged = build_fixture(DATE, HOURS);
+    for hour in HOURS {
+        staged.push(bulk_match_object(DATE, hour, 50_000));
+    }
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    let key_template = "out/{prefix}/{run_id}-{seq}.ndjson.{ext}";
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("s3")
+        .arg("--s3-output-bucket")
+        .arg(RESULTS_BUCKET)
+        .arg("--s3-output-key-template")
+        .arg(key_template)
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        // Plaintext: encoder buffer == ingested bytes, so threshold checks
+        // are predictable rather than gated on zstd's internal block timing.
+        .arg("--compression-format")
+        .arg("none")
+        // Defaults are already 5/5 but pin them explicitly so the test
+        // doesn't drift if defaults change later.
+        .arg("--s3-output-multipart-threshold-mb")
+        .arg("5")
+        .arg("--s3-output-multipart-part-mb")
+        .arg("5")
+        .arg("--s3-output-multipart-concurrency")
+        .arg("4")
+        .timeout(std::time::Duration::from_secs(180))
+        .assert()
+        .success();
+
+    let (received, keys) = list_and_decode(&s3, RESULTS_BUCKET, "out/", TestCodec::None).await?;
+    let expected = expected_matches(&staged, PATTERN);
+    assert_multiset_eq(&received, &expected);
+
+    // Sanity: at least one object should be ≥ 5 MiB, proving the test
+    // actually crossed the multipart threshold (rather than silently
+    // falling back to single PutObject).
+    assert!(
+        !keys.is_empty(),
+        "no objects produced — fixture or run is broken"
+    );
+    let mut max_size = 0u64;
+    for key in &keys {
+        let head = s3
+            .head_object()
+            .bucket(RESULTS_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("head_object {key}: {e}"))?;
+        let len = head.content_length().unwrap_or(0) as u64;
+        if len > max_size {
+            max_size = len;
+        }
+    }
+    let five_mib = 5 * 1024 * 1024;
+    assert!(
+        max_size >= five_mib,
+        "expected at least one batch ≥ 5 MiB (multipart threshold); got max {max_size} bytes — \
+         multipart path was not exercised"
+    );
+
+    Ok(())
+}
+
 async fn run_s3_test(
     codec: TestCodec,
     batch_max_mb: Option<&str>,

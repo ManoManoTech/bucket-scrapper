@@ -39,6 +39,7 @@ Key modules:
 
 - Rust, Tokio async runtime
 - `aws-sdk-s3` for S3 operations (downloads + S3 output uploads)
+- `aws-sdk-s3-transfer-manager` (developer preview, pinned `=0.1.3`) drives multipart uploads on the s3 sink, sharing our pre-built `aws_sdk_s3::Client` via `Config::Builder::client(...)`
 - `flume` for bounded MPMC channels
 - `grep-matcher` / `grep-regex` for line matching
 - `zstd` / `flate2` for compression
@@ -56,3 +57,4 @@ cargo clippy        # zero warnings expected
 ## Known Issues
 
 - `unused manifest key: profile.profiling.force-frame-pointers` — Cargo bug with custom profiles, not a code issue
+- `aws-sdk-s3-transfer-manager` is a developer preview (no production-stability guarantee), pinned at `=0.1.3`. It transitively activates `aws-smithy-http-client`'s default features, which pulls in the legacy hyper-rustls 0.24 / rustls 0.21 / rustls-webpki 0.101 path — re-introducing RUSTSEC-2026-0098/0099/0104 (name-constraint and CRL-parsing issues in rustls-webpki). Cargo's additive feature unification means we can't strip those from outside the TM crate. Accepted as a deliberate tradeoff for AWS-maintained multipart code; revisit when TM disables defaults on its aws-* deps upstream.

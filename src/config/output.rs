@@ -133,10 +133,24 @@ pub struct S3OutputConfig {
     pub batch_max_mb: Option<f64>,
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Batches at or above this many MB are uploaded via S3 multipart
+    /// (CreateMultipartUpload → parallel UploadPart → Complete) instead
+    /// of a single PutObject. Default 5 MiB matches the AWS minimum
+    /// part size; smaller values are rejected at startup.
     #[serde(default = "default_s3_multipart_threshold_mb")]
     pub multipart_threshold_mb: u64,
+    /// Target size of each multipart part in MB. AWS minimum is 5 MiB
+    /// (smaller values are rejected at startup); maximum is 5 GiB.
+    /// Actual part count may exceed the target if the resulting upload
+    /// would otherwise exceed AWS's 10,000-part limit per object.
     #[serde(default = "default_s3_multipart_part_mb")]
     pub multipart_part_mb: u64,
+    /// Concurrency for parts in flight across all in-flight uploads on
+    /// this sink. Unset → AWS transfer manager `ConcurrencyMode::Auto`
+    /// (auto-tunes based on target throughput). Set to a positive
+    /// integer for an explicit cap.
+    #[serde(default)]
+    pub multipart_concurrency: Option<usize>,
     #[serde(default)]
     pub upload_tasks: Option<usize>,
 }
@@ -176,10 +190,10 @@ fn default_file_path_template() -> String {
     "{prefix}.{ext}".to_string()
 }
 fn default_s3_multipart_threshold_mb() -> u64 {
-    64
+    5
 }
 fn default_s3_multipart_part_mb() -> u64 {
-    16
+    5
 }
 
 /// In-place expand `${VAR}` and `${VAR:-default}` placeholders inside every
@@ -247,6 +261,28 @@ pub fn validate_output(cfg: &OutputConfig) -> Result<()> {
                     allow_seq: true,
                 },
             )?;
+            // AWS minimum 5 MiB / maximum 5 GiB per part.
+            if !(5..=5000).contains(&c.multipart_part_mb) {
+                return Err(anyhow!(
+                    "outputs[].multipart_part_mb {} is out of range (5..=5000); \
+                     5 MiB is the AWS minimum part size, 5 GiB is the maximum",
+                    c.multipart_part_mb
+                ));
+            }
+            if c.multipart_threshold_mb < 5 {
+                return Err(anyhow!(
+                    "outputs[].multipart_threshold_mb {} is below the 5 MiB AWS minimum part size",
+                    c.multipart_threshold_mb
+                ));
+            }
+            if let Some(n) = c.multipart_concurrency {
+                if n == 0 {
+                    return Err(anyhow!(
+                        "outputs[].multipart_concurrency must be >= 1 when set; \
+                         omit the field for auto-tuning"
+                    ));
+                }
+            }
         }
         OutputConfig::Void => {}
     }
@@ -421,8 +457,9 @@ mystery: 42
             key_template: default_s3_key_template(),
             batch_max_mb: None,
             compression: CompressionConfig::default(),
-            multipart_threshold_mb: 64,
-            multipart_part_mb: 16,
+            multipart_threshold_mb: 5,
+            multipart_part_mb: 5,
+            multipart_concurrency: None,
             upload_tasks: None,
         });
         validate_output(&cfg).unwrap();
@@ -461,8 +498,9 @@ mystery: 42
             key_template: "out/{prefix}.ndjson.{ext}".into(),
             batch_max_mb: Some(10.0),
             compression: CompressionConfig::default(),
-            multipart_threshold_mb: 64,
-            multipart_part_mb: 16,
+            multipart_threshold_mb: 5,
+            multipart_part_mb: 5,
+            multipart_concurrency: None,
             upload_tasks: None,
         });
         let err = validate_output(&cfg).unwrap_err();
@@ -478,8 +516,9 @@ mystery: 42
             key_template: "out/{run_id}.ndjson.{ext}".into(),
             batch_max_mb: None,
             compression: CompressionConfig::default(),
-            multipart_threshold_mb: 64,
-            multipart_part_mb: 16,
+            multipart_threshold_mb: 5,
+            multipart_part_mb: 5,
+            multipart_concurrency: None,
             upload_tasks: None,
         });
         let err = validate_output(&cfg).unwrap_err();
@@ -552,5 +591,54 @@ dir: /tmp/out
             }
             other => panic!("expected file, got {other:?}"),
         }
+    }
+
+    fn s3_with(part_mb: u64, threshold_mb: u64, concurrency: Option<usize>) -> OutputConfig {
+        OutputConfig::S3(S3OutputConfig {
+            bucket: "results".into(),
+            region: None,
+            endpoint_url: None,
+            key_template: default_s3_key_template(),
+            batch_max_mb: None,
+            compression: CompressionConfig::default(),
+            multipart_threshold_mb: threshold_mb,
+            multipart_part_mb: part_mb,
+            multipart_concurrency: concurrency,
+            upload_tasks: None,
+        })
+    }
+
+    #[test]
+    fn validate_rejects_multipart_part_below_aws_minimum() {
+        let err = validate_output(&s3_with(4, 5, None)).unwrap_err();
+        assert!(format!("{err}").contains("multipart_part_mb"));
+    }
+
+    #[test]
+    fn validate_rejects_multipart_part_above_aws_maximum() {
+        let err = validate_output(&s3_with(6000, 5, None)).unwrap_err();
+        assert!(format!("{err}").contains("multipart_part_mb"));
+    }
+
+    #[test]
+    fn validate_rejects_multipart_threshold_below_aws_minimum() {
+        let err = validate_output(&s3_with(5, 4, None)).unwrap_err();
+        assert!(format!("{err}").contains("multipart_threshold_mb"));
+    }
+
+    #[test]
+    fn validate_rejects_multipart_concurrency_zero() {
+        let err = validate_output(&s3_with(5, 5, Some(0))).unwrap_err();
+        assert!(format!("{err}").contains("multipart_concurrency"));
+    }
+
+    #[test]
+    fn validate_accepts_multipart_concurrency_unset() {
+        validate_output(&s3_with(5, 5, None)).unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_multipart_concurrency_positive() {
+        validate_output(&s3_with(5, 5, Some(8))).unwrap();
     }
 }

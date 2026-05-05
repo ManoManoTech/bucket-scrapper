@@ -143,8 +143,11 @@ outputs:
   #     the codec and end-of-run produces a single batch. Use
   #     `compression.format: none` if you want size-driven batching with
   #     predictable thresholds.
-  #   - `multipart_threshold_mb` / `multipart_part_mb` are accepted but
-  #     not yet implemented; every batch is a single PutObject (5 GB cap).
+  #   - Batches at or above `multipart_threshold_mb` (default 5 MiB) are
+  #     uploaded via S3 multipart with parts of `multipart_part_mb`
+  #     (default 5 MiB). Smaller batches use a single PutObject.
+  #     `multipart_concurrency` (omit for auto, or set a positive int)
+  #     bounds parts in flight across all in-flight batches.
   #
   # When `batch_max_mb` is set, `key_template` MUST contain `{seq}`,
   # otherwise every batch within a prefix would render to the same key
@@ -166,9 +169,10 @@ outputs:
   #   compression:
   #     format: zstd
   #     level: 3
-  #   multipart_threshold_mb: 64     # informational; multipart not yet implemented
-  #   multipart_part_mb: 16
-  #   upload_tasks: null             # null = auto
+  #   multipart_threshold_mb: 5      # batches >= this go multipart; AWS min 5 MiB
+  #   multipart_part_mb: 5           # part size; AWS min 5 MiB, max 5000 MiB
+  #   multipart_concurrency: null    # null = transfer manager auto-tuning
+  #   upload_tasks: null             # null = auto (whole-batch concurrency)
 
   # ── Void output: drop all matches (benchmarking only) ────────────────────
   # - type: void

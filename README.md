@@ -158,7 +158,9 @@ outputs:
 
 #### Batching model
 
-The s3 sink uploads **batches**. One batch is one `PutObject` call. Every batch carries lines from a single source prefix; there is no cross-prefix mixing or consolidation. The configurable axis is *how many batches per source prefix*.
+The s3 sink uploads **batches**. One batch is one S3 object — uploaded as a single `PutObject` if it's under the multipart threshold, or via `CreateMultipartUpload` → parallel `UploadPart` → `CompleteMultipartUpload` (handled by [`aws-sdk-s3-transfer-manager`]) above it. Every batch carries lines from a single source prefix; there is no cross-prefix mixing or consolidation. The configurable axis is *how many batches per source prefix*.
+
+[`aws-sdk-s3-transfer-manager`]: https://crates.io/crates/aws-sdk-s3-transfer-manager
 
 **Per-prefix encoder lifecycle.** When the first matched line for a source prefix arrives, the sink lazily creates an in-memory encoder for that prefix (zstd / gzip / identity, per `compression.format`). Subsequent matched lines for the same prefix are written into that encoder. A prefix that produces no matches has no encoder and emits no object. Different prefixes have independent encoders and never block each other.
 
@@ -176,9 +178,16 @@ End-of-run runs an unconditional flush over every prefix that still has a non-em
 
 **Why a small `batch_max_mb` may not produce extra batches.** zstd and gzip both buffer internally and only emit compressed bytes when they have enough data to encode efficiently. A trickle of small, highly-compressible lines can keep the encoder's *output* buffer at zero for a long time even though many lines have been ingested — so no threshold crossing fires, and end-of-run produces a single batch. To exercise batched mode you need either enough input volume per prefix to force several internal block flushes, or `compression.format: none` (where the output buffer grows monotonically with input size).
 
-**Concurrency and ordering.** Batches go onto a bounded queue drained by N uploader tasks (`upload_tasks`, defaults to ~`cpu/4`). Uploaders run concurrently, so batches within a prefix can land out of order on S3. `{seq}` reflects the order in which the sink *finalized* the batch, not the order S3 finished receiving it. End-of-run waits for the queue to drain before reporting completion.
+**Concurrency and ordering.** Two independent axes:
 
-**Failure model.** Recoverable upload errors (transient 5xx, throttling) surface as `error!` logs but don't stop the pipeline; the run continues with the next batch. Non-recoverable errors (malformed request, auth failure) flip the sink's fatal flag, the download coordinator stops feeding new work, and the run aborts. Lost batches are counted into `OutputStats.lines_dropped`. Multipart uploads are not yet implemented — every batch is a single `PutObject`, so a batch must fit AWS's 5 GB single-PUT cap (the `multipart_threshold_mb` / `multipart_part_mb` config fields are accepted but currently informational, with a startup warning if you set them away from defaults).
+- `upload_tasks` (defaults to ~`cpu/4`) bounds how many *whole batches* are in flight at once.
+- `multipart_concurrency` (defaults to the transfer manager's auto-tuning) bounds how many *parts* are in flight across all in-flight batches. Set to a positive integer for an explicit cap.
+
+Batches within a prefix can land out of order on S3 because uploaders run concurrently. `{seq}` reflects the order in which the sink *finalized* the batch, not the order S3 finished receiving it. End-of-run waits for the queue to drain before reporting completion.
+
+**Multipart.** Batches at or above `multipart_threshold_mb` (default 5) are uploaded via S3 multipart with parts of `multipart_part_mb` (default 5). AWS enforces 5 MiB minimum and 5 GiB maximum per part; the config validator rejects out-of-range values at startup.
+
+**Failure model.** Recoverable upload errors (transient 5xx, throttling, partial multipart failures the transfer manager retries internally) surface as `error!` logs but don't stop the pipeline; the run continues with the next batch. Non-recoverable errors (malformed request, auth failure) flip the sink's fatal flag, the download coordinator stops feeding new work, and the run aborts. Lost batches are counted into `OutputStats.lines_dropped`. Failed multipart uploads are aborted by the transfer manager so server-side state isn't leaked.
 
 **`{seq}` is required when `batch_max_mb` is set.** Without it, every batch within a prefix would render to the same key and silently overwrite the previous one. Startup rejects such configs.
 

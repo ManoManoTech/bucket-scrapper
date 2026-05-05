@@ -76,6 +76,7 @@ pub struct OutputCli {
     pub s3_batch_max_mb: Option<f64>,
     pub s3_multipart_threshold_mb: Option<u64>,
     pub s3_multipart_part_mb: Option<u64>,
+    pub s3_multipart_concurrency: Option<usize>,
     pub s3_upload_tasks: Option<usize>,
 
     // shared
@@ -122,6 +123,10 @@ impl OutputCli {
             "--s3-output-multipart-threshold-mb"
         );
         check!(s3_multipart_part_mb, "--s3-output-multipart-part-mb");
+        check!(
+            s3_multipart_concurrency,
+            "--s3-output-multipart-concurrency"
+        );
         check!(s3_upload_tasks, "--s3-output-upload-tasks");
         check!(compression_format, "--compression-format");
         check!(compression_level, "--compression-level");
@@ -231,8 +236,9 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                     .unwrap_or_else(|| "results/{prefix}/part-{seq}.ndjson.{ext}".to_string()),
                 batch_max_mb: cli.s3_batch_max_mb,
                 compression: cli_compression(cli),
-                multipart_threshold_mb: cli.s3_multipart_threshold_mb.unwrap_or(64),
-                multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(16),
+                multipart_threshold_mb: cli.s3_multipart_threshold_mb.unwrap_or(5),
+                multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(5),
+                multipart_concurrency: cli.s3_multipart_concurrency,
                 upload_tasks: cli.s3_upload_tasks,
             })
         }
@@ -293,6 +299,11 @@ fn reject_inactive_flags(kind: OutputKind, cli: &OutputCli) -> Result<()> {
         "--s3-output-multipart-threshold-mb"
     );
     reject_unless!(is_s3, s3_multipart_part_mb, "--s3-output-multipart-part-mb");
+    reject_unless!(
+        is_s3,
+        s3_multipart_concurrency,
+        "--s3-output-multipart-concurrency"
+    );
     reject_unless!(is_s3, s3_upload_tasks, "--s3-output-upload-tasks");
     reject_unless!(is_file, file_path_template, "--output-path-template");
 

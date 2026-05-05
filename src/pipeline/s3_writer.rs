@@ -65,14 +65,27 @@
 //!
 //! ## Multipart uploads
 //!
-//! Currently every batch is uploaded via a single `PutObject` request.
-//! AWS supports up to 5 GB per single PUT, so configurations with
-//! batches under that limit work as-is. True multipart support
-//! (chunking a single batch into parts) is left as future work — the
-//! `multipart_threshold_mb` and `multipart_part_mb` config fields are
-//! accepted but not yet acted upon, and the sink emits a warning at
-//! startup if you set them away from the defaults so the gap is
-//! explicit.
+//! Each finalized batch is handed to the AWS-published
+//! [`aws-sdk-s3-transfer-manager`] crate, which auto-multiparts based
+//! on the sink's `multipart_threshold_mb` (default 5 MiB) and
+//! `multipart_part_mb` (default 5 MiB) settings. Batches below the
+//! threshold go through `PutObject`; batches at or above use
+//! `CreateMultipartUpload` → parallel `UploadPart` →
+//! `CompleteMultipartUpload`, with `AbortMultipartUpload` on failure
+//! (all handled by the transfer manager). AWS enforces a 5 MiB minimum
+//! part size and 10,000-part maximum; our config validation rejects
+//! sub-5 MiB values at startup.
+//!
+//! The sink shares its `aws_sdk_s3::Client` with the transfer manager
+//! via `tm::Config::Builder::client(...)`, so credentials, endpoint
+//! URL, and the cached DNS resolver carry through unchanged.
+//! Concurrency for parts in flight (across all in-flight batches) is
+//! controlled by `multipart_concurrency`: omit the field for the
+//! transfer manager's auto-tuning, or set a positive integer for an
+//! explicit cap. The sink's own `upload_tasks` knob still bounds the
+//! number of whole batches in flight; the two axes are independent.
+//!
+//! [`aws-sdk-s3-transfer-manager`]: https://crates.io/crates/aws-sdk-s3-transfer-manager
 //!
 //! ## Key template placeholders
 //!
@@ -101,8 +114,8 @@ use super::path_template::{
 };
 use crate::config::output::S3OutputConfig;
 use anyhow::{anyhow, Context, Result};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_sdk_s3_transfer_manager as tm;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
@@ -121,7 +134,11 @@ struct PrefixBatch {
 
 /// Owned state shared between ingest path and uploader pool.
 struct Inner {
-    client: Client,
+    /// AWS transfer manager client. Wraps our existing `aws_sdk_s3::Client`
+    /// (we pass it via `Config::Builder::client(...)`) and decides
+    /// single PutObject vs. multipart per batch based on configured
+    /// `multipart_threshold_mb` / `multipart_part_mb`.
+    tm: tm::Client,
     bucket: String,
     key_template: String,
     /// `Some(n)` enables size-based mid-run flushes at `n` compressed bytes per
@@ -176,17 +193,6 @@ impl S3OutputSink {
             }
         }
 
-        let mp_threshold = cfg.multipart_threshold_mb;
-        let mp_part = cfg.multipart_part_mb;
-        if mp_threshold != 64 || mp_part != 16 {
-            warn!(
-                multipart_threshold_mb = mp_threshold,
-                multipart_part_mb = mp_part,
-                "S3 output: multipart is not yet implemented; \
-                 every batch is uploaded as a single PutObject regardless of these settings"
-            );
-        }
-
         let upload_tasks = cfg.upload_tasks.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get() / 4)
@@ -194,13 +200,31 @@ impl S3OutputSink {
                 .max(1)
         });
 
+        // Build the transfer-manager client around our existing aws-sdk-s3
+        // client. The TM crate's Config::Builder::client(...) accepts an
+        // already-configured `aws_sdk_s3::Client`, so credentials,
+        // endpoint URL, and the cached DNS resolver flow through unchanged.
+        let part_bytes = cfg.multipart_part_mb * 1024 * 1024;
+        let threshold_bytes = cfg.multipart_threshold_mb * 1024 * 1024;
+        let concurrency = match cfg.multipart_concurrency {
+            None => tm::types::ConcurrencyMode::Auto,
+            Some(n) => tm::types::ConcurrencyMode::Explicit(n),
+        };
+        let tm_config = tm::Config::builder()
+            .client(client)
+            .multipart_threshold(tm::types::PartSize::Target(threshold_bytes))
+            .part_size(tm::types::PartSize::Target(part_bytes))
+            .concurrency(concurrency)
+            .build();
+        let tm_client = tm::Client::new(tm_config);
+
         let (upload_tx, upload_rx) = flume::bounded::<UploadJob>(upload_tasks * 2);
 
         let run_id = make_run_id();
         let codec = Codec::from_config(&cfg.compression)?;
 
         let inner = Arc::new(Inner {
-            client,
+            tm: tm_client,
             bucket: cfg.bucket.clone(),
             key_template: cfg.key_template.clone(),
             batch_max_bytes: cfg.batch_max_mb.map(|mb| (mb * 1_000_000.0) as u64),
@@ -242,22 +266,27 @@ impl S3OutputSink {
                 plaintext,
             } = job;
             let body_len = body.len() as u64;
-            let body_stream = ByteStream::from(body);
+            let stream = tm::io::InputStream::from(bytes::Bytes::from(body));
 
+            // Build the upload request. TM auto-multiparts above the
+            // configured threshold and uses PutObject below it.
             let mut req = inner
-                .client
-                .put_object()
+                .tm
+                .upload()
                 .bucket(&inner.bucket)
                 .key(&key)
-                .body(body_stream)
+                .body(stream)
                 .content_type("application/x-ndjson");
             if let Some(enc) = inner.codec.content_encoding() {
                 req = req.content_encoding(enc);
             }
-            let result = req.send().await;
+            let result = match req.initiate() {
+                Ok(handle) => handle.join().await.map(|_output| ()),
+                Err(e) => Err(e),
+            };
 
             match result {
-                Ok(_) => {
+                Ok(()) => {
                     inner
                         .compressed_bytes
                         .fetch_add(body_len, Ordering::Relaxed);
@@ -269,20 +298,24 @@ impl S3OutputSink {
                         bytes = body_len,
                         lines,
                         plaintext,
-                        "S3 PutObject"
+                        "S3 upload"
                     );
                 }
                 Err(e) => {
                     inner.lines_dropped.fetch_add(lines, Ordering::Relaxed);
-                    let msg = format!("{e}");
-                    if !crate::s3::is_recoverable_s3_error(&msg) {
+                    // TM wraps the underlying SDK errors. Walk the source
+                    // chain so our existing recoverable/fatal classifier
+                    // sees the actual aws-sdk-s3 error message rather than
+                    // the TM wrapper's "transfer failed" prefix.
+                    let chain = error_chain_str(&e);
+                    if !crate::s3::is_recoverable_s3_error(&chain) {
                         error!(
                             task = task_id,
                             bucket = %inner.bucket,
                             key = %key,
                             lines,
-                            error = %msg,
-                            "Fatal S3 PutObject error, stopping pipeline"
+                            error = %chain,
+                            "Fatal S3 upload error, stopping pipeline"
                         );
                         inner.fatal.store(true, Ordering::Relaxed);
                         break;
@@ -292,8 +325,8 @@ impl S3OutputSink {
                         bucket = %inner.bucket,
                         key = %key,
                         lines,
-                        error = %msg,
-                        "S3 PutObject failed"
+                        error = %chain,
+                        "S3 upload failed"
                     );
                 }
             }
@@ -362,6 +395,21 @@ impl S3OutputSink {
         }
         Ok(())
     }
+}
+
+/// Render an error and its source chain into a single string. The TM
+/// crate wraps the underlying aws-sdk-s3 errors, so the recoverable /
+/// fatal classifier needs to see the full chain to find substrings like
+/// `dispatch failure` or `403 Forbidden`.
+fn error_chain_str(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut src = err.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
 }
 
 impl OutputSink for S3OutputSink {

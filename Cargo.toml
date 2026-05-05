@@ -9,6 +9,12 @@ aws-config = "1.1.3"
 # rustls 0.21 (RUSTSEC-2026-0098/0099/0104). We use the modern aws-lc-rs path via
 # `default-https-client` instead.
 aws-sdk-s3 = { version = "1.131", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+# Developer-preview AWS-published transfer manager. Pinned exactly because
+# pre-1.0 minor versions can carry breaking API changes. Note: this dep
+# transitively re-activates aws-smithy-http-client's default features and
+# reintroduces the rustls 0.21 / rustls-webpki 0.101 path (RUSTSEC-2026-
+# 0098/0099/0104). See CLAUDE.md "Known Issues" for context.
+aws-sdk-s3-transfer-manager = "=0.1.3"
 aws-types = "1.1.3"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
