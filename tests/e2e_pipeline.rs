@@ -8,7 +8,7 @@ mod e2e;
 use anyhow::Result;
 use assert_cmd::Command;
 use aws_sdk_s3::Client as S3Client;
-use e2e::fixtures::{build_fixture, expected_matches, seed_bucket};
+use e2e::fixtures::{build_fixture, expected_matches, seed_bucket, Encoding, StagedObject};
 use e2e::garage::start_garage;
 use e2e::nginx::start_nginx;
 use std::collections::BTreeSet;
@@ -238,7 +238,17 @@ async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) ->
     garage.create_bucket(RESULTS_BUCKET).await?;
 
     let s3 = garage.s3_client();
-    let staged = build_fixture(DATE, HOURS);
+    let mut staged = build_fixture(DATE, HOURS);
+    if batch_max_mb.is_some() {
+        // The default fixture is too small to push any plaintext past zstd's
+        // internal block buffer, so the rollover threshold (which inspects
+        // the encoder's *output* Vec) never sees any bytes. Add one bulky
+        // matching object per hour to force several block flushes per
+        // prefix and exercise rollover.
+        for hour in HOURS {
+            staged.push(bulk_match_object(DATE, hour, 5_000));
+        }
+    }
     seed_bucket(&s3, BUCKET, &staged).await?;
 
     let workdir = TempDir::new()?;
@@ -326,6 +336,26 @@ async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) ->
         }
     }
     Ok(())
+}
+
+/// One bulky `service-bulk-*.json` object containing only ERROR lines. Plain
+/// text (uncompressed body) so the scrapper sees the lines verbatim. Keyed
+/// under the standard `logs/dt=…/hour=…/` prefix, satisfying the e2e key
+/// filter regex.
+fn bulk_match_object(date: &str, hour: &str, n_lines: usize) -> StagedObject {
+    let prefix = format!("logs/dt={date}/hour={hour}");
+    let lines: Vec<String> = (0..n_lines)
+        .map(|i| {
+            format!(
+                r#"{{"service":"bulk","hour":"{hour}","seq":{i},"level":"ERROR","msg":"ERROR bulk row #{i} for rollover test, padding the line a bit so blocks fill faster"}}"#
+            )
+        })
+        .collect();
+    StagedObject {
+        key: format!("{prefix}/service-bulk-001.json"),
+        lines,
+        encoding: Encoding::Plain,
+    }
 }
 
 /// List every object under `prefix` in `bucket`, fetch each, zstd-decode it,
