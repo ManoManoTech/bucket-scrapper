@@ -211,7 +211,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                     .s3_key_template
                     .clone()
                     .unwrap_or_else(|| "results/{prefix}/part-{seq}.ndjson.zst".to_string()),
-                batch_max_mb: cli.s3_batch_max_mb.unwrap_or(16.0),
+                batch_max_mb: cli.s3_batch_max_mb,
                 compression_level: cli.s3_compression_level.or(cli.compression_level),
                 multipart_threshold_mb: cli.s3_multipart_threshold_mb.unwrap_or(64),
                 multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(16),

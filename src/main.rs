@@ -622,7 +622,7 @@ async fn build_sink(
             info!(
                 bucket = %s3_cfg.bucket,
                 key_template = %s3_cfg.key_template,
-                batch_max_mb = s3_cfg.batch_max_mb,
+                batch_max_mb = ?s3_cfg.batch_max_mb,
                 "S3 output configured"
             );
             Arc::new(S3OutputSink::new(client, s3_cfg)?)

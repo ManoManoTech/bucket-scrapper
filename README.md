@@ -143,15 +143,24 @@ bucket-scrapper -s 2024-01-15T10:00:00Z \
 
 ### S3 sink
 
-Per-prefix batched zstd objects written to a destination S3 bucket (works with non-AWS backends — Garage, MinIO — via `endpoint_url`):
+Per-prefix zstd objects written to a destination S3 bucket (works with non-AWS backends — Garage, MinIO — via `endpoint_url`). By default each source prefix collapses to exactly one output object (N:1, same shape as the file sink). Set `batch_max_mb` to opt into size-based rollover within a prefix:
 
 ```yaml
 outputs:
   - type: s3
     bucket: my-results-bucket
     key_template: "results/{prefix}/{run_id}-{seq}.ndjson.zst"
-    batch_max_mb: 16
+    # batch_max_mb: 16   # optional; omit for one object per source prefix
 ```
+
+Output mapping summary (file and S3 sinks):
+
+| Sink | Default | With `batch_max_mb` set |
+|------|---------|-------------------------|
+| `file` | one `.zst` file per source prefix (always) | n/a — file sink has no rollover |
+| `s3` | one object per source prefix | one or more objects per prefix, rolling over at the threshold |
+
+Cross-prefix consolidation (e.g. one daily file across all hours) is not currently supported.
 
 ### Void sink
 

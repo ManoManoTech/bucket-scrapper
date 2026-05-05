@@ -1,10 +1,17 @@
-//! S3 output sink: per-prefix zstd-batched uploads.
+//! S3 output sink: per-prefix zstd uploads.
 //!
-//! Mirrors file output semantics. For each source S3 prefix the sink keeps
-//! an in-memory zstd encoder. When the compressed buffer exceeds
-//! `batch_max_mb`, the batch is finalized, the destination key is rendered
-//! from `key_template`, and the bytes are handed to a bounded uploader pool
-//! that issues `PutObject` requests in parallel.
+//! For each source S3 prefix the sink keeps an in-memory zstd encoder. By
+//! default (no `batch_max_mb` set), each prefix produces exactly one output
+//! object on `finish()` — N input objects collapse to 1 output object per
+//! prefix, mirroring file sink semantics.
+//!
+//! When `batch_max_mb` is set, batch rollover is enabled: as soon as a
+//! prefix's compressed buffer exceeds the threshold, the batch is finalized,
+//! the destination key is rendered from `key_template`, the `{seq}` for
+//! that prefix is incremented, and the bytes are handed to a bounded
+//! uploader pool. Use rollover when output objects must stay under a size
+//! cap (e.g. downstream import limits); leave it off for simple N:1
+//! consolidation.
 //!
 //! ## Key template placeholders
 //!
@@ -54,7 +61,9 @@ struct Inner {
     client: Client,
     bucket: String,
     key_template: String,
-    batch_max_bytes: u64,
+    /// `Some(n)` enables size-based rollover at `n` compressed bytes per
+    /// prefix. `None` disables rollover — each prefix produces one object.
+    batch_max_bytes: Option<u64>,
     compression_level: i32,
     run_id: String,
     /// Per-prefix mutable state. Outer Mutex protects map insertion only;
@@ -89,8 +98,12 @@ impl S3OutputSink {
     /// for `cfg.region` / `cfg.endpoint_url` already (the resolver wires that
     /// up — see `crate::config::resolve`).
     pub fn new(client: Client, cfg: &S3OutputConfig) -> Result<Self> {
-        if cfg.batch_max_mb <= 0.0 {
-            return Err(anyhow!("S3 output: batch_max_mb must be > 0"));
+        if let Some(mb) = cfg.batch_max_mb {
+            if mb.is_nan() || mb <= 0.0 {
+                return Err(anyhow!(
+                    "S3 output: batch_max_mb must be > 0 when set (omit for N:1 per-prefix mode)"
+                ));
+            }
         }
 
         let mp_threshold = cfg.multipart_threshold_mb;
@@ -119,7 +132,7 @@ impl S3OutputSink {
             client,
             bucket: cfg.bucket.clone(),
             key_template: cfg.key_template.clone(),
-            batch_max_bytes: (cfg.batch_max_mb * 1_000_000.0) as u64,
+            batch_max_bytes: cfg.batch_max_mb.map(|mb| (mb * 1_000_000.0) as u64),
             compression_level: cfg.compression_level.unwrap_or(3),
             run_id,
             prefixes: Mutex::new(HashMap::new()),
@@ -282,9 +295,11 @@ impl OutputSink for S3OutputSink {
             .plaintext_bytes
             .fetch_add(line.len() as u64, Ordering::Relaxed);
 
-        let approx_compressed = batch.encoder.get_ref().len() as u64;
-        if approx_compressed >= self.inner.batch_max_bytes {
-            Self::flush_batch(&self.inner, prefix, &mut batch)?;
+        if let Some(threshold) = self.inner.batch_max_bytes {
+            let approx_compressed = batch.encoder.get_ref().len() as u64;
+            if approx_compressed >= threshold {
+                Self::flush_batch(&self.inner, prefix, &mut batch)?;
+            }
         }
         Ok(())
     }

@@ -211,14 +211,26 @@ async fn run_http_test() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s3_output_end_to_end() {
+async fn s3_output_end_to_end_no_batching() {
     skip_unless_docker!();
-    if let Err(e) = run_s3_test().await {
-        panic!("s3_output_end_to_end failed: {e:#}");
+    // Default mode: --s3-output-batch-max-mb omitted. Each source prefix
+    // (one per hour in the fixture) collapses to exactly one output object.
+    if let Err(e) = run_s3_test(None, HOURS.len()).await {
+        panic!("s3_output_end_to_end_no_batching failed: {e:#}");
     }
 }
 
-async fn run_s3_test() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end_batched() {
+    skip_unless_docker!();
+    // Tiny rollover threshold: each prefix splits into multiple sequence
+    // numbers, so we expect strictly more output objects than source prefixes.
+    if let Err(e) = run_s3_test(Some("0.00001"), HOURS.len() + 1).await {
+        panic!("s3_output_end_to_end_batched failed: {e:#}");
+    }
+}
+
+async fn run_s3_test(batch_max_mb: Option<&str>, min_expected_objects: usize) -> Result<()> {
     // Single Garage instance, two buckets: one source, one destination.
     // Same credentials, so the scrapper's source S3 client also reaches the
     // destination — no per-output endpoint/credentials override needed.
@@ -253,15 +265,16 @@ async fn run_s3_test() -> Result<()> {
         .arg("s3")
         .arg("--s3-output-bucket")
         .arg(RESULTS_BUCKET)
-        .arg("--s3-output-batch-max-mb")
-        .arg("1")
         .arg("--s3-output-key-template")
         .arg("out/{prefix}/{run_id}-{seq}.ndjson.zst")
         .arg("--max-parallel")
         .arg("4")
         .arg("--log-format")
-        .arg("json")
-        .timeout(std::time::Duration::from_secs(120))
+        .arg("json");
+    if let Some(mb) = batch_max_mb {
+        cmd.arg("--s3-output-batch-max-mb").arg(mb);
+    }
+    cmd.timeout(std::time::Duration::from_secs(120))
         .assert()
         .success();
 
@@ -269,13 +282,49 @@ async fn run_s3_test() -> Result<()> {
     let expected = expected_matches(&staged, PATTERN);
     assert_multiset_eq(&received, &expected);
 
-    // At least one returned object key matches the configured template shape:
+    // Every returned object key matches the configured template shape:
     //   out/<prefix-with-slashes>/<8-hex-run-id>-<5-digit-seq>.ndjson.zst
     let template_re = regex::Regex::new(r"^out/.+/[0-9a-f]{8}-\d{5}\.ndjson\.zst$").unwrap();
-    assert!(
-        keys.iter().any(|k| template_re.is_match(k)),
-        "no destination key matched template `out/{{prefix}}/{{run_id}}-{{seq}}.ndjson.zst`; got: {keys:?}"
-    );
+    for key in &keys {
+        assert!(
+            template_re.is_match(key),
+            "destination key did not match template: {key}"
+        );
+    }
+
+    match batch_max_mb {
+        // Without batching: exactly one object per source prefix, all
+        // sequence-zero (no rollover ever happened).
+        None => {
+            assert_eq!(
+                keys.len(),
+                min_expected_objects,
+                "no-batching mode should produce exactly one object per source prefix; got: {keys:?}"
+            );
+            for key in &keys {
+                assert!(
+                    key.contains("-00000."),
+                    "no-batching mode must keep seq=00000 (no rollover); got: {key}"
+                );
+            }
+        }
+        // With aggressive rollover: strictly more objects than prefixes,
+        // and at least one object with seq > 0.
+        Some(_) => {
+            assert!(
+                keys.len() > HOURS.len(),
+                "batched mode should produce more objects than source prefixes ({}); got {} keys: {:?}",
+                HOURS.len(),
+                keys.len(),
+                keys
+            );
+            assert!(
+                keys.iter().any(|k| !k.contains("-00000.")),
+                "batched mode should produce at least one rolled-over object (seq > 0); got: {keys:?}"
+            );
+            let _ = min_expected_objects; // bound is implicit via the `>` check above
+        }
+    }
     Ok(())
 }
 

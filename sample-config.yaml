@@ -95,17 +95,20 @@ outputs:
   #     increase_mbps: 1.0
   #     max_submission_time_s: 4.0   # 0 = AIMD disabled
 
-  # ── S3 output: per-prefix batched zstd objects ───────────────────────────
+  # ── S3 output: per-prefix zstd objects ───────────────────────────────────
+  # By default each source prefix collapses to exactly one output object
+  # (N:1, same shape as the file sink). Set `batch_max_mb` to opt into
+  # size-based rollover within a prefix.
   # - type: s3
   #   bucket: my-results-bucket
   #   region: eu-west-3                                           # optional
   #   endpoint_url: null                                          # optional
   #   key_template: "results/{prefix}/{run_id}-{seq}.ndjson.zst"
-  #   batch_max_mb: 16
+  #   # batch_max_mb: 16             # optional; omit for one object per prefix
   #   compression_level: 3
-  #   multipart_threshold_mb: 64    # informational; multipart not yet implemented
+  #   multipart_threshold_mb: 64     # informational; multipart not yet implemented
   #   multipart_part_mb: 16
-  #   upload_tasks: null            # null = auto
+  #   upload_tasks: null             # null = auto
 
   # ── Void output: drop all matches (benchmarking only) ────────────────────
   # - type: void

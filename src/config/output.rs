@@ -104,8 +104,13 @@ pub struct S3OutputConfig {
     pub endpoint_url: Option<String>,
     #[serde(default = "default_s3_key_template")]
     pub key_template: String,
-    #[serde(default = "default_s3_batch_max_mb")]
-    pub batch_max_mb: f64,
+    /// Optional size threshold (MB) for per-prefix batch rollover. When unset,
+    /// each source prefix produces exactly one output object (N:1 reduction,
+    /// matching file sink semantics). When set, a prefix's compressed buffer
+    /// is finalized and uploaded once it crosses this size, and a new
+    /// `{seq}` is started for that prefix.
+    #[serde(default)]
+    pub batch_max_mb: Option<f64>,
     #[serde(default)]
     pub compression_level: Option<i32>,
     #[serde(default = "default_s3_multipart_threshold_mb")]
@@ -145,9 +150,6 @@ fn default_aimd_max_submission_time_s() -> f64 {
 }
 fn default_s3_key_template() -> String {
     "results/{date}/{hour}/{prefix_hash}-{seq}.ndjson.zst".to_string()
-}
-fn default_s3_batch_max_mb() -> f64 {
-    16.0
 }
 fn default_s3_multipart_threshold_mb() -> u64 {
     64
