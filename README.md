@@ -56,6 +56,29 @@ Further narrow which S3 objects to process with a regex on the object key:
 bucket-scrapper -s 2024-01-15T10:00:00Z -f "service-a.*\.json\.zst$"
 ```
 
+### File-level sampling
+
+Drop a fraction of input files *after* key filtering with a float in `(0.0, 1.0]`:
+
+```bash
+# Keep ~10% of files, reproducibly
+bucket-scrapper -s 2024-01-15T10:00:00Z --sample-files 0.1 --sampling-seed 42
+```
+
+Or per-bucket in the config (overrides the global CLI flag for that bucket):
+
+```yaml
+buckets:
+  - bucket: my-log-bucket
+    path: [...]
+    sample_files: 0.1     # keep 10% of this bucket's files
+sampling_seed: 42         # optional, top-level; omit for fresh entropy each run
+```
+
+Sampling is the **coarsest** of the work-shedding mechanisms: it sheds whole files, so for sources with high per-file size variance the resulting line-volume sample can be noisy. It is also the cheapest — files that aren't kept are never downloaded, decompressed, or scanned.
+
+`0.0`, negative values, and `>1.0` are rejected at startup. Omit the field to disable sampling.
+
 ## 2. Filtering lines
 
 By default, all lines from matching objects are forwarded. Add a regex to keep only what you need:

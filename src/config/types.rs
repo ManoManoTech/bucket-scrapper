@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::output::OutputConfig;
+use crate::sampling::is_valid_sampling_rate;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -18,6 +19,12 @@ pub struct BucketConfig {
     pub path: Vec<PathSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_prefix_patterns: Option<Vec<String>>,
+    /// Fraction of input files to keep after key filtering, in (0.0, 1.0].
+    /// Coarsest work-shedding mechanism — sheds whole files. Can be noisy
+    /// for sources with high per-file size variance. None = use the global
+    /// CLI fallback (`--sample-files`), which itself defaults to no sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_files: Option<f64>,
     /// Captures unknown YAML keys for forward-compatibility.
     #[serde(flatten, skip_serializing)]
     pub extra: HashMap<String, serde_yaml::Value>,
@@ -37,6 +44,10 @@ impl BucketConfig {
                  Add a datefmt component like: datefmt: \"dt=20240101/hour=00\"",
                 self.bucket
             ));
+        }
+        if let Some(rate) = self.sample_files {
+            is_valid_sampling_rate(rate)
+                .map_err(|e| format!("Bucket '{}' sample_files: {e}", self.bucket))?;
         }
         Ok(())
     }
@@ -61,6 +72,11 @@ pub struct ConfigSchema {
     /// (CLI-driven mode).
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
+
+    /// Optional RNG seed for the file-level sampler. Omit for fresh entropy
+    /// each run; set for reproducibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 }
 
 impl ConfigSchema {
@@ -89,6 +105,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             path,
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         }
     }
@@ -122,6 +139,36 @@ mod tests {
     fn validate_rejects_empty_path() {
         let cfg = bucket_config(vec![]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_sample_rate() {
+        let mut cfg = bucket_config(vec![PathSchema::DateFormat {
+            datefmt: "dt=%Y%m%d".to_string(),
+        }]);
+        cfg.sample_files = Some(0.1);
+        cfg.validate().unwrap();
+        cfg.sample_files = Some(1.0);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_sample_rate() {
+        let mut cfg = bucket_config(vec![PathSchema::DateFormat {
+            datefmt: "dt=%Y%m%d".to_string(),
+        }]);
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            cfg.sample_files = Some(bad);
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains("test-bucket"),
+                "error should name bucket: {err}"
+            );
+            assert!(
+                err.contains("sample_files"),
+                "error should name field: {err}"
+            );
+        }
     }
 
     #[test]

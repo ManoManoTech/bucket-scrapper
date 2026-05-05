@@ -60,6 +60,7 @@ fn extract_single_format_date_and_prefix(prefix: String) -> PathFormatter {
 ///         PathSchema::DateFormat { datefmt: "dt=20231225/hour=14".to_string() }
 ///     ],
 ///     only_prefix_patterns: None,
+///     sample_files: None,
 ///     extra: HashMap::new(),
 /// };
 ///
@@ -115,6 +116,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -136,6 +138,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -157,6 +160,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -178,6 +182,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -200,6 +205,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -228,6 +234,7 @@ mod tests {
                 }, // Empty - should be filtered
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -244,6 +251,7 @@ mod tests {
                 datefmt: "2006/01/02/15".to_string(),
             }],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 
@@ -294,6 +302,7 @@ mod tests {
                 },
             ],
             only_prefix_patterns: None,
+            sample_files: None,
             extra: HashMap::new(),
         };
 

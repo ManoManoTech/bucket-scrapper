@@ -26,7 +26,9 @@ use bucket_scrapper::pipeline::{
 use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::S3ObjectInfo;
+use bucket_scrapper::sampling::{parse_unit_interval, FileSampler};
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
+use std::collections::HashMap;
 
 /// High-performance S3 bucket content searcher using ripgrep
 #[derive(Parser)]
@@ -102,6 +104,17 @@ struct Cli {
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
     #[arg(long, default_value = "0")]
     memory_limit_gb: u64,
+
+    /// File-level sample rate in (0.0, 1.0]: fraction of input files kept
+    /// after key filtering. Coarsest work-shedding mechanism — sheds whole
+    /// files. Per-bucket `sample_files` in config overrides this.
+    #[arg(long, value_parser = parse_unit_interval)]
+    sample_files: Option<f64>,
+
+    /// Seed for the sampling RNG. Omit for fresh entropy each run.
+    /// Per-config `sampling_seed` (top-level) is used as fallback.
+    #[arg(long)]
+    sampling_seed: Option<u64>,
 
     // ── Output selection / per-output overrides ────────────────────────────
     //
@@ -387,7 +400,7 @@ async fn main() -> Result<()> {
     info!(output = sink.type_name(), "Output configured");
 
     // List all objects in parallel across all buckets × hourly prefixes
-    let all_bucket_objects = {
+    let mut all_bucket_objects = {
         let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
         let semaphore = Arc::new(Semaphore::new(cli.max_parallel));
         let mut join_set: JoinSet<Result<Vec<S3ObjectInfo>>> = JoinSet::new();
@@ -478,6 +491,31 @@ async fn main() -> Result<()> {
         all_objects.sort_by_key(|o| o.size);
         all_objects
     };
+
+    {
+        let per_bucket: HashMap<String, f64> = config_buckets
+            .iter()
+            .filter_map(|b| b.sample_files.map(|r| (b.bucket.clone(), r)))
+            .collect();
+        let default_rate = cli.sample_files.unwrap_or(1.0);
+        let seed = cli
+            .sampling_seed
+            .or_else(|| config.as_ref().and_then(|c| c.sampling_seed));
+
+        if default_rate < 1.0 || !per_bucket.is_empty() {
+            let before = all_bucket_objects.len();
+            let mut sampler = FileSampler::new(default_rate, per_bucket, seed);
+            let (kept, dropped) = sampler.apply(&mut all_bucket_objects);
+            info!(
+                before,
+                kept,
+                dropped,
+                seed = ?seed,
+                default_rate,
+                "Applied file-level sampling"
+            );
+        }
+    }
 
     if all_bucket_objects.is_empty() {
         anyhow::bail!("No objects found to search");

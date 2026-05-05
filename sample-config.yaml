@@ -24,6 +24,15 @@
 #   only_prefix_patterns is an optional list of regexes matched against the
 #   object key *after* the generated prefix. Only objects whose suffix matches
 #   at least one pattern will be downloaded.
+#
+# File-level sampling:
+#   sample_files (per-bucket) is an optional float in (0.0, 1.0] applied
+#   *after* key filtering. 0.1 keeps 10% of files. Coarsest of the
+#   work-shedding mechanisms — it sheds whole files, so for sources with
+#   high per-file size variance the resulting line-volume sample can be
+#   noisy. The global `--sample-files` CLI flag is the fallback when the
+#   per-bucket field is absent. Set `sampling_seed` (top-level) to make
+#   the choice reproducible across runs.
 
 buckets:
   # Example: Hive-partitioned logs (dt=YYYYMMDD/hour=HH)
@@ -34,6 +43,7 @@ buckets:
     only_prefix_patterns:
       - "^service-a.*\\.json\\.zst$"
       - "^service-b.*\\.json\\.gz$"
+    # sample_files: 0.1   # optional: keep ~10% of files after filtering
 
   # Example: date-path layout (YYYY/MM/DD/HH)
   - bucket: my-other-logs-bucket
@@ -43,6 +53,10 @@ buckets:
 
 # Default AWS region (can be overridden with --region)
 region: eu-west-3
+
+# Optional RNG seed for the file-level sampler. Omit for fresh entropy each
+# run; set for reproducible sampling across runs.
+# sampling_seed: 42
 
 # ─── Output ────────────────────────────────────────────────────────────────
 #
