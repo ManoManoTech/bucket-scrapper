@@ -235,6 +235,102 @@ async fn run_file_test(codec: TestCodec) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_output_end_to_end_sharded() {
+    skip_unless_docker!();
+    if let Err(e) = run_sharded_test().await {
+        panic!("file_output_end_to_end_sharded failed: {e:#}");
+    }
+}
+
+/// Three independent scrapper invocations against the same Garage fixture,
+/// each owning one of three shards. The union of their outputs must equal the
+/// no-shard expected set (coverage), and total line count across shards must
+/// equal the expected set's size (disjointness — no line was processed twice).
+async fn run_sharded_test() -> Result<()> {
+    const SHARD_COUNT: usize = 3;
+    let codec = TestCodec::Zstd;
+
+    let garage = start_garage(BUCKET).await?;
+    let s3 = garage.s3_client();
+    let staged = build_fixture(DATE, HOURS);
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+
+    let mut per_shard_lines: Vec<Vec<String>> = Vec::with_capacity(SHARD_COUNT);
+
+    for shard_number in 0..SHARD_COUNT {
+        let output_dir = workdir.path().join(format!("out-{shard_number}"));
+        std::fs::create_dir_all(&output_dir)?;
+        write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(codec))?;
+
+        let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+        for (k, v) in garage.env_for_scrapper() {
+            cmd.env(k, v);
+        }
+        cmd.arg("--config")
+            .arg(&config_path)
+            .arg("--region")
+            .arg("garage")
+            .arg("--start")
+            .arg("2026-01-01T10:00:00Z")
+            .arg("--end")
+            .arg("2026-01-01T11:00:00Z")
+            .arg("--line-pattern-regex")
+            .arg(PATTERN)
+            .arg("--filter")
+            .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+            .arg("--max-parallel")
+            .arg("4")
+            .arg("--log-format")
+            .arg("json")
+            .arg("--shard-count")
+            .arg(SHARD_COUNT.to_string())
+            .arg("--shard-number")
+            .arg(shard_number.to_string())
+            .timeout(std::time::Duration::from_secs(120))
+            .assert()
+            .success();
+
+        let outputs = collect_outputs(&output_dir, codec);
+        let mut lines = Vec::new();
+        for f in &outputs {
+            for line in decode_file(f, codec)?.lines() {
+                if !line.is_empty() {
+                    lines.push(line.to_string());
+                }
+            }
+        }
+        per_shard_lines.push(lines);
+    }
+
+    let expected = expected_matches(&staged, PATTERN);
+
+    let union: Vec<String> = per_shard_lines.iter().flatten().cloned().collect();
+    assert_multiset_eq(&union, &expected);
+
+    let total: usize = per_shard_lines.iter().map(|v| v.len()).sum();
+    assert_eq!(
+        total,
+        expected.len(),
+        "shards overlap: total lines across shards = {}, expected = {}",
+        total,
+        expected.len()
+    );
+
+    // The fixture has 6 partition-eligible objects (2 hours × 3 included
+    // services) → 2 objects per shard with SHARD_COUNT=3. A zero-length shard
+    // would mean the modulo math is off or the shard filter ran before the
+    // listing was assembled.
+    for (i, lines) in per_shard_lines.iter().enumerate() {
+        assert!(!lines.is_empty(), "shard {i} produced no lines");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_output_end_to_end_zstd() {
     skip_unless_docker!();
     if let Err(e) = run_http_test(TestCodec::Zstd).await {

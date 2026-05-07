@@ -29,6 +29,7 @@ use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::S3ObjectInfo;
 use bucket_scrapper::sampling::{parse_unit_interval, FileSampler};
+use bucket_scrapper::sharding::ShardSelector;
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 use std::collections::HashMap;
 
@@ -117,6 +118,19 @@ struct Cli {
     /// Per-config `sampling_seed` (top-level) is used as fallback.
     #[arg(long)]
     sampling_seed: Option<u64>,
+
+    /// Total number of shards across distributed scrapper instances. When set,
+    /// only objects whose index in the deterministically sorted, sampled list
+    /// satisfies `index % shard_count == shard_number` are processed by this
+    /// instance. Naive partition: workload imbalance scales with per-file size
+    /// variance. Must be set together with `--shard-number`.
+    #[arg(long, requires = "shard_number")]
+    shard_count: Option<usize>,
+
+    /// Zero-indexed shard this instance owns. Must be `< shard_count`.
+    /// Must be set together with `--shard-count`.
+    #[arg(long, requires = "shard_count")]
+    shard_number: Option<usize>,
 
     // ── Output selection / per-output overrides ────────────────────────────
     //
@@ -531,7 +545,15 @@ async fn main() -> Result<()> {
             "Listing complete"
         );
 
-        all_objects.sort_by_key(|o| o.size);
+        // Total order: size first (pipeline expects size-ascending), then
+        // bucket+key as tiebreaker so distributed shard workers agree on the
+        // partition order despite nondeterministic JoinSet completion order.
+        all_objects.sort_by(|a, b| {
+            a.size
+                .cmp(&b.size)
+                .then_with(|| a.bucket.cmp(&b.bucket))
+                .then_with(|| a.key.cmp(&b.key))
+        });
         all_objects
     };
 
@@ -558,6 +580,21 @@ async fn main() -> Result<()> {
                 "Applied file-level sampling"
             );
         }
+    }
+
+    if let (Some(count), Some(number)) = (cli.shard_count, cli.shard_number) {
+        let selector = ShardSelector::new(count, number)
+            .map_err(|e| anyhow::anyhow!("invalid shard config: {e}"))?;
+        let before = all_bucket_objects.len();
+        let (kept, dropped) = selector.apply(&mut all_bucket_objects);
+        info!(
+            before,
+            kept,
+            dropped,
+            shard_count = count,
+            shard_number = number,
+            "Applied shard partitioning"
+        );
     }
 
     if all_bucket_objects.is_empty() {
