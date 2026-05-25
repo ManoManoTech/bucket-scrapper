@@ -12,3 +12,4 @@ dhat-heap.json
 heaptrack.*
 quickwit_index_config.yml
 .serena/
+mempalace.yaml
