@@ -16,7 +16,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 use bucket_scrapper::config::loader::load_config;
 use bucket_scrapper::config::output::OutputConfig;
 use bucket_scrapper::config::path_formatter::generate_path_formatter;
-use bucket_scrapper::config::resolve::{resolve_output, OutputCli, OutputKind};
+use bucket_scrapper::config::resolve::{resolve_output, CliOutputFormat, OutputCli, OutputKind};
 use bucket_scrapper::config::types::{BucketConfig, ConfigSchema};
 use bucket_scrapper::matcher::{LineMatcher, MatcherConfig};
 use bucket_scrapper::pipeline::codec::Codec;
@@ -162,6 +162,15 @@ struct Cli {
     /// gzip 0–9 (default 6). Must be unset when `--compression-format=none`.
     #[arg(long)]
     compression_level: Option<i32>,
+
+    /// Output framing for matched lines. `json_lines` (default) writes
+    /// NDJSON; `json_array` wraps each file/batch in a JSON array;
+    /// `json_array_pretty` keeps one item per line inside the array. The
+    /// HTTP sink also flips `Content-Type` to `application/json` for the
+    /// array variants. Lines are assumed to already be valid JSON values —
+    /// no parsing is performed.
+    #[arg(long, value_enum)]
+    output_format: Option<CliOutputFormat>,
 
     /// HTTP API URL for log ingestion (e.g., https://logs.example.com/api/v1/logs)
     #[arg(long, env = "HTTP_URL")]
@@ -316,6 +325,7 @@ impl Cli {
             compression_format: self.compression_format.map(Into::into),
             compression_level: self.compression_level,
             file_path_template: self.output_path_template.clone(),
+            output_format: self.output_format,
         }
     }
 }
@@ -636,8 +646,12 @@ async fn build_sink(
     Ok(match cfg {
         OutputConfig::File(file_cfg) => {
             let codec = Codec::from_config(&file_cfg.compression)?;
-            let writer =
-                SharedFileWriter::new(file_cfg.dir.clone(), file_cfg.path_template.clone(), codec)?;
+            let writer = SharedFileWriter::new(
+                file_cfg.dir.clone(),
+                file_cfg.path_template.clone(),
+                codec,
+                file_cfg.format.clone(),
+            )?;
             Arc::new(FileOutputSink::new(Arc::new(writer)))
         }
         OutputConfig::Http(http_cfg) => {
@@ -675,6 +689,7 @@ async fn build_sink(
                 max_upload_rate,
                 aimd_decrease_factor: http_cfg.aimd.decrease_factor,
                 aimd_increase_bytes: http_cfg.aimd.increase_mbps * 1_000_000.0,
+                format: http_cfg.format.clone(),
             };
 
             info!(

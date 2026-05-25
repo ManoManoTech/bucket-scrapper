@@ -419,6 +419,120 @@ async fn run_http_test(codec: TestCodec) -> Result<()> {
     Ok(())
 }
 
+/// E2E proof that the HTTP sink under `--output-format json_array` produces
+/// **one valid JSON array per uploaded batch** — not a single concatenated
+/// blob, not NDJSON, not partial fragments. The bulky fixture + tiny
+/// batch_max_mb force multiple batches so the across-batch boundary is
+/// covered (the unit tests only see a single batch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_output_end_to_end_json_array() {
+    skip_unless_docker!();
+    if let Err(e) = run_http_json_array_test().await {
+        panic!("http_output_end_to_end_json_array failed: {e:#}");
+    }
+}
+
+async fn run_http_json_array_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    let s3 = garage.s3_client();
+    // Bulky fixture: lots of matching JSON lines per hour, so the
+    // sub-MB batch threshold rolls over several times.
+    let mut staged = build_fixture(DATE, HOURS);
+    for hour in HOURS {
+        staged.push(bulk_match_object(DATE, hour, 5_000));
+    }
+    seed_bucket(&s3, BUCKET, &staged).await?;
+    let dump_root = TempDir::new()?;
+    let nginx = start_nginx(dump_root.path()).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("http")
+        .arg("--http-url")
+        .arg(&nginx.url)
+        .arg("--http-batch-max-mb")
+        // ~50 KB — small enough to force several rollovers given ~10k
+        // matching lines × ~140 B each = ~1.4 MB plaintext.
+        .arg("0.05")
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        // Plaintext on the wire: keep the dumped bodies directly parseable
+        // as JSON without first decompressing. The framing layer is the
+        // axis under test, not compression.
+        .arg("--compression-format")
+        .arg("none")
+        .arg("--output-format")
+        .arg("json_array")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let dumps = nginx.collect_dumps().await?;
+    assert!(
+        dumps.len() >= 2,
+        "expected ≥2 batches to cover the multi-array case; got {}",
+        dumps.len()
+    );
+
+    let mut received: Vec<String> = Vec::new();
+    for (idx, body) in dumps.iter().enumerate() {
+        // Every body must be its own standalone valid JSON array.
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(body).map_err(|e| {
+            anyhow!(
+                "batch {idx} body is not a valid JSON array: {e}; first 200 bytes: {:?}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            )
+        })?;
+        assert!(
+            !arr.is_empty(),
+            "batch {idx} should not be an empty array (the sink must not emit `[]`)"
+        );
+        // Canonicalize via `serde_json::to_string` so the multiset
+        // comparison ignores key ordering inside each object (the
+        // framing strips a trailing `\n` but otherwise passes bytes
+        // through unchanged — only the parse/reserialize step on our
+        // side reorders).
+        for item in arr {
+            received.push(serde_json::to_string(&item)?);
+        }
+    }
+
+    let expected: Vec<String> = expected_matches(&staged, PATTERN)
+        .into_iter()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                panic!("expected line not parseable as JSON: {e}; line={line}")
+            });
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect();
+    assert_multiset_eq(&received, &expected);
+
+    drop(dump_root); // keep TempDir alive until end
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_output_end_to_end_no_batching() {
     skip_unless_docker!();
@@ -453,6 +567,154 @@ async fn s3_output_end_to_end_plaintext() {
     if let Err(e) = run_s3_test(TestCodec::None, None, HOURS.len()).await {
         panic!("s3_output_end_to_end_plaintext failed: {e:#}");
     }
+}
+
+/// E2E proof that the S3 sink under `--output-format json_array` writes
+/// **one valid JSON array per uploaded object** — not a single concatenated
+/// blob across rollovers. Forces rollover via `--s3-output-batch-max-mb`
+/// so the across-object boundary is covered (the unit tests only see a
+/// single batch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_end_to_end_json_array() {
+    skip_unless_docker!();
+    if let Err(e) = run_s3_json_array_test().await {
+        panic!("s3_output_end_to_end_json_array failed: {e:#}");
+    }
+}
+
+async fn run_s3_json_array_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    garage.create_bucket(RESULTS_BUCKET).await?;
+
+    let s3 = garage.s3_client();
+    // Bulky fixture to feed enough plaintext per prefix that the size-based
+    // rollover actually fires (zstd's internal block buffer would otherwise
+    // hide all the bytes until end-of-run; plaintext codec sidesteps that).
+    let mut staged = build_fixture(DATE, HOURS);
+    for hour in HOURS {
+        staged.push(bulk_match_object(DATE, hour, 5_000));
+    }
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    // Use `.json` instead of `.ndjson` in the literal portion to reflect
+    // the new framing; the codec extension still drives the trailing
+    // `.{ext}` (empty for plaintext, so the key ends at `.json`).
+    let key_template = "out/{prefix}/{run_id}-{seq}.json";
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("s3")
+        .arg("--s3-output-bucket")
+        .arg(RESULTS_BUCKET)
+        .arg("--s3-output-key-template")
+        .arg(key_template)
+        // Plaintext: predictable rollover and direct JSON parsing of object bodies.
+        .arg("--compression-format")
+        .arg("none")
+        // Aggressive rollover so several objects per prefix are produced.
+        .arg("--s3-output-batch-max-mb")
+        .arg("0.05")
+        .arg("--output-format")
+        .arg("json_array")
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    // List every uploaded object; each body must be its own JSON array.
+    let mut keys = Vec::new();
+    let mut continuation = None;
+    loop {
+        let mut req = s3.list_objects_v2().bucket(RESULTS_BUCKET).prefix("out/");
+        if let Some(token) = continuation.take() {
+            req = req.continuation_token(token);
+        }
+        let resp = req.send().await?;
+        if let Some(contents) = resp.contents {
+            for obj in contents {
+                if let Some(k) = obj.key {
+                    keys.push(k);
+                }
+            }
+        }
+        if resp.is_truncated.unwrap_or(false) {
+            continuation = resp.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    assert!(
+        keys.len() > HOURS.len(),
+        "expected rollover to produce more objects than source prefixes ({}); got {} keys: {keys:?}",
+        HOURS.len(),
+        keys.len()
+    );
+    assert!(
+        keys.iter().any(|k| !k.contains("-00000.")),
+        "expected at least one rolled-over object (seq > 0); got: {keys:?}"
+    );
+
+    let mut received: Vec<String> = Vec::new();
+    for key in &keys {
+        let resp = s3
+            .get_object()
+            .bucket(RESULTS_BUCKET)
+            .key(key)
+            .send()
+            .await?;
+        let body = resp.body.collect().await?.to_vec();
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(|e| {
+            anyhow!(
+                "object {key} body is not a valid JSON array: {e}; first 200 bytes: {:?}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            )
+        })?;
+        assert!(
+            !arr.is_empty(),
+            "object {key} should not be an empty array (the sink must not upload `[]`)"
+        );
+        for item in arr {
+            received.push(serde_json::to_string(&item)?);
+        }
+    }
+
+    // Canonicalize the expected lines through the same parse/reserialize
+    // path so key ordering in the comparison is consistent.
+    let expected: Vec<String> = expected_matches(&staged, PATTERN)
+        .into_iter()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                panic!("expected line not parseable as JSON: {e}; line={line}")
+            });
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect();
+    assert_multiset_eq(&received, &expected);
+
+    Ok(())
 }
 
 /// Exercises the multipart upload path through the AWS transfer manager.

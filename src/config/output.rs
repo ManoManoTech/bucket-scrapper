@@ -9,6 +9,7 @@
 //! single-entry restriction without breaking changes.
 
 use crate::pipeline::codec::{Codec, CompressionConfig};
+use crate::pipeline::framing::OutputFormat;
 use crate::pipeline::path_template::{validate_template, TemplateRules};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,13 @@ pub struct FileOutputConfig {
     pub path_template: String,
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Output framing. Default `json_lines` writes one match per line
+    /// (NDJSON). Set `kind: json_array` to wrap matches in a single JSON
+    /// array per file. The file extension is still driven by the codec —
+    /// override `path_template` if you want a `.json` literal instead of
+    /// `.ndjson` when emitting arrays.
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -79,6 +87,12 @@ pub struct HttpOutputConfig {
     pub max_upload_rate_mbps: f64,
     #[serde(default)]
     pub aimd: HttpAimdConfig,
+    /// Request body framing. Default `json_lines` posts NDJSON with
+    /// `Content-Type: application/x-ndjson`. Set `kind: json_array` to
+    /// post a single JSON array per batch with `Content-Type:
+    /// application/json`.
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -153,6 +167,13 @@ pub struct S3OutputConfig {
     pub multipart_concurrency: Option<usize>,
     #[serde(default)]
     pub upload_tasks: Option<usize>,
+    /// Object body framing. Default `json_lines` writes NDJSON. Set
+    /// `kind: json_array` to upload a single JSON array per batch. The
+    /// object extension is still driven by the codec — override
+    /// `key_template` if you want a `.json` literal instead of `.ndjson`
+    /// when emitting arrays.
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 fn default_http_timeout_secs() -> u64 {
@@ -444,6 +465,7 @@ mystery: 42
             dir: "/tmp/out".into(),
             path_template: default_file_path_template(),
             compression: CompressionConfig::default(),
+            format: OutputFormat::default(),
         });
         validate_output(&cfg).unwrap();
     }
@@ -461,6 +483,7 @@ mystery: 42
             multipart_part_mb: 5,
             multipart_concurrency: None,
             upload_tasks: None,
+            format: OutputFormat::default(),
         });
         validate_output(&cfg).unwrap();
     }
@@ -471,6 +494,7 @@ mystery: 42
             dir: "/tmp/out".into(),
             path_template: "results.{ext}".into(),
             compression: CompressionConfig::default(),
+            format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
         let msg = format!("{err}");
@@ -484,6 +508,7 @@ mystery: 42
             dir: "/tmp/out".into(),
             path_template: "{prefix}-{seq}.{ext}".into(),
             compression: CompressionConfig::default(),
+            format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
         assert!(format!("{err}").contains("{seq}"));
@@ -502,6 +527,7 @@ mystery: 42
             multipart_part_mb: 5,
             multipart_concurrency: None,
             upload_tasks: None,
+            format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
         assert!(format!("{err}").contains("{seq}"));
@@ -520,6 +546,7 @@ mystery: 42
             multipart_part_mb: 5,
             multipart_concurrency: None,
             upload_tasks: None,
+            format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
         assert!(format!("{err}").contains("{prefix}"));
@@ -534,6 +561,7 @@ mystery: 42
                 format: CodecFormat::Zstd,
                 level: Some(99),
             },
+            format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
         assert!(format!("{err}").contains("zstd"));
@@ -605,6 +633,7 @@ dir: /tmp/out
             multipart_part_mb: part_mb,
             multipart_concurrency: concurrency,
             upload_tasks: None,
+            format: OutputFormat::default(),
         })
     }
 

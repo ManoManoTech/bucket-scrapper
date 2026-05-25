@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod file_sink;
+pub mod framing;
 pub mod http_sink;
 pub mod http_writer;
 pub mod observer;
@@ -12,6 +13,7 @@ pub mod void_writer;
 
 pub use codec::{Codec, CodecEncoder, CodecFormat, CompressionConfig};
 pub use file_sink::FileOutputSink;
+pub use framing::{FramedEncoder, OutputFormat};
 pub use http_sink::HttpOutputSink;
 pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats};
 pub use observer::{ChannelObserver, DownloadObserver, PipelineObserver};

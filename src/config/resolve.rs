@@ -19,6 +19,7 @@ use crate::config::output::{
 };
 use crate::config::types::ConfigSchema;
 use crate::pipeline::codec::{CodecFormat, CompressionConfig};
+use crate::pipeline::framing::OutputFormat;
 use anyhow::{anyhow, Result};
 
 /// Selectable output type on the CLI.
@@ -83,6 +84,28 @@ pub struct OutputCli {
     pub compression_format: Option<CodecFormat>,
     pub compression_level: Option<i32>,
     pub file_path_template: Option<String>,
+    pub output_format: Option<CliOutputFormat>,
+}
+
+/// Flat CLI form of [`OutputFormat`]. The struct-tagged YAML variant is
+/// awkward to express on the command line, so we expose three flat choices
+/// and translate at resolve time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum CliOutputFormat {
+    JsonLines,
+    JsonArray,
+    JsonArrayPretty,
+}
+
+impl From<CliOutputFormat> for OutputFormat {
+    fn from(c: CliOutputFormat) -> Self {
+        match c {
+            CliOutputFormat::JsonLines => OutputFormat::JsonLines,
+            CliOutputFormat::JsonArray => OutputFormat::JsonArray { pretty: false },
+            CliOutputFormat::JsonArrayPretty => OutputFormat::JsonArray { pretty: true },
+        }
+    }
 }
 
 impl OutputCli {
@@ -131,6 +154,7 @@ impl OutputCli {
         check!(compression_format, "--compression-format");
         check!(compression_level, "--compression-level");
         check!(file_path_template, "--output-path-template");
+        check!(output_format, "--output-format");
         v
     }
 
@@ -174,6 +198,12 @@ fn cli_compression(cli: &OutputCli) -> CompressionConfig {
     }
 }
 
+fn cli_format(cli: &OutputCli) -> OutputFormat {
+    cli.output_format
+        .map(OutputFormat::from)
+        .unwrap_or_default()
+}
+
 fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
     let kind = cli.output.ok_or_else(|| {
         anyhow!(
@@ -196,6 +226,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 .clone()
                 .unwrap_or_else(|| "{prefix}.{ext}".to_string()),
             compression: cli_compression(cli),
+            format: cli_format(cli),
         }),
         OutputKind::Http => {
             let url = cli
@@ -219,6 +250,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                     increase_mbps: cli.http_aimd_increase_mbps.unwrap_or(1.0),
                     max_submission_time_s: cli.http_aimd_max_submission_time_s.unwrap_or(4.0),
                 },
+                format: cli_format(cli),
             })
         }
         OutputKind::S3 => {
@@ -240,6 +272,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(5),
                 multipart_concurrency: cli.s3_multipart_concurrency,
                 upload_tasks: cli.s3_upload_tasks,
+                format: cli_format(cli),
             })
         }
         OutputKind::Void => OutputConfig::Void,
@@ -416,6 +449,7 @@ mod tests {
             max_retries: 1,
             max_upload_rate_mbps: 0.0,
             aimd: HttpAimdConfig::default(),
+            format: OutputFormat::default(),
         }));
         let cfg = resolve_output(&empty_cli(), &schema).unwrap();
         match cfg {

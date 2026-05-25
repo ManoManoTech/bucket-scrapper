@@ -1,9 +1,9 @@
 use super::codec::Codec;
+use super::framing::{FramedEncoder, OutputFormat};
 use super::observer::PipelineObserver;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::Client;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -330,6 +330,10 @@ pub struct HttpWriterConfig {
     pub aimd_decrease_factor: f64,
     /// AIMD additive increase in bytes/sec per healthy batch.
     pub aimd_increase_bytes: f64,
+    /// Output framing for the request body. Default `JsonLines` posts
+    /// NDJSON with `Content-Type: application/x-ndjson`; `JsonArray` wraps
+    /// each batch in a JSON array with `Content-Type: application/json`.
+    pub format: OutputFormat,
 }
 
 impl Default for HttpWriterConfig {
@@ -353,6 +357,7 @@ impl Default for HttpWriterConfig {
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
             aimd_increase_bytes: 1_000_000.0,
+            format: OutputFormat::default(),
         }
     }
 }
@@ -538,26 +543,27 @@ impl HttpResultWriter {
                 Err(_) => break 'outer,
             };
 
-            // 2. Compress lines into buffer
-            let mut encoder = match config.codec.encoder(Vec::new()) {
+            // 2. Compress lines into buffer through the framing layer
+            let codec_enc = match config.codec.encoder(Vec::new()) {
                 Ok(enc) => enc,
                 Err(e) => {
                     error!(task = task_id, error = %e, "Failed to create encoder");
                     break 'outer;
                 }
             };
+            let mut framed = FramedEncoder::new(codec_enc, config.format.clone());
 
             let mut batch_lines = 0usize;
             let mut batch_plaintext_bytes = 0usize;
 
             // Write first line (Vec<u8> writes are infallible barring OOM)
-            encoder.write_all(&first_line).expect("write to Vec");
+            framed.write_item(&first_line).expect("write to Vec");
             batch_lines += 1;
             batch_plaintext_bytes += first_line.len();
 
             // Fill batch until compressed output reaches batch_max_bytes or channel closes
             loop {
-                if encoder.buffered_len() >= config.batch_max_bytes {
+                if framed.inner_ref().buffered_len() >= config.batch_max_bytes {
                     break;
                 }
 
@@ -581,13 +587,24 @@ impl HttpResultWriter {
                     }
                 };
 
-                encoder.write_all(&line).expect("write to Vec");
+                framed.write_item(&line).expect("write to Vec");
                 batch_lines += 1;
                 batch_plaintext_bytes += line.len();
             }
 
-            // 3. Finalize encoder frame → CompressedBatch
-            let compressed = match encoder.finish() {
+            // 3. Close framing, then finalize codec frame → CompressedBatch
+            let codec_enc = match framed.finish() {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!(task = task_id, error = %e, lines = batch_lines, "Failed to close framing");
+                    lines_dropped.fetch_add(batch_lines, Ordering::Relaxed);
+                    if channel_closed {
+                        break 'outer;
+                    }
+                    continue 'outer;
+                }
+            };
+            let compressed = match codec_enc.finish() {
                 Ok(buf) => buf,
                 Err(e) => {
                     error!(task = task_id, error = %e, lines = batch_lines, "Failed to finalize encoder frame");
@@ -801,9 +818,14 @@ impl HttpResultWriter {
                 tokio::time::sleep(delay).await;
             }
 
+            let content_type = if config.format.is_json_array() {
+                "application/json"
+            } else {
+                "application/x-ndjson"
+            };
             let mut request = client
                 .post(&config.url)
-                .header("Content-Type", "application/x-ndjson");
+                .header("Content-Type", content_type);
             if let Some(enc) = config.codec.content_encoding() {
                 request = request.header("Content-Encoding", enc);
             }
@@ -1158,6 +1180,13 @@ mod tests {
     /// codec-driven Content-Encoding behavior without re-validating the
     /// entire pipeline for each codec.
     async fn capture_one_request(codec: Codec) -> Vec<wiremock::Request> {
+        capture_one_request_with(codec, OutputFormat::default()).await
+    }
+
+    async fn capture_one_request_with(
+        codec: Codec,
+        format: OutputFormat,
+    ) -> Vec<wiremock::Request> {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1183,6 +1212,7 @@ mod tests {
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
             aimd_increase_bytes: 1_000_000.0,
+            format,
         };
         let writer = HttpResultWriter::new(cfg).expect("writer creation");
         let sender = writer.get_sender();
@@ -1240,6 +1270,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_request_uses_ndjson_content_type_in_json_lines_mode() {
+        let reqs = capture_one_request_with(Codec::None, OutputFormat::JsonLines).await;
+        assert!(!reqs.is_empty(), "no request received");
+        let ct = reqs[0]
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(ct, Some("application/x-ndjson"));
+    }
+
+    #[tokio::test]
+    async fn http_request_uses_json_content_type_in_json_array_mode() {
+        let reqs =
+            capture_one_request_with(Codec::None, OutputFormat::JsonArray { pretty: false }).await;
+        assert!(!reqs.is_empty(), "no request received");
+        let ct = reqs[0]
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(ct, Some("application/json"));
+
+        // Body must be a valid JSON array; production never parses, this is
+        // a test-only assertion.
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_slice(&reqs[0].body).expect("body must be a JSON array");
+        assert_eq!(arr.len(), 5, "5 items were sent");
+    }
+
+    #[tokio::test]
+    async fn http_multi_batch_json_array_each_batch_is_its_own_array() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ingest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Plaintext codec: encoder.buffered_len() == bytes written, so the
+        // batch_max_bytes threshold is hit deterministically without
+        // depending on zstd block-flush timing.
+        const BATCH_MAX_BYTES: usize = 256;
+        const NUM_LINES: usize = 120; // each line ~28 bytes → many batches
+
+        let cfg = HttpWriterConfig {
+            url: format!("{}/ingest", mock_server.uri()),
+            bearer_token: None,
+            batch_max_bytes: BATCH_MAX_BYTES,
+            timeout_secs: 5,
+            max_retries: 0,
+            channel_buffer_size: 16,
+            num_compressor_tasks: 1,
+            num_upload_tasks: 1,
+            upload_channel_size: 4,
+            codec: Codec::None,
+            max_submission_time: None,
+            max_upload_rate: None,
+            aimd_decrease_factor: 0.15,
+            aimd_increase_bytes: 1_000_000.0,
+            format: OutputFormat::JsonArray { pretty: false },
+        };
+        let writer = HttpResultWriter::new(cfg).expect("writer creation");
+        let sender = writer.get_sender();
+        for i in 0..NUM_LINES {
+            // Use a string field so we control the byte width (~28 bytes per
+            // line) without producing JSON-invalid numeric literals like `07`.
+            sender
+                .send_async(format!("{{\"k\":\"line-{i:03}-{i:03}\"}}\n").into_bytes())
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let stats = writer.finish().await.expect("finish");
+        assert_eq!(stats.lines_sent, NUM_LINES);
+        assert_eq!(stats.lines_dropped, 0);
+
+        let reqs = mock_server.received_requests().await.unwrap();
+        assert!(
+            reqs.len() >= 2,
+            "expected ≥2 batches to prove multi-batch framing, got {}",
+            reqs.len()
+        );
+
+        let mut total_items = 0usize;
+        for (idx, req) in reqs.iter().enumerate() {
+            let ct = req
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(
+                ct,
+                Some("application/json"),
+                "batch {idx} should advertise application/json, got {ct:?}"
+            );
+
+            // Each batch body must be a standalone valid JSON array.
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_slice(&req.body).unwrap_or_else(|e| {
+                    panic!(
+                        "batch {idx} body is not a JSON array: {e}; body={:?}",
+                        String::from_utf8_lossy(&req.body)
+                    )
+                });
+            assert!(!arr.is_empty(), "batch {idx} should not be an empty array");
+            total_items += arr.len();
+        }
+        assert_eq!(
+            total_items, NUM_LINES,
+            "items across all arrays must equal lines sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_request_json_array_roundtrips_through_codec() {
+        let reqs = capture_one_request_with(
+            Codec::Zstd { level: 1 },
+            OutputFormat::JsonArray { pretty: false },
+        )
+        .await;
+        assert!(!reqs.is_empty(), "no request received");
+        let plain = zstd::stream::decode_all(reqs[0].body.as_slice()).expect("zstd decode");
+        let s = std::str::from_utf8(&plain).expect("utf8");
+        assert!(s.starts_with('['), "expected JSON array start, got {s:?}");
+        assert!(s.ends_with(']'), "expected JSON array end, got {s:?}");
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&plain).expect("valid JSON");
+        assert_eq!(arr.len(), 5);
+    }
+
+    #[tokio::test]
     async fn pipeline_handles_429_and_recovers() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1279,6 +1440,7 @@ mod tests {
             max_upload_rate: None,
             aimd_decrease_factor: 0.15,
             aimd_increase_bytes: 1_000_000.0,
+            format: OutputFormat::default(),
         };
 
         let writer = HttpResultWriter::new(config).expect("writer creation should succeed");

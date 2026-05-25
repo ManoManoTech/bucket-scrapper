@@ -108,6 +108,7 @@
 //! defaults so the gap is explicit.
 
 use super::codec::{Codec, CodecEncoder};
+use super::framing::{FramedEncoder, OutputFormat};
 use super::output::{BoxFinishFuture, OutputSink, OutputStats};
 use super::path_template::{
     make_run_id, render_template, CollisionResult, CollisionTracker, TemplateValues,
@@ -118,7 +119,6 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3_transfer_manager as tm;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -126,7 +126,7 @@ use tracing::{debug, error, warn};
 
 /// In-flight per-prefix batch state.
 struct PrefixBatch {
-    encoder: CodecEncoder<Vec<u8>>,
+    encoder: FramedEncoder<CodecEncoder<Vec<u8>>>,
     lines: u64,
     plaintext: u64,
     seq: u64,
@@ -145,6 +145,7 @@ struct Inner {
     /// prefix. `None` disables rollover — each prefix produces one object.
     batch_max_bytes: Option<u64>,
     codec: Codec,
+    format: OutputFormat,
     run_id: String,
     /// Per-prefix mutable state. Outer Mutex protects map insertion only;
     /// per-prefix entries are `Mutex<PrefixBatch>` so different prefixes
@@ -229,6 +230,7 @@ impl S3OutputSink {
             key_template: cfg.key_template.clone(),
             batch_max_bytes: cfg.batch_max_mb.map(|mb| (mb * 1_000_000.0) as u64),
             codec,
+            format: cfg.format.clone(),
             run_id,
             prefixes: Mutex::new(HashMap::new()),
             upload_tx: Mutex::new(Some(upload_tx)),
@@ -336,14 +338,14 @@ impl S3OutputSink {
 
     /// Finalize the encoder for a prefix and enqueue an upload job.
     fn flush_batch(inner: &Inner, prefix: &str, batch: &mut PrefixBatch) -> Result<()> {
-        let encoder = std::mem::replace(
-            &mut batch.encoder,
-            inner
-                .codec
-                .encoder(Vec::new())
-                .context("create replacement encoder")?,
-        );
-        let body = encoder.finish().context("finalize batch encoder")?;
+        let replacement_codec = inner
+            .codec
+            .encoder(Vec::new())
+            .context("create replacement encoder")?;
+        let replacement = FramedEncoder::new(replacement_codec, inner.format.clone());
+        let framed = std::mem::replace(&mut batch.encoder, replacement);
+        let codec_enc = framed.finish().context("close batch framing")?;
+        let body = codec_enc.finish().context("finalize batch encoder")?;
         let lines = std::mem::replace(&mut batch.lines, 0);
         let plaintext = std::mem::replace(&mut batch.plaintext, 0);
 
@@ -422,11 +424,12 @@ impl OutputSink for S3OutputSink {
                 .unwrap_or_else(|e| e.into_inner());
             map.entry(prefix.to_string())
                 .or_insert_with(|| {
-                    let encoder = self
+                    let codec_enc = self
                         .inner
                         .codec
                         .encoder(Vec::new())
                         .expect("encoder creation must succeed");
+                    let encoder = FramedEncoder::new(codec_enc, self.inner.format.clone());
                     Arc::new(Mutex::new(PrefixBatch {
                         encoder,
                         lines: 0,
@@ -438,7 +441,7 @@ impl OutputSink for S3OutputSink {
         };
 
         let mut batch = entry.lock().unwrap_or_else(|e| e.into_inner());
-        batch.encoder.write_all(line).context("encoder write")?;
+        batch.encoder.write_item(line).context("encoder write")?;
         batch.lines += 1;
         batch.plaintext += line.len() as u64;
 
@@ -448,7 +451,7 @@ impl OutputSink for S3OutputSink {
             .fetch_add(line.len() as u64, Ordering::Relaxed);
 
         if let Some(threshold) = self.inner.batch_max_bytes {
-            let approx_compressed = batch.encoder.buffered_len() as u64;
+            let approx_compressed = batch.encoder.inner_ref().buffered_len() as u64;
             if approx_compressed >= threshold {
                 Self::flush_batch(&self.inner, prefix, &mut batch)?;
             }

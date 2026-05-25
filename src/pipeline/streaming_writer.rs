@@ -1,16 +1,16 @@
 use super::codec::{Codec, CodecEncoder};
+use super::framing::{FramedEncoder, OutputFormat};
 use super::path_template::{
     make_run_id, render_template, CollisionResult, CollisionTracker, TemplateValues,
 };
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use tracing::warn;
 
-type PrefixEncoder = CodecEncoder<File>;
+type PrefixEncoder = FramedEncoder<CodecEncoder<File>>;
 
 /// Shared file writer using per-prefix locking.
 ///
@@ -31,6 +31,7 @@ pub struct SharedFileWriter {
     output_dir: String,
     path_template: String,
     codec: Codec,
+    format: OutputFormat,
     run_id: String,
     lines_written: AtomicUsize,
     bytes_written: AtomicUsize,
@@ -38,7 +39,12 @@ pub struct SharedFileWriter {
 }
 
 impl SharedFileWriter {
-    pub fn new(output_dir: String, path_template: String, codec: Codec) -> Result<Self> {
+    pub fn new(
+        output_dir: String,
+        path_template: String,
+        codec: Codec,
+        format: OutputFormat,
+    ) -> Result<Self> {
         fs::create_dir_all(&output_dir)?;
         Ok(Self {
             encoders: RwLock::new(HashMap::new()),
@@ -46,6 +52,7 @@ impl SharedFileWriter {
             output_dir,
             path_template,
             codec,
+            format,
             run_id: make_run_id(),
             lines_written: AtomicUsize::new(0),
             bytes_written: AtomicUsize::new(0),
@@ -73,7 +80,7 @@ impl SharedFileWriter {
         let encoder_arc = self.get_or_create_encoder(prefix)?;
 
         let mut encoder = encoder_arc.lock().unwrap_or_else(|e| e.into_inner());
-        encoder.write_all(content)?;
+        encoder.write_item(content)?;
 
         self.lines_written.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
@@ -127,8 +134,9 @@ impl SharedFileWriter {
             fs::create_dir_all(parent)?;
         }
         let file = File::create(&output_file)?;
-        let encoder = self.codec.encoder(file)?;
-        let arc = std::sync::Arc::new(Mutex::new(encoder));
+        let codec_enc = self.codec.encoder(file)?;
+        let framed = FramedEncoder::new(codec_enc, self.format.clone());
+        let arc = std::sync::Arc::new(Mutex::new(framed));
         map.insert(prefix.to_string(), std::sync::Arc::clone(&arc));
         self.files_created.fetch_add(1, Ordering::Relaxed);
         Ok(arc)
@@ -154,8 +162,15 @@ impl SharedFileWriter {
         for (prefix, encoder_arc) in map {
             match std::sync::Arc::try_unwrap(encoder_arc) {
                 Ok(mutex) => {
-                    let encoder = mutex.into_inner().unwrap_or_else(|e| e.into_inner());
-                    match encoder.finish() {
+                    let framed = mutex.into_inner().unwrap_or_else(|e| e.into_inner());
+                    let codec_enc = match framed.finish() {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            warn!(prefix = %prefix, error = %e, "Failed to close framing");
+                            continue;
+                        }
+                    };
+                    match codec_enc.finish() {
                         Ok(file) => {
                             files_written += 1;
                             if let Ok(meta) = file.metadata() {
@@ -199,6 +214,17 @@ mod tests {
             dir.to_str().unwrap().to_string(),
             "{prefix}.{ext}".to_string(),
             codec,
+            OutputFormat::default(),
+        )
+        .unwrap()
+    }
+
+    fn writer_with(dir: &std::path::Path, codec: Codec, format: OutputFormat) -> SharedFileWriter {
+        SharedFileWriter::new(
+            dir.to_str().unwrap().to_string(),
+            "{prefix}.{ext}".to_string(),
+            codec,
+            format,
         )
         .unwrap()
     }
@@ -296,6 +322,71 @@ mod tests {
     }
 
     #[test]
+    fn json_array_format_produces_valid_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = writer_with(
+            dir.path(),
+            Codec::None,
+            OutputFormat::JsonArray { pretty: false },
+        );
+
+        w.write_match("p", b"{\"a\":1}\n").unwrap();
+        w.write_match("p", b"{\"b\":2}\n").unwrap();
+        w.write_match("p", b"{\"c\":3}\n").unwrap();
+        w.finalize().unwrap();
+
+        let path = dir.path().join("p");
+        let mut s = String::new();
+        File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "[{\"a\":1},{\"b\":2},{\"c\":3}]");
+
+        // The test (only) parses the result to confirm it is valid JSON;
+        // production code never touches serde.
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+        assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn json_array_pretty_format_is_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = writer_with(
+            dir.path(),
+            Codec::None,
+            OutputFormat::JsonArray { pretty: true },
+        );
+
+        w.write_match("p", b"{\"a\":1}\n").unwrap();
+        w.write_match("p", b"{\"b\":2}\n").unwrap();
+        w.finalize().unwrap();
+
+        let path = dir.path().join("p");
+        let mut s = String::new();
+        File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "[\n{\"a\":1},\n{\"b\":2}\n]");
+    }
+
+    #[test]
+    fn json_array_format_with_zstd_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = writer_with(
+            dir.path(),
+            Codec::Zstd { level: 1 },
+            OutputFormat::JsonArray { pretty: false },
+        );
+
+        w.write_match("p", b"{\"a\":1}\n").unwrap();
+        w.write_match("p", b"{\"b\":2}\n").unwrap();
+        w.finalize().unwrap();
+
+        let path = dir.path().join("p.zst");
+        let file = File::open(&path).unwrap();
+        let mut decoder = zstd::Decoder::new(file).unwrap();
+        let mut s = String::new();
+        decoder.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "[{\"a\":1},{\"b\":2}]");
+    }
+
+    #[test]
     fn collision_between_prefixes_errors() {
         // Template that ignores the prefix entirely — every prefix renders
         // to the same path. Static validation rejects this in production
@@ -306,6 +397,7 @@ mod tests {
             dir.path().to_str().unwrap().to_string(),
             "shared.{ext}".to_string(),
             Codec::Zstd { level: 1 },
+            OutputFormat::default(),
         )
         .unwrap();
 
