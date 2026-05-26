@@ -373,6 +373,7 @@ async fn main() -> Result<()> {
             .with_env_filter(env_filter)
             .with_target(false)
             .json()
+            .flatten_event(true)
             .init(),
         LogFormat::Text => fmt().with_env_filter(env_filter).with_target(false).init(),
     }
