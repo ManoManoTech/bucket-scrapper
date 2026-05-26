@@ -1101,15 +1101,10 @@ async fn run_void_test() -> Result<()> {
     let completion = logs
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|v| {
-            v.get("fields")
-                .and_then(|f| f.get("message"))
-                .and_then(|m| m.as_str())
-                == Some("Search completed")
-        })
+        .find(|v| v.get("message").and_then(|m| m.as_str()) == Some("Search completed"))
         .expect("Search completed record not found in JSON logs");
 
-    let fields = completion.get("fields").expect("fields object");
+    let fields = &completion;
     let expected = expected_matches(&staged, PATTERN);
     assert_eq!(expected.len(), 16, "fixture sanity check");
 
@@ -1201,12 +1196,7 @@ async fn run_progress_metrics_test() -> Result<()> {
     let progress_records: Vec<serde_json::Value> = logs
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| {
-            v.get("fields")
-                .and_then(|f| f.get("message"))
-                .and_then(|m| m.as_str())
-                == Some("Search progress")
-        })
+        .filter(|v| v.get("message").and_then(|m| m.as_str()) == Some("Search progress"))
         .collect();
     assert!(
         !progress_records.is_empty(),
@@ -1219,7 +1209,7 @@ async fn run_progress_metrics_test() -> Result<()> {
     assert_eq!(expected.len(), 16, "fixture sanity check");
 
     let final_record = progress_records.last().unwrap();
-    let fields = final_record.get("fields").expect("fields object");
+    let fields = final_record;
 
     for key in [
         "filter_lines_in",
