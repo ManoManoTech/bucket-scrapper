@@ -463,9 +463,53 @@ async fn main() -> Result<()> {
         config.as_ref().unwrap_or(&ConfigSchema::default()),
     )?;
 
-    let sink = build_sink(&resolved_output, &s3_client, cli.max_retries).await?;
+    info!(
+        start = %start_date,
+        end = %end_date,
+        duration_hours = (end_date - start_date).num_hours(),
+        buckets = config_buckets.len(),
+        bucket_names = ?config_buckets.iter().map(|b| &b.bucket).collect::<Vec<_>>(),
+        "Run scope",
+    );
 
-    info!(output = sink.type_name(), "Output configured");
+    match &resolved_output {
+        OutputConfig::File(c) => info!(
+            output_type = "file",
+            dir = %c.dir,
+            path_template = %c.path_template,
+            compression = ?c.compression.format,
+            compression_level = ?c.compression.level,
+            format = ?c.format,
+            "Sink configured",
+        ),
+        OutputConfig::Http(c) => info!(
+            output_type = "http",
+            url = %c.url,
+            bearer_auth = c.bearer_auth.is_some(),
+            timeout_secs = c.timeout_secs,
+            batch_max_mb = c.batch_max_mb,
+            compression = ?c.compression.format,
+            format = ?c.format,
+            "Sink configured",
+        ),
+        OutputConfig::S3(c) => info!(
+            output_type = "s3",
+            bucket = %c.bucket,
+            region = ?c.region,
+            endpoint_url = ?c.endpoint_url,
+            key_template = %c.key_template,
+            batch_max_mb = ?c.batch_max_mb,
+            multipart_threshold_mb = c.multipart_threshold_mb,
+            multipart_part_mb = c.multipart_part_mb,
+            multipart_concurrency = ?c.multipart_concurrency,
+            compression = ?c.compression.format,
+            format = ?c.format,
+            "Sink configured",
+        ),
+        OutputConfig::Void => info!(output_type = "void", "Sink configured"),
+    }
+
+    let sink = build_sink(&resolved_output, &s3_client, cli.max_retries).await?;
 
     // List all objects in parallel across all buckets × hourly prefixes
     let mut all_bucket_objects = {
