@@ -34,7 +34,7 @@ use std::task::{Context, Poll};
 /// ahead. Each chunk is one `Write::write` call's worth of bytes — typically
 /// a codec block (~128 KB for zstd at default level, smaller for gzip), so
 /// steady-state channel residency is ~2 × block size per active prefix.
-pub(super) const CHANNEL_CAPACITY: usize = 2;
+pub const CHANNEL_CAPACITY: usize = 2;
 
 /// Sync end of the streaming pipeline. Wraps an `mpsc::Sender<Bytes>` in an
 /// `io::Write` so the codec encoder can push compressed bytes through it.

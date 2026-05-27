@@ -25,6 +25,7 @@ use bucket_scrapper::pipeline::{
     FileOutputSink, HttpOutputSink, HttpResultWriter, HttpWriterConfig, OutputSink, OutputStats,
     S3OutputSink, SharedFileWriter, StreamingDownloader, StreamingDownloaderConfig, VoidOutputSink,
 };
+use bucket_scrapper::runtime_report;
 use bucket_scrapper::s3::client::WrappedS3Client;
 use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::S3ObjectInfo;
@@ -75,21 +76,25 @@ struct Cli {
     #[arg(short, long)]
     ignore_case: bool,
 
-    /// Maximum parallel downloads
-    #[arg(long, default_value = "32")]
-    max_parallel: usize,
+    /// Maximum parallel downloads.
+    /// Default: `max(8, available_parallelism)` — scales with instance
+    /// CPU count. Override for very large instances where the SDK
+    /// connection pool / DNS resolver gets contended.
+    #[arg(long)]
+    max_parallel: Option<usize>,
 
-    /// Maximum retry attempts for failed downloads
-    #[arg(long, default_value = "10")]
-    max_retries: u32,
+    /// Maximum retry attempts for failed downloads. Default 10.
+    #[arg(long)]
+    max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds
-    #[arg(long, default_value = "2")]
-    retry_delay: u64,
+    /// Initial retry delay in seconds. Default 2.
+    #[arg(long)]
+    retry_delay: Option<u64>,
 
-    /// Progress report interval in seconds (supports fractional, e.g. 0.5)
-    #[arg(long, default_value = "1")]
-    progress_interval: f64,
+    /// Progress report interval in seconds (supports fractional, e.g. 0.5).
+    /// Default 1.
+    #[arg(long)]
+    progress_interval: Option<f64>,
 
     /// Maximum age of the S3 client in minutes (longer = fewer DNS queries)
     #[arg(long, default_value = "60")]
@@ -100,9 +105,9 @@ struct Cli {
     filter_tasks: Option<usize>,
 
     /// Line channel capacity between download+decompress and filter workers
-    /// (RAM ≈ this × ~200 bytes avg line)
-    #[arg(long, default_value = "1000")]
-    line_buffer_size: usize,
+    /// (RAM ≈ this × ~200 bytes avg line). Default 1000.
+    #[arg(long)]
+    line_buffer_size: Option<usize>,
 
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
     #[arg(long, default_value = "0")]
@@ -434,20 +439,28 @@ async fn main() -> Result<()> {
 
     let searcher = Arc::new(LineMatcher::new(matcher_config)?);
 
-    let filter_tasks = cli.filter_tasks.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get() / 2)
-            .unwrap_or(2)
-            .max(1)
-    });
+    // Resolve performance parameters once, carrying their provenance.
+    // The `Param<T>` values feed both the runtime config below and the
+    // effective-parameter report emitted at startup + completion — that
+    // way the log always reflects what's actually running.
+    let p_max_parallel = runtime_report::cli_or_inferred(
+        cli.max_parallel,
+        runtime_report::infer_max_concurrent_downloads(),
+    );
+    let p_max_retries = runtime_report::cli_or_static(cli.max_retries, 10);
+    let p_retry_delay = runtime_report::cli_or_static(cli.retry_delay, 2);
+    let p_progress_interval = runtime_report::cli_or_static(cli.progress_interval, 1.0);
+    let p_filter_tasks =
+        runtime_report::cli_or_inferred(cli.filter_tasks, runtime_report::infer_filter_tasks());
+    let p_line_buffer_size = runtime_report::cli_or_static(cli.line_buffer_size, 1000);
 
     let download_config = StreamingDownloaderConfig {
-        max_concurrent_downloads: cli.max_parallel,
-        max_retries: cli.max_retries,
-        initial_retry_delay: Duration::from_secs(cli.retry_delay),
-        progress_interval: Duration::from_secs_f64(cli.progress_interval),
-        filter_tasks,
-        line_buffer_size: cli.line_buffer_size,
+        max_concurrent_downloads: p_max_parallel.value,
+        max_retries: p_max_retries.value,
+        initial_retry_delay: Duration::from_secs(p_retry_delay.value),
+        progress_interval: Duration::from_secs_f64(p_progress_interval.value),
+        filter_tasks: p_filter_tasks.value,
+        line_buffer_size: p_line_buffer_size.value,
     };
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
@@ -457,6 +470,21 @@ async fn main() -> Result<()> {
         &cli.to_output_cli(),
         config.as_ref().unwrap_or(&ConfigSchema::default()),
     )?;
+
+    // Emit the effective-parameter report at startup so operators can see
+    // exactly what defaults and inferences are in play before any work
+    // begins. Same report is emitted again from `report_completion` so
+    // post-mortems have it next to the throughput numbers.
+    let pipeline_params = runtime_report::PipelineParams {
+        max_parallel: p_max_parallel.clone(),
+        max_retries: p_max_retries.clone(),
+        retry_delay_s: p_retry_delay.clone(),
+        progress_interval_s: p_progress_interval.clone(),
+        filter_tasks: p_filter_tasks.clone(),
+        line_buffer_size: p_line_buffer_size.clone(),
+    };
+    let perf_report = runtime_report::build_report(&pipeline_params, &resolved_output);
+    runtime_report::emit("startup", &perf_report);
 
     info!(
         start = %start_date,
@@ -504,12 +532,12 @@ async fn main() -> Result<()> {
         OutputConfig::Void => info!(output_type = "void", "Sink configured"),
     }
 
-    let sink = build_sink(&resolved_output, &s3_client, cli.max_retries).await?;
+    let sink = build_sink(&resolved_output, &s3_client, p_max_retries.value).await?;
 
     // List all objects in parallel across all buckets × hourly prefixes
     let mut all_bucket_objects = {
         let date_hours = date_range_to_date_hour_list(&start_date, &end_date)?;
-        let semaphore = Arc::new(Semaphore::new(cli.max_parallel));
+        let semaphore = Arc::new(Semaphore::new(p_max_parallel.value));
         let mut join_set: JoinSet<Result<Vec<S3ObjectInfo>>> = JoinSet::new();
         let mut total_tasks = 0usize;
 
@@ -673,6 +701,10 @@ async fn main() -> Result<()> {
         batch_start.elapsed().as_secs_f64(),
         &stats,
     );
+    // Re-emit the effective-parameter report at end of run so post-run
+    // log analysis can correlate throughput with the exact settings
+    // used.
+    runtime_report::emit("completion", &perf_report);
 
     Ok(())
 }
