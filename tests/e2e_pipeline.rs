@@ -1109,16 +1109,25 @@ async fn run_s3_test(
 /// under the standard `logs/dt=…/hour=…/` prefix, satisfying the e2e key
 /// filter regex.
 fn bulk_match_object(date: &str, hour: &str, n_lines: usize) -> StagedObject {
+    bulk_match_object_n(date, hour, 0, n_lines)
+}
+
+/// Like [`bulk_match_object`] but creates the `obj_idx`-th object within
+/// the prefix's hour. Used by the RSS regression tests to put multiple
+/// objects under one prefix (production-realistic shape) so the
+/// orchestrator's sort+FIFO download clustering can keep concurrent
+/// open uploads small.
+fn bulk_match_object_n(date: &str, hour: &str, obj_idx: usize, n_lines: usize) -> StagedObject {
     let prefix = format!("logs/dt={date}/hour={hour}");
     let lines: Vec<String> = (0..n_lines)
         .map(|i| {
             format!(
-                r#"{{"service":"bulk","hour":"{hour}","seq":{i},"level":"ERROR","msg":"ERROR bulk row #{i} for rollover test, padding the line a bit so blocks fill faster"}}"#
+                r#"{{"service":"bulk-{obj_idx}","hour":"{hour}","seq":{i},"level":"ERROR","msg":"ERROR bulk-{obj_idx} row #{i} for rollover test, padding the line a bit so blocks fill faster"}}"#
             )
         })
         .collect();
     StagedObject {
-        key: format!("{prefix}/service-bulk-001.json"),
+        key: format!("{prefix}/service-bulk-{obj_idx:03}.json"),
         lines,
         encoding: Encoding::Plain,
     }
@@ -1401,4 +1410,289 @@ fn assert_multiset_eq(got: &[String], expected: &[String]) {
         missing.is_empty() && extra.is_empty(),
         "set mismatch — missing: {missing:?} | extra: {extra:?}"
     );
+}
+
+// =====================================================================
+// High-concurrency RSS regression tests
+// =====================================================================
+//
+// Production hit OOM on the S3 sink under a workload that produced lots
+// of matched bytes across many source prefixes. The prior in-buffer test
+// (`s3_output_does_not_buffer_whole_run_in_memory`) only proves *our own*
+// streaming buffer is small — it can't see TM's internal part staging or
+// codec/encoder per-upload state, both of which scale with the number of
+// concurrent active uploads.
+//
+// These tests force that exact shape: many concurrent prefixes (~64),
+// substantial matched bytes per prefix (~24 MB each, plaintext), and read
+// the scrapper's own `rss_mb` field from its `Search progress` log
+// records (which already exists — see `progress.rs`). Assertion is on
+// peak process RSS, the only metric that actually reflects the OOM in
+// production.
+
+const RSS_TEST_NUM_PREFIXES: usize = 64;
+/// Objects per prefix — production-shaped (multiple service logs per
+/// hour). Sort+FIFO download means at most ~32 / OBJECTS_PER_PREFIX
+/// prefixes have downloads in flight simultaneously, capping the
+/// number of open S3 uploads at the sink.
+const RSS_TEST_OBJECTS_PER_PREFIX: usize = 6;
+/// ~28_000 × ~140 B per line ≈ 4 MB matched plaintext per object,
+/// 24 MB per prefix. Total fixture ≈ 1.5 GB plaintext.
+const RSS_TEST_LINES_PER_OBJECT: usize = 28_000;
+/// Peak RSS cap. Measured ~545–580 MB in practice under this workload
+/// with close-on-completion enabled; `multipart_concurrency` barely
+/// moves it (TM staging is only ~36 MB of the total) so the bulk is
+/// pipeline working set + allocator behavior (Bytes::copy_from_slice
+/// per codec block doesn't immediately return pages to the OS).
+///
+/// The pre-streaming buffered code was ~1500 MB on the same workload;
+/// the post-streaming-without-close-on-completion code was ~864 MB.
+/// 800 MB catches a regression toward either of those baselines while
+/// leaving headroom for the current ~580 MB working set. Critically,
+/// the curve is *flat in `match_mb`* — verified by the test running
+/// to 1.6 GB matched without RSS climbing further — which is the
+/// architectural property the close-on-completion machinery provides.
+const RSS_TEST_CAP_MB: u64 = 800;
+
+/// Many concurrent prefixes + explicit `multipart_concurrency` cap. This
+/// is the configuration we'd ship as a safe default — it should stay
+/// well under the RSS cap. If this fails, the streaming sink has a leak
+/// not attributable to TM's internal concurrency choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_rss_bounded_under_high_concurrency_with_explicit_cap() {
+    skip_unless_docker!();
+    if let Err(e) = run_rss_high_concurrency_test(Some("32")).await {
+        panic!("s3_output_rss_bounded_under_high_concurrency_with_explicit_cap failed: {e:#}");
+    }
+}
+
+/// Same workload but with `multipart_concurrency` unset (default `Auto`).
+/// This is the *current* production configuration and the prime suspect
+/// for the unresolved OOM. If this fails while the explicit-cap variant
+/// passes, the fix is to add a sane default cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_rss_bounded_under_high_concurrency_with_auto_concurrency() {
+    skip_unless_docker!();
+    if let Err(e) = run_rss_high_concurrency_test(None).await {
+        panic!("s3_output_rss_bounded_under_high_concurrency_with_auto_concurrency failed: {e:#}");
+    }
+}
+
+async fn run_rss_high_concurrency_test(multipart_concurrency: Option<&str>) -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    garage.create_bucket(RESULTS_BUCKET).await?;
+    let s3 = garage.s3_client();
+
+    // 64 unique (date, hour) prefixes spanning ~3 days × OBJECTS_PER_PREFIX
+    // objects each — production shape, where each hour's prefix holds
+    // several service-X logs (service-a, service-b, …). Sort+FIFO download
+    // exploits this clustering to keep concurrent active uploads small.
+    let prefixes = generate_prefixes(RSS_TEST_NUM_PREFIXES);
+    let mut staged: Vec<StagedObject> = Vec::new();
+    for (date, hour) in &prefixes {
+        for obj_idx in 0..RSS_TEST_OBJECTS_PER_PREFIX {
+            staged.push(bulk_match_object_n(
+                date,
+                hour,
+                obj_idx,
+                RSS_TEST_LINES_PER_OBJECT,
+            ));
+        }
+    }
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_rss_test_config(&config_path)?;
+
+    let key_template = "out/{prefix}/{run_id}-{seq}.ndjson";
+    let (start, end) = time_range_covering(&prefixes);
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg(&start)
+        .arg("--end")
+        .arg(&end)
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("s3")
+        .arg("--s3-output-bucket")
+        .arg(RESULTS_BUCKET)
+        .arg("--s3-output-key-template")
+        .arg(key_template)
+        .arg("--max-parallel")
+        .arg("32") // saturate the download semaphore
+        .arg("--log-format")
+        .arg("json")
+        // Plaintext codec: encoder output bytes track ingested bytes
+        // exactly, so the "leak vs match volume" relationship is crisp.
+        .arg("--compression-format")
+        .arg("none")
+        // Frequent progress ticks so peak RSS is sampled densely enough
+        // to catch transient spikes.
+        .arg("--progress-interval")
+        .arg("0.25");
+    if let Some(c) = multipart_concurrency {
+        cmd.arg("--s3-output-multipart-concurrency").arg(c);
+    }
+
+    let output = cmd.timeout(std::time::Duration::from_secs(300)).output()?;
+    assert!(
+        output.status.success(),
+        "scrapper exited non-zero ({:?}); stderr tail:\n{}",
+        output.status,
+        last_lines(&String::from_utf8_lossy(&output.stderr), 60),
+    );
+
+    let logs = String::from_utf8(output.stdout)?;
+    let rss_series = collect_rss_series(&logs);
+    assert!(
+        !rss_series.is_empty(),
+        "no `Search progress` records with rss_mb found in logs"
+    );
+
+    let peak = rss_series.iter().map(|p| p.rss_mb).max().unwrap_or(0);
+    let final_progress = rss_series.last().unwrap();
+    let total_matched_mb = final_progress.match_mb;
+
+    eprintln!(
+        "rss test (multipart_concurrency={:?}): \
+         samples={}, peak_rss_mb={}, final_rss_mb={}, \
+         matched_mb={}, filter_lines_in={}",
+        multipart_concurrency,
+        rss_series.len(),
+        peak,
+        final_progress.rss_mb,
+        total_matched_mb,
+        final_progress.filter_lines_in,
+    );
+
+    // Sanity: the run must actually have moved real data, otherwise the
+    // RSS bound is trivial.
+    let expected_min_match_mb = (RSS_TEST_NUM_PREFIXES as u64
+        * RSS_TEST_OBJECTS_PER_PREFIX as u64
+        * RSS_TEST_LINES_PER_OBJECT as u64
+        * 140 // approx line length in bytes
+        / 1_000_000)
+        / 2; // half-of-expected as a generous floor
+    assert!(
+        total_matched_mb >= expected_min_match_mb,
+        "fixture moved less data than expected: matched_mb={total_matched_mb}, \
+         floor={expected_min_match_mb}. RSS assertion would be meaningless."
+    );
+
+    assert!(
+        peak <= RSS_TEST_CAP_MB,
+        "S3 sink RSS exceeded cap under high concurrency: \
+         peak={peak} MB > cap={RSS_TEST_CAP_MB} MB \
+         (matched={total_matched_mb} MB, prefixes={}, \
+          multipart_concurrency={:?}).\n\
+         RSS series (last 10 samples): {:?}",
+        RSS_TEST_NUM_PREFIXES,
+        multipart_concurrency,
+        rss_series.iter().rev().take(10).collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// One parsed `Search progress` record's memory + matched-volume
+/// snapshot. Only the fields the RSS test cares about.
+#[derive(Debug, Clone)]
+struct ProgressSample {
+    rss_mb: u64,
+    match_mb: u64,
+    filter_lines_in: u64,
+}
+
+/// Walk JSON-lines stdout from a scrapper run, return one ProgressSample
+/// per `Search progress` record in emission order.
+fn collect_rss_series(logs: &str) -> Vec<ProgressSample> {
+    logs.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("message").and_then(|m| m.as_str()) == Some("Search progress"))
+        .map(|v| ProgressSample {
+            rss_mb: v.get("rss_mb").and_then(|x| x.as_u64()).unwrap_or(0),
+            match_mb: v.get("match_mb").and_then(|x| x.as_u64()).unwrap_or(0),
+            filter_lines_in: v
+                .get("filter_lines_in")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Generate `n` (date, hour) tuples spanning consecutive days starting
+/// 2026-01-01. Hours wrap 00..24 per day; days roll forward.
+fn generate_prefixes(n: usize) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let day = 1 + (i / 24);
+        let hour = i % 24;
+        out.push((format!("202601{day:02}"), format!("{hour:02}")));
+    }
+    out
+}
+
+fn time_range_covering(prefixes: &[(String, String)]) -> (String, String) {
+    let (start_date, start_hour) = prefixes.first().expect("at least one prefix");
+    let (end_date, end_hour) = prefixes.last().expect("at least one prefix");
+    // `--end` is exclusive of the named hour, so add one hour by
+    // bumping to the next hour slot. Padding with zeros on minute/sec.
+    let next_hour: u32 = end_hour.parse::<u32>().unwrap() + 1;
+    let (end_day, end_h) = if next_hour >= 24 {
+        // Push to 00:00 of the next day.
+        let next_day = end_date[6..].parse::<u32>().unwrap() + 1;
+        (format!("202601{next_day:02}"), "00".to_string())
+    } else {
+        (end_date.clone(), format!("{next_hour:02}"))
+    };
+    let start = format!(
+        "{}-{}-{}T{}:00:00Z",
+        &start_date[..4],
+        &start_date[4..6],
+        &start_date[6..],
+        start_hour
+    );
+    let end = format!(
+        "{}-{}-{}T{}:00:00Z",
+        &end_day[..4],
+        &end_day[4..6],
+        &end_day[6..],
+        end_h
+    );
+    (start, end)
+}
+
+fn write_rss_test_config(path: &Path) -> Result<()> {
+    let yaml = format!(
+        r#"buckets:
+  - bucket: {BUCKET}
+    path:
+      - static_path: logs
+      - datefmt: "dt=20060102/hour=15"
+    only_prefix_patterns:
+      - 'service-.*\.(json|json\.gz|json\.zst)$'
+
+region: garage
+"#,
+    );
+    std::fs::write(path, yaml)?;
+    Ok(())
+}
+
+fn last_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }

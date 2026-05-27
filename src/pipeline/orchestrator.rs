@@ -6,12 +6,14 @@
 
 use super::observer::{ChannelObserver, DownloadObserver};
 use super::output::OutputSink;
+use super::prefix_progress::PrefixProgress;
 use crate::matcher::LineMatcher;
 use crate::progress::PipelineProgress;
 use crate::s3::{self, S3ObjectInfo};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,10 +22,34 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-/// A single decompressed line tagged with its source file.
+/// A single decompressed line tagged with its source file. Carries an
+/// `Arc<PrefixProgress>` so the filter worker can increment `processed`
+/// and trigger close-on-completion without a per-line map lookup.
 struct DecompressedLine {
     data: Vec<u8>,
     source: Arc<S3ObjectInfo>,
+    progress: Arc<PrefixProgress>,
+}
+
+/// Best-effort early close of a prefix's S3 upload once its downloads
+/// have all completed and the channel has been fully drained for it.
+/// Cheap-and-safe to call from both the sync filter-worker context and
+/// the async download-task-completion context — `OutputSink::close_prefix`
+/// is non-blocking (it does its own `spawn_blocking` internally for the
+/// codec frame finalization).
+///
+/// If the close-ready condition isn't met yet, this is a no-op: the next
+/// caller to bump a counter will re-evaluate. If the condition holds, the
+/// `try_claim_close` CAS guarantees exactly one caller wins and invokes
+/// `close_prefix`.
+#[inline]
+fn maybe_close_prefix(sink: &dyn OutputSink, progress: &PrefixProgress) {
+    if !progress.is_drained() {
+        return;
+    }
+    if progress.try_claim_close() {
+        sink.close_prefix(&progress.name);
+    }
 }
 
 /// Bridges async S3 `ByteStream` chunks into synchronous [`Read`] for
@@ -137,9 +163,44 @@ impl StreamingDownloader {
             return Ok((0, 0));
         }
 
+        // Sort objects by source prefix so the bounded download semaphore
+        // clusters in-flight downloads on a small window of prefixes.
+        // Combined with the close-on-completion machinery below, this caps
+        // the number of simultaneously-open S3 uploads at the sink.
+        let mut objects = objects.to_vec();
+        objects.sort_by(|a, b| a.prefix.cmp(&b.prefix).then_with(|| a.key.cmp(&b.key)));
+
+        // One `PrefixProgress` per distinct source prefix in the run, built
+        // once and threaded through the pipeline via `DecompressedLine`.
+        // Lookup map is consulted only at download-dispatch time (small N,
+        // not per line). Vec preserves the canonical iteration order for
+        // end-of-run convergence assertions.
+        //
+        // **Important**: `downloads_pending[p]` is initialized to the *total*
+        // object count for the prefix up-front, then decremented as each
+        // download task exits. If we instead incremented per-dispatch
+        // (`fetch_add(1)` before each spawn), there would be a window
+        // between iter N and iter N+1 where a fast-finishing D1 could
+        // bring downloads_pending to 0 *before* D2's dispatch, letting a
+        // filter worker observe "drained" and fire close_prefix
+        // prematurely — the next line would re-open with seq+1.
+        let mut progress_vec: Vec<Arc<PrefixProgress>> = Vec::new();
+        let mut progress_lookup: HashMap<String, Arc<PrefixProgress>> = HashMap::new();
+        for obj in &objects {
+            let entry = progress_lookup
+                .entry(obj.prefix.clone())
+                .or_insert_with(|| {
+                    let p = PrefixProgress::new(obj.prefix.clone());
+                    progress_vec.push(p.clone());
+                    p
+                });
+            entry.downloads_pending.fetch_add(1, Ordering::Relaxed);
+        }
+
         let total_bytes: usize = objects.iter().map(|o| o.size).sum();
         info!(
             objects = objects.len(),
+            prefixes = progress_vec.len(),
             mb = total_bytes / 1_000_000,
             download_concurrency = self.config.max_concurrent_downloads,
             filter_workers = self.config.filter_tasks,
@@ -182,15 +243,19 @@ impl StreamingDownloader {
             let client = self.client.clone();
             let config = self.config.clone();
             let semaphore = self.download_semaphore.clone();
-            let objects = objects.to_vec();
+            let objects = objects.clone();
+            let progress_lookup = progress_lookup.clone();
             let tx = line_tx;
             let progress = progress.clone();
             let fe = fatal_error.clone();
+            let sink = sink.clone();
 
             tokio::spawn(async move {
                 let result = Self::download_coordinator(
                     client,
                     &objects,
+                    progress_lookup,
+                    sink,
                     config,
                     semaphore,
                     tx,
@@ -330,6 +395,26 @@ impl StreamingDownloader {
         // Stop the progress ticker
         progress_ticker.abort();
 
+        // I4: at end of run every prefix's `sent == processed` and every
+        // prefix was either closed early or will be closed by sink.finish().
+        // Surfaces counter drift bugs early; if this fires we know the
+        // close-on-completion accounting is off, not just a sink-side leak.
+        for p in &progress_vec {
+            let sent = p.sent.load(Ordering::Relaxed);
+            let processed = p.processed.load(Ordering::Relaxed);
+            debug_assert_eq!(
+                sent, processed,
+                "PrefixProgress mismatch at end of run: prefix={}, sent={}, processed={}",
+                p.name, sent, processed,
+            );
+            let pending = p.downloads_pending.load(Ordering::Relaxed);
+            debug_assert_eq!(
+                pending, 0,
+                "PrefixProgress.downloads_pending != 0 at end of run: prefix={}, pending={}",
+                p.name, pending,
+            );
+        }
+
         // Emit a final progress report so the last log line carries the accurate
         // end-of-run totals (filter input volume, matched ratios, etc.) — useful
         // for short runs where the periodic ticker may only have fired at t=0.
@@ -351,6 +436,8 @@ impl StreamingDownloader {
     async fn download_coordinator(
         client: Client,
         objects: &[S3ObjectInfo],
+        progress_lookup: HashMap<String, Arc<PrefixProgress>>,
+        sink: Arc<dyn OutputSink>,
         config: StreamingDownloaderConfig,
         semaphore: Arc<Semaphore>,
         line_tx: flume::Sender<DecompressedLine>,
@@ -426,10 +513,19 @@ impl StreamingDownloader {
             let dl_obs = download_observer.clone();
             let tx = line_tx.clone();
             let fe = fatal_error.clone();
+            // `downloads_pending` was pre-incremented once per object in
+            // the run-startup pass above — don't double-count here. The
+            // spawned task owns the matching `fetch_sub` in all exit
+            // paths.
+            let prefix_progress = progress_lookup
+                .get(&obj.prefix)
+                .cloned()
+                .expect("progress_lookup built from same objects");
+            let sink_for_task = sink.clone();
 
             join_set.spawn(async move {
                 let source = Arc::new(obj_clone);
-                let size = Self::download_and_stream(
+                let result = Self::download_and_stream(
                     &client,
                     &source,
                     source.clone(),
@@ -437,13 +533,31 @@ impl StreamingDownloader {
                     &config,
                     &dl_obs,
                     fe,
+                    prefix_progress.clone(),
                 )
-                .await?;
+                .await;
 
                 // Release permit AFTER streaming+decompress completes
                 // (S3 connection was open throughout).
                 drop(permit);
-                Ok(size)
+
+                // Decrement downloads_pending unconditionally — even on
+                // error this prefix has one fewer in-flight download.
+                // Use `compare_exchange`-via-fetch_sub semantics: assert
+                // we don't underflow (which would indicate a counter bug).
+                let prev = prefix_progress
+                    .downloads_pending
+                    .fetch_sub(1, Ordering::Relaxed);
+                debug_assert!(
+                    prev > 0,
+                    "downloads_pending underflow for prefix {}",
+                    prefix_progress.name
+                );
+                // If this was the last download for the prefix and all
+                // lines are processed, fire the early close.
+                maybe_close_prefix(sink_for_task.as_ref(), &prefix_progress);
+
+                result
             });
 
             spawned += 1;
@@ -514,6 +628,7 @@ impl StreamingDownloader {
         source: &Arc<S3ObjectInfo>,
         line_tx: &flume::Sender<DecompressedLine>,
         fatal_error: Option<Arc<AtomicBool>>,
+        progress: &Arc<PrefixProgress>,
     ) -> Result<()> {
         let reader: Box<dyn Read> = if source.key.ends_with(".gz") {
             Box::new(flate2::read::GzDecoder::new(reader))
@@ -541,10 +656,16 @@ impl StreamingDownloader {
             if buf_reader.read_until(b'\n', &mut buf)? == 0 {
                 break;
             }
+            // Bump `sent` before send so the filter worker's `processed`
+            // increment never observes a stale `sent` value lower than
+            // its own count. Both counters use Relaxed; the channel
+            // send/recv establishes happens-before across stages.
+            progress.sent.fetch_add(1, Ordering::Relaxed);
             line_tx
                 .send(DecompressedLine {
                     data: buf.clone(),
                     source: source.clone(),
+                    progress: progress.clone(),
                 })
                 .map_err(|_| anyhow::anyhow!("Filter workers gone, channel closed"))?;
             lines_emitted += 1;
@@ -570,6 +691,7 @@ impl StreamingDownloader {
         config: &StreamingDownloaderConfig,
         download_observer: &DownloadObserver,
         fatal_error: Option<Arc<AtomicBool>>,
+        progress: Arc<PrefixProgress>,
     ) -> Result<usize> {
         // Bounded channel for async→sync chunk bridging.
         // Capacity 4 ≈ 256 KB of S3 chunks in flight (typical chunk ~64 KB).
@@ -577,9 +699,10 @@ impl StreamingDownloader {
 
         // Spawn the synchronous decompressor side.
         let emit_source = source.clone();
+        let emit_progress = progress.clone();
         let emit_handle = tokio::task::spawn_blocking(move || {
             let reader = ChunkReader::new(chunk_rx);
-            Self::emit_lines(reader, &emit_source, &line_tx, fatal_error)
+            Self::emit_lines(reader, &emit_source, &line_tx, fatal_error, &emit_progress)
         });
 
         debug!(
@@ -757,6 +880,31 @@ impl StreamingDownloader {
                     match_count.fetch_add(1, Ordering::Relaxed);
                     match_bytes.fetch_add(line_len, Ordering::Relaxed);
                 }
+
+                // Bump `processed` AFTER ingest — establishes
+                // happens-before from this line's ingest to any
+                // close-on-completion that subsequently observes
+                // sent==processed. Worker that brings processed to sent
+                // is the worker that just finished its ingest; all
+                // earlier workers' processed bumps already happened,
+                // which means their ingests already completed too.
+                // Swap was diagnosed against an off-by-one upload race
+                // in `s3_output_end_to_end_*` where a fast worker's
+                // close_prefix landed between another worker's lock
+                // acquisition and write, causing a spurious re-open
+                // with seq+1.
+                let old_processed = line.progress.processed.fetch_add(1, Ordering::Relaxed);
+                debug_assert!(
+                    line.progress.sent.load(Ordering::Relaxed) > old_processed,
+                    "processed ({}) overran sent for prefix {}",
+                    old_processed + 1,
+                    line.progress.name,
+                );
+
+                // Trigger close-on-completion if this was the last line
+                // for the prefix and all downloads have already exited.
+                // CAS guards against double-close from racing workers.
+                maybe_close_prefix(sink.as_ref(), &line.progress);
             }
             Ok(local)
         })

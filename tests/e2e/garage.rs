@@ -110,11 +110,17 @@ pub async fn start_garage(bucket_name: &str) -> Result<GarageHandle> {
         .with_exposed_port(ContainerPort::Tcp(ADMIN_PORT))
         .with_wait_for(WaitFor::message_on_stderr("S3 API server listening on"));
 
+    // tmpfs the Garage data + metadata dirs so seeded fixtures and
+    // upload-test output never hit host disk. We don't keep any test
+    // artifacts across runs, so RAM-backed storage is both faster and
+    // friendlier on the host. Garage doesn't care what backs its data
+    // directory.
     let container = image
         .with_mount(Mount::bind_mount(
             config_path.canonicalize()?.to_string_lossy().to_string(),
             "/etc/garage.toml",
         ))
+        .with_mount(Mount::tmpfs_mount("/var/lib/garage"))
         .start()
         .await
         .context("starting garage container")?;

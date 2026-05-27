@@ -195,6 +195,11 @@ struct Inner {
     /// (`objects_written`, `compressed_bytes`, `lines_dropped`, `fatal`)
     /// on completion. `finish()` joins all of these before returning.
     pending_uploads: Mutex<Vec<JoinHandle<()>>>,
+    /// `JoinHandle`s for the blocking close work spawned by
+    /// `close_prefix`. Each of these eventually pushes its
+    /// `ActiveUpload.handle` into `pending_uploads`, so `finish()` must
+    /// await `close_tasks` first, then `pending_uploads`.
+    close_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Defence-in-depth: warn (don't error) when two distinct source
     /// prefixes render to the same destination key. Static validation
     /// catches the common cases at config-resolve time; this catches the
@@ -281,6 +286,7 @@ impl S3OutputSink {
             run_id,
             prefixes: Mutex::new(HashMap::new()),
             pending_uploads: Mutex::new(Vec::new()),
+            close_tasks: Mutex::new(Vec::new()),
             collisions: Mutex::new(CollisionTracker::new()),
             matched_lines: AtomicU64::new(0),
             plaintext_bytes: AtomicU64::new(0),
@@ -563,6 +569,56 @@ impl OutputSink for S3OutputSink {
         Ok(())
     }
 
+    fn close_prefix(&self, prefix: &str) {
+        // If `finish()` has already started, the trailing close path
+        // there will handle whatever's left — bail to avoid races with
+        // the prefix map drain.
+        if self.inner.finished.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Take the ActiveUpload out under the per-prefix lock (cheap)
+        // without holding the outer prefix-map lock during the heavy
+        // finalize work.
+        let active_opt = {
+            let map = self
+                .inner
+                .prefixes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = map.get(prefix).cloned();
+            drop(map);
+            entry.and_then(|arc| arc.lock().unwrap_or_else(|e| e.into_inner()).upload.take())
+        };
+        let Some(active) = active_opt else {
+            // No active upload — either close_prefix was called more than
+            // once (CAS should have prevented this) or this prefix never
+            // got a matched line. Either way, nothing to do.
+            return;
+        };
+
+        // Finalizing the encoder may write a frame trailer through
+        // ChannelWriter::write -> mpsc::blocking_send, which would panic
+        // if invoked from a runtime worker. spawn_blocking moves the work
+        // onto a blocking thread regardless of caller context.
+        let inner = self.inner.clone();
+        let prefix_for_task = prefix.to_string();
+        let handle = self.inner.runtime.spawn_blocking(move || {
+            if let Err(e) = Self::close_upload(&inner, active) {
+                warn!(
+                    prefix = %prefix_for_task,
+                    error = %e,
+                    "S3 sink: failed to close prefix upload",
+                );
+            }
+        });
+        self.inner
+            .close_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+
     fn finish<'a>(&'a self) -> BoxFinishFuture<'a> {
         Box::pin(async move {
             self.inner.finished.store(true, Ordering::Relaxed);
@@ -610,6 +666,25 @@ impl OutputSink for S3OutputSink {
                         ),
                         Ok(Ok(())) => {}
                     }
+                }
+            }
+
+            // First await every close_tasks handle — those are the
+            // spawn_blocking finalizers triggered by `close_prefix`
+            // mid-run. Each of them pushes its upload's driver
+            // `JoinHandle` into `pending_uploads` as the last thing it
+            // does, so this drain must happen before we read
+            // `pending_uploads` below.
+            let close_handles = std::mem::take(
+                &mut *self
+                    .inner
+                    .close_tasks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            for handle in close_handles {
+                if let Err(e) = handle.await {
+                    warn!(error = %e, "S3 sink: close_prefix task panicked");
                 }
             }
 

@@ -53,6 +53,27 @@ pub trait OutputSink: Send + Sync {
     /// should take them via interior mutability so this can run on `&self`.
     fn finish<'a>(&'a self) -> BoxFinishFuture<'a>;
 
+    /// Best-effort early close of a source prefix's in-flight upload.
+    /// Called by the orchestrator once every download for `prefix` has
+    /// completed AND every line for `prefix` has been pulled off the
+    /// line channel — see `PrefixProgress` in
+    /// [`crate::pipeline::prefix_progress`].
+    ///
+    /// This is the lever that caps concurrent open uploads in the s3
+    /// sink. Default impl is a no-op for sinks that don't care (file,
+    /// http, void) — they either close per-batch already or carry no
+    /// per-prefix resources to release.
+    ///
+    /// Must be non-blocking: ingest paths call this from both sync
+    /// (`spawn_blocking` filter worker) and async (download task
+    /// completion) contexts. Implementations that need to do blocking
+    /// work should spawn it onto a blocking thread internally.
+    ///
+    /// `finish()` is the safety net: anything that misses an early
+    /// close still gets closed at end of run, so missing or doubled
+    /// `close_prefix` calls degrade gracefully (no hang).
+    fn close_prefix(&self, _prefix: &str) {}
+
     /// Optional channel-fill observer surfaced to progress reporting.
     /// Returning `Some` engages the HTTP-style progress format.
     fn observer(&self) -> Option<PipelineObserver> {
