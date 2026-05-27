@@ -834,6 +834,130 @@ async fn run_multipart_test() -> Result<()> {
     Ok(())
 }
 
+/// Regression guard for the OOM mode: in default S3-sink mode (no
+/// `--s3-output-batch-max-mb`), the sink must **not** buffer the entire
+/// run's matches in memory per prefix. Asserts that `peak_inflight_bytes`
+/// (sum across per-prefix encoder buffers, sampled on every ingest) stays
+/// below a small cap regardless of how much plaintext per prefix is
+/// matched. Pre-streaming code accumulates ~28 MB/prefix → 56 MB total
+/// resident and fails this. Streaming code ships bytes to TM as they're
+/// produced and stays ≤ part_size × in-flight uploads + slack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_output_does_not_buffer_whole_run_in_memory() {
+    skip_unless_docker!();
+    if let Err(e) = run_s3_oom_regression_test().await {
+        panic!("s3_output_does_not_buffer_whole_run_in_memory failed: {e:#}");
+    }
+}
+
+async fn run_s3_oom_regression_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    garage.create_bucket(RESULTS_BUCKET).await?;
+
+    let s3 = garage.s3_client();
+    // ~200K matching lines × ~140 B per line ≈ 28 MB plaintext per prefix,
+    // 2 prefixes → ~56 MB total matched plaintext. Plaintext codec so the
+    // encoder's output buffer ≈ ingested bytes (no zstd block-buffer
+    // ambiguity), making the buffering question crisp.
+    let mut staged = Vec::new();
+    for hour in HOURS {
+        staged.push(bulk_match_object(DATE, hour, 200_000));
+    }
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml(&config_path, None)?;
+
+    let key_template = "out/{prefix}/{run_id}-{seq}.ndjson";
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    let output = cmd
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--output")
+        .arg("s3")
+        .arg("--s3-output-bucket")
+        .arg(RESULTS_BUCKET)
+        .arg("--s3-output-key-template")
+        .arg(key_template)
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        // Plaintext codec: buffered_len == ingested bytes, so the buffer
+        // measurement reflects actual matched plaintext rather than
+        // compression-block timing.
+        .arg("--compression-format")
+        .arg("none")
+        // NB: deliberately omit --s3-output-batch-max-mb — this is the
+        // default mode that today buffers the whole run per prefix.
+        .timeout(std::time::Duration::from_secs(240))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "scrapper exited non-zero ({:?}); stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let logs = String::from_utf8(output.stdout)?;
+    let completion = logs
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("message").and_then(|m| m.as_str()) == Some("Search completed"))
+        .expect("Search completed record not found in JSON logs");
+
+    let extras_str = completion
+        .get("extras")
+        .and_then(|v| v.as_str())
+        .expect("extras field missing or not a string");
+    let extras: serde_json::Value =
+        serde_json::from_str(extras_str).expect("extras field is not valid JSON");
+
+    let peak = extras
+        .get("peak_inflight_bytes")
+        .and_then(|v| v.as_u64())
+        .expect("peak_inflight_bytes missing from extras");
+
+    // Cap: 2 prefixes × `multipart_part_mb` (5 MiB) + slack ≈ 12 MB.
+    // Streaming code stays well under this; pre-streaming code with ~28 MB
+    // per prefix accumulated will blow past it by ~5×.
+    let cap_bytes: u64 = 12 * 1_000_000;
+    assert!(
+        peak <= cap_bytes,
+        "S3 sink buffered too much: peak_inflight_bytes={peak} > {cap_bytes} \
+         (per-prefix matched plaintext × num prefixes was ~56 MB; the sink \
+         should stream rather than accumulate)"
+    );
+
+    // Sanity: confirm the run actually moved real data — guards against
+    // the test passing because nothing matched.
+    let lines_recorded = completion
+        .get("lines_recorded")
+        .and_then(|v| v.as_u64())
+        .expect("lines_recorded missing");
+    assert_eq!(
+        lines_recorded, 400_000,
+        "expected 200_000 matches × 2 prefixes = 400_000 lines"
+    );
+
+    Ok(())
+}
+
 async fn run_s3_test(
     codec: TestCodec,
     batch_max_mb: Option<&str>,

@@ -165,8 +165,6 @@ pub struct S3OutputConfig {
     /// integer for an explicit cap.
     #[serde(default)]
     pub multipart_concurrency: Option<usize>,
-    #[serde(default)]
-    pub upload_tasks: Option<usize>,
     /// Object body framing. Default `json_lines` writes NDJSON. Set
     /// `kind: json_array` to upload a single JSON array per batch. The
     /// object extension is still driven by the codec — override
@@ -482,7 +480,6 @@ mystery: 42
             multipart_threshold_mb: 5,
             multipart_part_mb: 5,
             multipart_concurrency: None,
-            upload_tasks: None,
             format: OutputFormat::default(),
         });
         validate_output(&cfg).unwrap();
@@ -526,7 +523,6 @@ mystery: 42
             multipart_threshold_mb: 5,
             multipart_part_mb: 5,
             multipart_concurrency: None,
-            upload_tasks: None,
             format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
@@ -545,7 +541,6 @@ mystery: 42
             multipart_threshold_mb: 5,
             multipart_part_mb: 5,
             multipart_concurrency: None,
-            upload_tasks: None,
             format: OutputFormat::default(),
         });
         let err = validate_output(&cfg).unwrap_err();
@@ -632,7 +627,6 @@ dir: /tmp/out
             multipart_threshold_mb: threshold_mb,
             multipart_part_mb: part_mb,
             multipart_concurrency: concurrency,
-            upload_tasks: None,
             format: OutputFormat::default(),
         })
     }

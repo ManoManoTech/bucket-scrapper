@@ -1,57 +1,67 @@
-//! S3 output sink: per-prefix codec-encoded uploads.
+//! S3 output sink: per-prefix codec-encoded streaming uploads.
 //!
-//! ## Batching model
+//! ## Streaming model
 //!
-//! One *batch* is one `PutObject` call. Every batch carries lines from a
-//! single source prefix — there is no cross-prefix mixing or
-//! consolidation. The user-facing axis is how many batches per source
-//! prefix.
+//! Each per-prefix batch is uploaded as a single S3 multipart upload,
+//! streamed directly from the codec encoder. The compressed body never
+//! materializes as a `Vec<u8>` — bytes flow from the encoder through a
+//! bounded mpsc channel into TM's `PartStream` interface, which uploads
+//! parts to S3 concurrently. Peak resident memory per active prefix is
+//! ~`channel_cap × codec_block_size + multipart_part_mb`, independent of
+//! total batch size. See [`super::s3_streaming`] for the channel plumbing.
 //!
 //! Per-prefix encoder lifecycle:
 //!
-//! 1. The first matched line for a prefix lazily creates a
-//!    [`CodecEncoder<Vec<u8>>`] for that prefix (zstd / gzip / identity,
-//!    per `compression.format`). Different prefixes have independent
-//!    encoders and never block each other.
-//! 2. Subsequent matched lines for the same prefix write into that
-//!    encoder's output buffer.
-//! 3. The encoder is finalized either when its buffered compressed size
-//!    crosses `batch_max_mb` (only if set) or, unconditionally, at
-//!    end-of-run. Finalization produces a finished compressed frame.
-//! 4. The frame is rendered into a destination key from `key_template`
-//!    (with the current `{seq}` substituted) and pushed onto a bounded
-//!    upload queue drained by `upload_tasks` worker tasks running
-//!    concurrent `PutObject` calls.
-//! 5. After a mid-run flush, `{seq}` for that prefix is incremented and
-//!    a fresh encoder is constructed in place.
+//! 1. The first matched line for a prefix lazily opens an `ActiveUpload`:
+//!    we render the destination key, build a `CodecEncoder<ChannelWriter>`,
+//!    construct an `InputStream::from_part_stream(EncoderPartStream{..})`,
+//!    and call `tm.upload()…initiate()` which spawns TM's internal upload
+//!    tasks. Different prefixes have independent uploads and never block
+//!    each other.
+//! 2. Subsequent matched lines write through the codec encoder; bytes
+//!    leave RAM as fast as TM can ship them to S3.
+//! 3. The upload is closed when either `bytes_sent >= batch_max_mb`
+//!    triggers a rollover or `finish()` runs at end-of-run. Closing means
+//!    finalizing the framing + codec encoders (emitting trailers), then
+//!    dropping the writer so the mpsc channel closes and TM's `PartStream`
+//!    sees EOF.
+//! 4. The TM driver task (spawned at open) joins the upload, then folds
+//!    per-batch counts into the sink's global counters
+//!    (`objects_written`, `compressed_bytes`) on success or
+//!    `lines_dropped` + `fatal` on failure.
+//! 5. After a rollover, `{seq}` is incremented and the next matched line
+//!    opens a fresh upload — prefixes that match nothing never create an
+//!    upload at all.
 //!
 //! Default mode (no `batch_max_mb`): each prefix produces exactly one
-//! batch with `{seq}=00000`, finalized at end-of-run — N source objects
-//! collapse to 1 destination object per prefix.
+//! object covering the entire run; `{seq}` is always `00000`.
 //!
-//! Batched mode (`batch_max_mb` set): a prefix that crosses the
-//! threshold N times produces N+1 batches (`00000`..`N`), the last one
-//! emitted by the end-of-run flush.
+//! Batched mode (`batch_max_mb` set): a prefix that crosses the threshold
+//! N times produces N+1 objects (`00000`..`N`), the last one emitted by
+//! the end-of-run close. Threshold is checked on `bytes_sent` (cumulative
+//! compressed bytes shipped through the channel), so the actual rollover
+//! lands a little above the configured size.
 //!
-//! Caveats worth knowing before tuning `batch_max_mb`:
+//! Trade-offs of the streaming path versus the previous buffered model:
 //!
-//! - The threshold is checked against the encoder's *output* buffer
-//!   (compressed bytes), not plaintext, and only after each ingest call.
-//!   The flush therefore lands a little *above* the threshold rather
-//!   than at it.
-//! - zstd / gzip buffer internally and only emit compressed bytes when
-//!   they have a full block to encode efficiently. A trickle of small,
-//!   highly-compressible lines can keep the *output* buffer at zero for
-//!   a long time, so no threshold crossing fires and end-of-run produces
-//!   a single batch. Use `compression.format: none` for size-driven
-//!   batching with predictable thresholds, or feed enough volume per
-//!   prefix to force several internal block flushes.
-//! - Concurrent uploaders mean batches within a prefix can land out of
-//!   order on S3. `{seq}` reflects sink finalization order, not
-//!   upload-completion order.
-//! - `{seq}` is an in-memory counter, so two runs hitting the same
-//!   prefix produce overlapping `{seq}` values; `{run_id}` (unique per
-//!   process) is the disambiguator.
+//! - **Always-MPU.** `InputStream::from_part_stream` is MPU-only — even
+//!   sub-`multipart_threshold_mb` batches go through CreateMultipartUpload
+//!   → UploadPart → CompleteMultipartUpload (3 API calls) instead of a
+//!   single PutObject.
+//! - **No full-batch retry.** Once compressed bytes leave the encoder
+//!   they're gone; TM's per-part retries are the only retry. The sink
+//!   already treated a failed upload as a dropped batch
+//!   (`lines_dropped += batch.lines`), so this is a non-regression.
+//! - **zstd block buffering still hides bytes.** A trickle of small,
+//!   highly-compressible lines can keep zstd's *output* near zero for a
+//!   long time, so the `bytes_sent` threshold may not fire when expected.
+//!   Use `compression.format: none` for size-driven batching with
+//!   predictable thresholds, or feed enough volume per prefix to force
+//!   block flushes.
+//! - **Out-of-order upload completion.** TM uploads parts concurrently,
+//!   so `{seq}` reflects sink open order, not upload-completion order.
+//! - **`{seq}` is per-process.** Two runs hitting the same prefix produce
+//!   overlapping `{seq}` values; `{run_id}` is the disambiguator.
 //!
 //! ## Key template placeholders
 //!
@@ -63,49 +73,28 @@
 //! - `{run_id}` — 8-char hex hash unique to this process invocation.
 //! - `{ext}` — codec-derived file extension (`zst` / `gz` / empty).
 //!
-//! ## Multipart uploads
+//! ## Multipart configuration
 //!
-//! Each finalized batch is handed to the AWS-published
-//! [`aws-sdk-s3-transfer-manager`] crate, which auto-multiparts based
-//! on the sink's `multipart_threshold_mb` (default 5 MiB) and
-//! `multipart_part_mb` (default 5 MiB) settings. Batches below the
-//! threshold go through `PutObject`; batches at or above use
-//! `CreateMultipartUpload` → parallel `UploadPart` →
-//! `CompleteMultipartUpload`, with `AbortMultipartUpload` on failure
-//! (all handled by the transfer manager). AWS enforces a 5 MiB minimum
-//! part size and 10,000-part maximum; our config validation rejects
-//! sub-5 MiB values at startup.
+//! Each upload runs through TM with the configured `multipart_part_mb`
+//! (default 5 MiB). For the streaming path TM also needs an *upper-bound*
+//! content-length hint to plan part sizes; we advertise
+//! `batch_max_bytes + part_bytes` when batching is on, or
+//! `part_bytes × 10_000` (~50 GiB at default settings) when unbounded.
+//! `multipart_threshold_mb` is retained for config compatibility but has
+//! no effect on the streaming path (always-MPU).
 //!
-//! The sink shares its `aws_sdk_s3::Client` with the transfer manager
-//! via `tm::Config::Builder::client(...)`, so credentials, endpoint
-//! URL, and the cached DNS resolver carry through unchanged.
-//! Concurrency for parts in flight (across all in-flight batches) is
-//! controlled by `multipart_concurrency`: omit the field for the
-//! transfer manager's auto-tuning, or set a positive integer for an
-//! explicit cap. The sink's own `upload_tasks` knob still bounds the
-//! number of whole batches in flight; the two axes are independent.
+//! AWS enforces 5 MiB minimum part size and 10,000-part maximum; our
+//! config validation rejects sub-5 MiB values at startup.
+//!
+//! The sink shares its `aws_sdk_s3::Client` with the transfer manager via
+//! `tm::Config::Builder::client(...)`, so credentials, endpoint URL, and
+//! the cached DNS resolver carry through unchanged. Concurrency for parts
+//! in flight is controlled by `multipart_concurrency`: omit the field
+//! for TM's auto-tuning, or set a positive integer for an explicit cap.
+//! Per-prefix upload concurrency is implicit — bounded by the number of
+//! distinct prefixes ingested in parallel by the filter workers.
 //!
 //! [`aws-sdk-s3-transfer-manager`]: https://crates.io/crates/aws-sdk-s3-transfer-manager
-//!
-//! ## Key template placeholders
-//!
-//! - `{prefix}` — the source S3 prefix (e.g. `logs/dt=20240315/hour=09`).
-//! - `{prefix_hash}` — 8-char hex BLAKE3-style hash of the prefix (DefaultHasher).
-//!   Useful when the source prefix contains characters you don't want in the
-//!   destination key.
-//! - `{seq}` — zero-padded 5-digit sequence number, incremented per prefix
-//!   on every batch rollover.
-//! - `{run_id}` — 8-char hex hash unique to this process invocation.
-//!
-//! ## Multipart uploads
-//!
-//! Currently every batch is uploaded via a single `PutObject` request. AWS
-//! supports up to 5 GB per single PUT, so configurations with batches under
-//! that limit work as-is. True multipart support (chunking a single batch
-//! into parts) is left as future work — the `multipart_threshold_mb` and
-//! `multipart_part_mb` config fields are accepted but not yet acted upon,
-//! and the sink emits a warning at startup if you set them away from the
-//! defaults so the gap is explicit.
 
 use super::codec::{Codec, CodecEncoder};
 use super::framing::{FramedEncoder, OutputFormat};
@@ -113,37 +102,87 @@ use super::output::{BoxFinishFuture, OutputSink, OutputStats};
 use super::path_template::{
     make_run_id, render_template, CollisionResult, CollisionTracker, TemplateValues,
 };
+use super::s3_streaming::{ChannelWriter, EncoderPartStream, CHANNEL_CAPACITY};
 use crate::config::output::S3OutputConfig;
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3_transfer_manager as tm;
+use bytes::Bytes;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
+/// AWS S3 multipart upload limit.
+const MAX_MPU_PARTS: u64 = 10_000;
+
 /// In-flight per-prefix batch state.
+///
+/// `upload` is `None` until the first matched line for the prefix actually
+/// arrives — opening the TM upload eagerly would create empty multipart
+/// uploads for prefixes that never match. On rollover (`batch_max_mb`
+/// crossed) the upload is closed and the slot returns to `None`, ready for
+/// the next match's open. `seq` is the monotonic part identifier preserved
+/// across rollovers.
 struct PrefixBatch {
-    encoder: FramedEncoder<CodecEncoder<Vec<u8>>>,
-    lines: u64,
-    plaintext: u64,
+    upload: Option<ActiveUpload>,
     seq: u64,
 }
 
-/// Owned state shared between ingest path and uploader pool.
+/// One running TM multipart upload. Its encoder pushes compressed bytes
+/// through `ChannelWriter` → mpsc channel → `EncoderPartStream` → TM, which
+/// uploads parts to S3 concurrently. Streaming means the entire batch
+/// never sits in RAM: at most ~`channel_cap × write-size` + `part_size` is
+/// resident per active upload.
+struct ActiveUpload {
+    encoder: FramedEncoder<CodecEncoder<ChannelWriter>>,
+    /// Background task driving the TM upload and accounting result stats.
+    /// Pushed onto `Inner.pending_uploads` on close — `finish()` awaits all
+    /// of them before returning stats.
+    handle: JoinHandle<()>,
+    /// Cumulative compressed bytes shipped through `ChannelWriter`. Shared
+    /// with the writer so this struct can sample it for the per-batch
+    /// `batch_max_bytes` rollover check without locking.
+    bytes_sent: Arc<AtomicU64>,
+    /// Lines + plaintext counts for the currently-open batch. Shared with
+    /// the upload's background task so it can fold into global counters
+    /// (or `lines_dropped` on failure) after the upload completes.
+    batch_stats: Arc<BatchStats>,
+    /// Rendered destination key — kept for logging.
+    key: String,
+}
+
+#[derive(Default)]
+struct BatchStats {
+    lines: AtomicU64,
+    plaintext: AtomicU64,
+}
+
+/// Owned state shared between ingest path and the per-prefix upload tasks.
 struct Inner {
     /// AWS transfer manager client. Wraps our existing `aws_sdk_s3::Client`
-    /// (we pass it via `Config::Builder::client(...)`) and decides
-    /// single PutObject vs. multipart per batch based on configured
-    /// `multipart_threshold_mb` / `multipart_part_mb`.
+    /// (we pass it via `Config::Builder::client(...)`) and runs each
+    /// per-prefix upload as a multipart transfer (the streaming
+    /// `PartStream` source is MPU-only — see
+    /// `aws-sdk-s3-transfer-manager` `is_mpu_only`).
     tm: tm::Client,
+    /// Tokio runtime handle captured at construction. Used to spawn
+    /// per-upload tasks from the synchronous `ingest` path (which runs
+    /// inside `spawn_blocking`).
+    runtime: Handle,
     bucket: String,
     key_template: String,
-    /// `Some(n)` enables size-based mid-run flushes at `n` compressed bytes per
-    /// prefix. `None` disables rollover — each prefix produces one object.
+    /// `Some(n)` enables size-based mid-run rollover at `n` compressed bytes
+    /// shipped per prefix. `None` disables rollover — each prefix produces
+    /// one object covering the whole run.
     batch_max_bytes: Option<u64>,
+    /// Configured `multipart_part_mb` in bytes. Determines the part size we
+    /// hand to TM and the upper-bound content-length hint we advertise to
+    /// TM's part-size planner.
+    part_bytes: u64,
     codec: Codec,
     format: OutputFormat,
     run_id: String,
@@ -151,8 +190,11 @@ struct Inner {
     /// per-prefix entries are `Mutex<PrefixBatch>` so different prefixes
     /// never block each other.
     prefixes: Mutex<HashMap<String, Arc<Mutex<PrefixBatch>>>>,
-    /// Bounded queue for finalized batches awaiting upload.
-    upload_tx: Mutex<Option<flume::Sender<UploadJob>>>,
+    /// `JoinHandle`s for in-flight upload tasks. Each one decrements
+    /// `inflight_bytes` as parts ship to TM and updates global counters
+    /// (`objects_written`, `compressed_bytes`, `lines_dropped`, `fatal`)
+    /// on completion. `finish()` joins all of these before returning.
+    pending_uploads: Mutex<Vec<JoinHandle<()>>>,
     /// Defence-in-depth: warn (don't error) when two distinct source
     /// prefixes render to the same destination key. Static validation
     /// catches the common cases at config-resolve time; this catches the
@@ -166,19 +208,26 @@ struct Inner {
     compressed_bytes: AtomicU64,
     lines_dropped: AtomicU64,
     objects_written: AtomicU64,
+    /// Sink-global sum of bytes currently resident in our streaming
+    /// pipeline (channel queues + reader pending buffers across all
+    /// active uploads). Incremented by `ChannelWriter::write` and
+    /// decremented by `EncoderPartStream::poll_part` when parts are
+    /// handed to TM.
+    inflight_bytes: Arc<AtomicU64>,
+    /// Max observed value of `inflight_bytes` over the run. Surfaced in
+    /// `OutputStats.extras` so the e2e suite can assert the sink doesn't
+    /// buffer the whole run in memory.
+    peak_inflight_bytes: Arc<AtomicU64>,
     fatal: Arc<AtomicBool>,
-}
-
-struct UploadJob {
-    key: String,
-    body: Vec<u8>,
-    lines: u64,
-    plaintext: u64,
+    /// Once `true`, the sink is finalized and `ingest` returns an error
+    /// instead of opening a fresh upload. Prevents `flush_batch`-style
+    /// races where late-arriving lines would otherwise reopen a closed
+    /// batch.
+    finished: AtomicBool,
 }
 
 pub struct S3OutputSink {
     inner: Arc<Inner>,
-    upload_handles: Mutex<Option<Vec<JoinHandle<()>>>>,
 }
 
 impl S3OutputSink {
@@ -193,13 +242,6 @@ impl S3OutputSink {
                 ));
             }
         }
-
-        let upload_tasks = cfg.upload_tasks.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get() / 4)
-                .unwrap_or(2)
-                .max(1)
-        });
 
         // Build the transfer-manager client around our existing aws-sdk-s3
         // client. The TM crate's Config::Builder::client(...) accepts an
@@ -219,150 +261,58 @@ impl S3OutputSink {
             .build();
         let tm_client = tm::Client::new(tm_config);
 
-        let (upload_tx, upload_rx) = flume::bounded::<UploadJob>(upload_tasks * 2);
-
         let run_id = make_run_id();
         let codec = Codec::from_config(&cfg.compression)?;
 
+        // `S3OutputSink::new` runs inside the tokio runtime (called from
+        // async `main`). Capture the handle so the synchronous `ingest`
+        // path can spawn upload tasks via `runtime.spawn(...)`.
+        let runtime = Handle::current();
+
         let inner = Arc::new(Inner {
             tm: tm_client,
+            runtime,
             bucket: cfg.bucket.clone(),
             key_template: cfg.key_template.clone(),
             batch_max_bytes: cfg.batch_max_mb.map(|mb| (mb * 1_000_000.0) as u64),
+            part_bytes,
             codec,
             format: cfg.format.clone(),
             run_id,
             prefixes: Mutex::new(HashMap::new()),
-            upload_tx: Mutex::new(Some(upload_tx)),
+            pending_uploads: Mutex::new(Vec::new()),
             collisions: Mutex::new(CollisionTracker::new()),
             matched_lines: AtomicU64::new(0),
             plaintext_bytes: AtomicU64::new(0),
             compressed_bytes: AtomicU64::new(0),
             lines_dropped: AtomicU64::new(0),
             objects_written: AtomicU64::new(0),
+            inflight_bytes: Arc::new(AtomicU64::new(0)),
+            peak_inflight_bytes: Arc::new(AtomicU64::new(0)),
             fatal: Arc::new(AtomicBool::new(false)),
+            finished: AtomicBool::new(false),
         });
 
-        let mut handles = Vec::with_capacity(upload_tasks);
-        for task_id in 0..upload_tasks {
-            let inner = inner.clone();
-            let rx = upload_rx.clone();
-            handles.push(tokio::spawn(async move {
-                Self::uploader_task(task_id, inner, rx).await;
-            }));
-        }
-        drop(upload_rx);
-
-        Ok(Self {
-            inner,
-            upload_handles: Mutex::new(Some(handles)),
-        })
+        Ok(Self { inner })
     }
 
-    async fn uploader_task(task_id: usize, inner: Arc<Inner>, rx: flume::Receiver<UploadJob>) {
-        while let Ok(job) = rx.recv_async().await {
-            let UploadJob {
-                key,
-                body,
-                lines,
-                plaintext,
-            } = job;
-            let body_len = body.len() as u64;
-            let stream = tm::io::InputStream::from(bytes::Bytes::from(body));
-
-            // Build the upload request. TM auto-multiparts above the
-            // configured threshold and uses PutObject below it.
-            let mut req = inner
-                .tm
-                .upload()
-                .bucket(&inner.bucket)
-                .key(&key)
-                .body(stream)
-                .content_type("application/x-ndjson");
-            if let Some(enc) = inner.codec.content_encoding() {
-                req = req.content_encoding(enc);
-            }
-            let result = match req.initiate() {
-                Ok(handle) => handle.join().await.map(|_output| ()),
-                Err(e) => Err(e),
-            };
-
-            match result {
-                Ok(()) => {
-                    inner
-                        .compressed_bytes
-                        .fetch_add(body_len, Ordering::Relaxed);
-                    inner.objects_written.fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        task = task_id,
-                        bucket = %inner.bucket,
-                        key = %key,
-                        bytes = body_len,
-                        lines,
-                        plaintext,
-                        "S3 upload"
-                    );
-                }
-                Err(e) => {
-                    inner.lines_dropped.fetch_add(lines, Ordering::Relaxed);
-                    // TM wraps the underlying SDK errors. Walk the source
-                    // chain so our existing recoverable/fatal classifier
-                    // sees the actual aws-sdk-s3 error message rather than
-                    // the TM wrapper's "transfer failed" prefix.
-                    let chain = error_chain_str(&e);
-                    if !crate::s3::is_recoverable_s3_error(&chain) {
-                        error!(
-                            task = task_id,
-                            bucket = %inner.bucket,
-                            key = %key,
-                            lines,
-                            error = %chain,
-                            "Fatal S3 upload error, stopping pipeline"
-                        );
-                        inner.fatal.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    error!(
-                        task = task_id,
-                        bucket = %inner.bucket,
-                        key = %key,
-                        lines,
-                        error = %chain,
-                        "S3 upload failed"
-                    );
-                }
-            }
-        }
-        debug!(task = task_id, "S3 uploader task finished");
-    }
-
-    /// Finalize the encoder for a prefix and enqueue an upload job.
-    fn flush_batch(inner: &Inner, prefix: &str, batch: &mut PrefixBatch) -> Result<()> {
-        let replacement_codec = inner
-            .codec
-            .encoder(Vec::new())
-            .context("create replacement encoder")?;
-        let replacement = FramedEncoder::new(replacement_codec, inner.format.clone());
-        let framed = std::mem::replace(&mut batch.encoder, replacement);
-        let codec_enc = framed.finish().context("close batch framing")?;
-        let body = codec_enc.finish().context("finalize batch encoder")?;
-        let lines = std::mem::replace(&mut batch.lines, 0);
-        let plaintext = std::mem::replace(&mut batch.plaintext, 0);
-
-        if body.is_empty() || lines == 0 {
-            return Ok(());
-        }
-
+    /// Build a fresh active upload for `prefix`. Renders the destination
+    /// key, opens an mpsc channel between the encoder side and TM's
+    /// `PartStream`, kicks off the TM multipart upload as a background
+    /// task, and returns the writer-side state for the per-prefix batch.
+    ///
+    /// `seq` is the value to substitute into `{seq}` for this batch's key —
+    /// caller increments their own `PrefixBatch.seq` afterwards.
+    fn open_upload(inner: &Arc<Inner>, prefix: &str, seq: u64) -> Result<ActiveUpload> {
         let key = render_template(
             &inner.key_template,
             &TemplateValues {
                 prefix,
                 run_id: &inner.run_id,
-                seq: batch.seq,
+                seq,
                 ext: inner.codec.extension(),
             },
         );
-        batch.seq += 1;
 
         // Defence-in-depth collision check. Static validation forbids
         // templates without `{prefix}`/`{prefix_hash}`, so this only
@@ -382,19 +332,152 @@ impl S3OutputSink {
             }
         }
 
-        let tx_guard = inner.upload_tx.lock().unwrap_or_else(|e| e.into_inner());
-        match tx_guard.as_ref() {
-            Some(tx) => {
-                tx.send(UploadJob {
-                    key,
-                    body,
-                    lines,
-                    plaintext,
-                })
-                .map_err(|_| anyhow!("S3 uploader pool gone, channel closed"))?;
-            }
-            None => return Err(anyhow!("S3 sink already finished")),
+        // Channel capacity is small on purpose — see `CHANNEL_CAPACITY` doc.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+
+        let bytes_sent = Arc::new(AtomicU64::new(0));
+        let writer = ChannelWriter::new(
+            tx,
+            inner.inflight_bytes.clone(),
+            inner.peak_inflight_bytes.clone(),
+            bytes_sent.clone(),
+        );
+        let codec_enc = inner
+            .codec
+            .encoder(writer)
+            .context("create streaming codec encoder")?;
+        let framed = FramedEncoder::new(codec_enc, inner.format.clone());
+
+        // Upper bound on content length: TM uses it to pick `part_size` so
+        // total parts stay ≤ MAX_MPU_PARTS. For the bounded-batch case the
+        // upper is `batch_max_bytes + part_bytes` (the rollover check fires
+        // *after* the threshold cross, so we may overshoot by up to one
+        // codec block). For the unbounded case we advertise
+        // `part_bytes * MAX_MPU_PARTS` — TM will leave `part_size` as
+        // configured, allowing up to ~50 GB per object at default
+        // settings before it would auto-bump part_size.
+        let upper_hint = match inner.batch_max_bytes {
+            Some(cap) => cap + inner.part_bytes,
+            None => inner.part_bytes.saturating_mul(MAX_MPU_PARTS),
+        };
+        let part_stream =
+            EncoderPartStream::new(rx, inner.inflight_bytes.clone()).with_upper_size(upper_hint);
+        let input_stream = tm::io::InputStream::from_part_stream(part_stream);
+
+        let mut req = inner
+            .tm
+            .upload()
+            .bucket(&inner.bucket)
+            .key(&key)
+            .body(input_stream)
+            .content_type(if inner.format.is_json_array() {
+                "application/json"
+            } else {
+                "application/x-ndjson"
+            });
+        if let Some(enc) = inner.codec.content_encoding() {
+            req = req.content_encoding(enc);
         }
+
+        let upload_handle = req
+            .initiate()
+            .map_err(|e| anyhow!("S3 sink: failed to initiate upload for `{key}`: {e}"))?;
+
+        let batch_stats = Arc::new(BatchStats::default());
+
+        // Spawn a tiny driver task that awaits TM completion, then folds
+        // per-batch counts into the sink's global counters (or
+        // `lines_dropped` + `fatal` on failure).
+        let driver = {
+            let inner = inner.clone();
+            let key_for_task = key.clone();
+            let stats = batch_stats.clone();
+            let bytes_sent_for_task = bytes_sent.clone();
+            async move {
+                let result = upload_handle.join().await;
+                let lines = stats.lines.load(Ordering::Relaxed);
+                let plaintext = stats.plaintext.load(Ordering::Relaxed);
+                let bytes = bytes_sent_for_task.load(Ordering::Relaxed);
+                match result {
+                    Ok(_) => {
+                        inner.compressed_bytes.fetch_add(bytes, Ordering::Relaxed);
+                        inner.objects_written.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            bucket = %inner.bucket,
+                            key = %key_for_task,
+                            bytes,
+                            lines,
+                            plaintext,
+                            "S3 streaming upload"
+                        );
+                    }
+                    Err(e) => {
+                        inner.lines_dropped.fetch_add(lines, Ordering::Relaxed);
+                        let chain = error_chain_str(&e);
+                        if !crate::s3::is_recoverable_s3_error(&chain) {
+                            error!(
+                                bucket = %inner.bucket,
+                                key = %key_for_task,
+                                lines,
+                                error = %chain,
+                                "Fatal S3 upload error, stopping pipeline"
+                            );
+                            inner.fatal.store(true, Ordering::Relaxed);
+                        } else {
+                            error!(
+                                bucket = %inner.bucket,
+                                key = %key_for_task,
+                                lines,
+                                error = %chain,
+                                "S3 upload failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        let handle = inner.runtime.spawn(driver);
+
+        Ok(ActiveUpload {
+            encoder: framed,
+            handle,
+            bytes_sent,
+            batch_stats,
+            key,
+        })
+    }
+
+    /// Close an active upload — finalize the framing + codec layers (which
+    /// emits any trailing JSON-array `]` and codec frame tail), drop the
+    /// `ChannelWriter` so the channel closes and TM's `PartStream` sees
+    /// EOF, then push the driver task's join handle into `pending_uploads`
+    /// so `finish()` can await it.
+    fn close_upload(inner: &Arc<Inner>, active: ActiveUpload) -> Result<()> {
+        let ActiveUpload {
+            encoder,
+            handle,
+            bytes_sent: _,
+            batch_stats: _,
+            key,
+        } = active;
+
+        // Finalize JSON-array framing. May write `]` through the codec.
+        let codec_enc = encoder
+            .finish()
+            .with_context(|| format!("close batch framing for `{key}`"))?;
+        // Finalize codec frame (zstd/gzip trailer). Consumes the
+        // `ChannelWriter`; dropping it closes the mpsc channel.
+        let _writer = codec_enc
+            .finish()
+            .with_context(|| format!("finalize codec encoder for `{key}`"))?;
+        // _writer drops here, channel closes, TM's PartStream returns
+        // Poll::Ready(None) on its next poll, TM completes the multipart.
+
+        inner
+            .pending_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
         Ok(())
     }
 }
@@ -416,6 +499,10 @@ fn error_chain_str(err: &dyn std::error::Error) -> String {
 
 impl OutputSink for S3OutputSink {
     fn ingest(&self, prefix: &str, line: &[u8]) -> Result<()> {
+        if self.inner.finished.load(Ordering::Relaxed) {
+            return Err(anyhow!("S3 sink already finished"));
+        }
+
         let entry = {
             let mut map = self
                 .inner
@@ -424,16 +511,8 @@ impl OutputSink for S3OutputSink {
                 .unwrap_or_else(|e| e.into_inner());
             map.entry(prefix.to_string())
                 .or_insert_with(|| {
-                    let codec_enc = self
-                        .inner
-                        .codec
-                        .encoder(Vec::new())
-                        .expect("encoder creation must succeed");
-                    let encoder = FramedEncoder::new(codec_enc, self.inner.format.clone());
                     Arc::new(Mutex::new(PrefixBatch {
-                        encoder,
-                        lines: 0,
-                        plaintext: 0,
+                        upload: None,
                         seq: 0,
                     }))
                 })
@@ -441,19 +520,44 @@ impl OutputSink for S3OutputSink {
         };
 
         let mut batch = entry.lock().unwrap_or_else(|e| e.into_inner());
-        batch.encoder.write_item(line).context("encoder write")?;
-        batch.lines += 1;
-        batch.plaintext += line.len() as u64;
+
+        // Lazily open an upload on the first matched line for this prefix
+        // (or after a rollover closed the previous batch). Deferring the
+        // open until first byte means prefixes that match nothing never
+        // create empty multipart uploads.
+        if batch.upload.is_none() {
+            let seq = batch.seq;
+            let active = Self::open_upload(&self.inner, prefix, seq)?;
+            batch.upload = Some(active);
+            batch.seq += 1;
+        }
+
+        let active = batch.upload.as_mut().expect("just opened above");
+        active
+            .encoder
+            .write_item(line)
+            .context("streaming encoder write")?;
+        active.batch_stats.lines.fetch_add(1, Ordering::Relaxed);
+        active
+            .batch_stats
+            .plaintext
+            .fetch_add(line.len() as u64, Ordering::Relaxed);
 
         self.inner.matched_lines.fetch_add(1, Ordering::Relaxed);
         self.inner
             .plaintext_bytes
             .fetch_add(line.len() as u64, Ordering::Relaxed);
 
+        // Rollover check: have we shipped enough compressed bytes through
+        // this writer to cross `batch_max_bytes`? `bytes_sent` is
+        // monotonic, so we just sample it.
         if let Some(threshold) = self.inner.batch_max_bytes {
-            let approx_compressed = batch.encoder.inner_ref().buffered_len() as u64;
-            if approx_compressed >= threshold {
-                Self::flush_batch(&self.inner, prefix, &mut batch)?;
+            let shipped = active.bytes_sent.load(Ordering::Relaxed);
+            if shipped >= threshold {
+                let active = batch.upload.take().expect("just confirmed Some");
+                Self::close_upload(&self.inner, active)?;
+                // The next ingest for this prefix will open a fresh upload
+                // with `seq` incremented above. No need to do it here.
             }
         }
         Ok(())
@@ -461,7 +565,18 @@ impl OutputSink for S3OutputSink {
 
     fn finish<'a>(&'a self) -> BoxFinishFuture<'a> {
         Box::pin(async move {
-            // Drain remaining batches.
+            self.inner.finished.store(true, Ordering::Relaxed);
+
+            // Close every active per-prefix upload. Each close drops the
+            // writer → channel EOF → TM's PartStream returns
+            // Poll::Ready(None) → TM completes the multipart upload.
+            //
+            // close_upload finalizes the codec encoder, which can write a
+            // frame trailer through `ChannelWriter::write` →
+            // `blocking_send`. Calling that from this async context
+            // (a runtime worker thread) panics with "Cannot block the
+            // current thread from within a runtime", so we hop to a
+            // blocking thread for each close.
             let prefixes: Vec<(String, Arc<Mutex<PrefixBatch>>)> = {
                 let mut map = self
                     .inner
@@ -471,34 +586,45 @@ impl OutputSink for S3OutputSink {
                 map.drain().collect()
             };
             for (prefix, entry) in prefixes {
-                let mut batch = entry.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = Self::flush_batch(&self.inner, &prefix, &mut batch) {
-                    warn!(prefix = %prefix, error = %e, "S3 sink: failed to flush final batch");
+                let active_opt = entry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .upload
+                    .take();
+                if let Some(active) = active_opt {
+                    let inner_for_close = self.inner.clone();
+                    let close_result = tokio::task::spawn_blocking(move || {
+                        Self::close_upload(&inner_for_close, active)
+                    })
+                    .await;
+                    match close_result {
+                        Err(e) => warn!(
+                            prefix = %prefix,
+                            error = %e,
+                            "S3 sink: close_upload task panicked"
+                        ),
+                        Ok(Err(e)) => warn!(
+                            prefix = %prefix,
+                            error = %e,
+                            "S3 sink: failed to close trailing upload"
+                        ),
+                        Ok(Ok(())) => {}
+                    }
                 }
             }
 
-            // Close upload channel so uploader tasks drain and exit.
-            {
-                let mut tx_guard = self
+            // Await every driver task — they've already started uploading
+            // (some may have finished mid-run), so this is just the join.
+            let handles = std::mem::take(
+                &mut *self
                     .inner
-                    .upload_tx
+                    .pending_uploads
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                tx_guard.take();
-            }
-
-            let handles = {
-                let mut h = self
-                    .upload_handles
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                h.take()
-            };
-            if let Some(handles) = handles {
-                for handle in handles {
-                    if let Err(e) = handle.await {
-                        warn!(error = %e, "S3 uploader task panicked");
-                    }
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    warn!(error = %e, "S3 upload driver task panicked");
                 }
             }
 
@@ -514,6 +640,10 @@ impl OutputSink for S3OutputSink {
                         json!(self.inner.objects_written.load(Ordering::Relaxed)),
                     ),
                     ("run_id".to_string(), json!(self.inner.run_id)),
+                    (
+                        "peak_inflight_bytes".to_string(),
+                        json!(self.inner.peak_inflight_bytes.load(Ordering::Relaxed)),
+                    ),
                 ]),
             };
 

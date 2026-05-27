@@ -78,7 +78,6 @@ pub struct OutputCli {
     pub s3_multipart_threshold_mb: Option<u64>,
     pub s3_multipart_part_mb: Option<u64>,
     pub s3_multipart_concurrency: Option<usize>,
-    pub s3_upload_tasks: Option<usize>,
 
     // shared
     pub compression_format: Option<CodecFormat>,
@@ -150,7 +149,6 @@ impl OutputCli {
             s3_multipart_concurrency,
             "--s3-output-multipart-concurrency"
         );
-        check!(s3_upload_tasks, "--s3-output-upload-tasks");
         check!(compression_format, "--compression-format");
         check!(compression_level, "--compression-level");
         check!(file_path_template, "--output-path-template");
@@ -271,7 +269,6 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
                 multipart_threshold_mb: cli.s3_multipart_threshold_mb.unwrap_or(5),
                 multipart_part_mb: cli.s3_multipart_part_mb.unwrap_or(5),
                 multipart_concurrency: cli.s3_multipart_concurrency,
-                upload_tasks: cli.s3_upload_tasks,
                 format: cli_format(cli),
             })
         }
@@ -337,7 +334,6 @@ fn reject_inactive_flags(kind: OutputKind, cli: &OutputCli) -> Result<()> {
         s3_multipart_concurrency,
         "--s3-output-multipart-concurrency"
     );
-    reject_unless!(is_s3, s3_upload_tasks, "--s3-output-upload-tasks");
     reject_unless!(is_file, file_path_template, "--output-path-template");
 
     if !bad.is_empty() {

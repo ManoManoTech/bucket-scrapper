@@ -264,10 +264,6 @@ struct Cli {
     /// pass a positive integer for an explicit cap.
     #[arg(long)]
     s3_output_multipart_concurrency: Option<usize>,
-
-    /// Number of concurrent uploader tasks for the s3 output.
-    #[arg(long)]
-    s3_output_upload_tasks: Option<usize>,
 }
 
 /// CLI mirror of [`CodecFormat`] — kept separate so clap's `ValueEnum`
@@ -321,7 +317,6 @@ impl Cli {
             s3_multipart_threshold_mb: self.s3_output_multipart_threshold_mb,
             s3_multipart_part_mb: self.s3_output_multipart_part_mb,
             s3_multipart_concurrency: self.s3_output_multipart_concurrency,
-            s3_upload_tasks: self.s3_output_upload_tasks,
             compression_format: self.compression_format.map(Into::into),
             compression_level: self.compression_level,
             file_path_template: self.output_path_template.clone(),
@@ -814,7 +809,11 @@ fn report_completion(
         compression_ratio = compression_ratio,
         plaintext_mbps = if elapsed_s > 0.0 { plaintext_mb / elapsed_s } else { 0.0 },
         pattern = cli.line_pattern_regex.as_deref().unwrap_or("(all lines)"),
-        extras = ?stats.extras,
+        // Render `extras` as a JSON object string so downstream log
+        // consumers (and the e2e tests) can parse it back; the previous
+        // `?` Debug format produced an ad-hoc Rust-style repr that
+        // wasn't machine-readable.
+        extras = %serde_json::to_string(&stats.extras).unwrap_or_else(|_| "{}".to_string()),
         "Search completed"
     );
 }

@@ -7,6 +7,7 @@ pub mod observer;
 pub mod orchestrator;
 pub mod output;
 pub mod path_template;
+pub mod s3_streaming;
 pub mod s3_writer;
 pub mod streaming_writer;
 pub mod void_writer;
