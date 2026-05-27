@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 /// Boxed future used by [`OutputSink::finish`] to make the trait `dyn`-safe
@@ -89,4 +89,34 @@ pub trait OutputSink: Send + Sync {
 
     /// One-line label describing the sink for end-of-run logging.
     fn type_name(&self) -> &'static str;
+
+    /// Optional handle to per-sink internal-state metrics, sampled by
+    /// the progress reporter. Used to disambiguate the bottleneck label:
+    /// when filter workers are stuck inside `sink.ingest`, this tells us
+    /// *why* — is the sink's own outbound queue full (network-bound) or
+    /// is the queue empty because the producer side is slow (codec-bound)?
+    ///
+    /// Default returns empty; sinks with meaningful internal buffering
+    /// (currently just S3) override.
+    fn sink_observability(&self) -> SinkObservability {
+        SinkObservability::default()
+    }
+}
+
+/// Per-sink internal-state metrics exposed to the progress reporter.
+///
+/// Both fields are optional: a sink that doesn't have a meaningful
+/// internal queue (file, void) returns `None` for both, and the
+/// progress reporter treats the absence of the signal conservatively
+/// — see `classify_bottleneck_non_http` for the exact rules.
+#[derive(Debug, Clone, Default)]
+pub struct SinkObservability {
+    /// Bytes currently resident in sink-internal channels and reader
+    /// pending buffers. Read by the progress reporter on each tick.
+    pub inflight_bytes: Option<Arc<AtomicU64>>,
+    /// Count of upload contexts currently open — used to scale the
+    /// per-upload "backed up" threshold against. For the S3 sink this
+    /// is the number of multipart uploads with a still-living
+    /// `ChannelWriter` or a still-running TM driver task.
+    pub active_uploads: Option<Arc<AtomicUsize>>,
 }

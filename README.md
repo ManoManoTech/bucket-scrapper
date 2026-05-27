@@ -325,3 +325,33 @@ Usage: bucket-scrapper [OPTIONS] --start <START>
 **CPU**: Use samply with the profiling build profile.
 
 **Memory**: `cargo build --profile profiling --features dhat-heap`, then submit the generated `profiler.json` to [dh_view](https://nnethercote.github.io/dh_view/dh_view.html).
+
+## Reading the `bottleneck` label
+
+Every `Search progress` log record carries a `bottleneck` field that names the stage most likely limiting throughput at the time the report was emitted. The classifier reads several channel-fill percentages plus a sink-busy gauge; the label is a one-word summary of the dominant signal.
+
+### Signals it looks at
+
+- **`dc_pct`** — fill percentage of the decompressed-line channel between the download/decompress stage and the filter workers. High means the downstream stages can't keep up with what's being decompressed.
+- **`workers_in_ingest`** — instantaneous count of filter workers currently inside `sink.ingest`. Compared against the total filter-worker count: ≥ half means the sink is where time is going (codec compression, framing, sink-internal queues), < half means filter-side work (regex / channel receive) is what's eating the workers.
+- **`sink_inflight_bytes`** + **`sink_active_uploads`** — S3 sink only. Bytes resident in the per-upload mpsc channels and reader pending buffers, scaled by how many uploads are currently open. High means TM is slow to drain parts to S3; low while workers are stuck in `sink.ingest` means the codec is the producer-side cost.
+- HTTP-mode only: **`line_pct`** and **`batch_pct`** — fill of the HTTP writer's internal line and batch channels. Provide direct visibility into the compressor and uploader stages.
+
+### Label meanings
+
+- **`download`** — `dc_pct` is low. The download stage isn't filling the line channel fast enough. Causes: S3 per-connection throughput, network bandwidth, low `--max-parallel`, or storage class.
+- **`filter`** — `dc_pct` high, `workers_in_ingest` low. Filter workers are spending their time on regex matching or waiting on channel receives. Causes: an expensive regex, lots of non-matching lines, or simply too few filter workers (`--filter-tasks`).
+- **`sink_s3_codec`** — `dc_pct` high, `workers_in_ingest` high, sink mpsc is roughly empty. Workers are in `sink.ingest` but bytes are leaving fast — the codec (zstd / gzip) is the producer-side cost. Try `--compression-format none`, raise the level only with eyes on this label, or look at per-prefix lock contention if you have many concurrent prefixes hitting the same per-prefix mutex.
+- **`sink_s3_network`** — `dc_pct` high, `workers_in_ingest` high, sink mpsc is backed up. `ChannelWriter::blocking_send` is waiting because TM / S3 isn't accepting parts fast enough. Causes: network bandwidth ceiling, `multipart_concurrency` set too low, S3 throttling.
+- **`sink_file`** — `dc_pct` high, `workers_in_ingest` high, file sink. Codec or the OS write path is the lid. The file sink doesn't have an internal queue to look at — reach for `iostat`/`vmstat`/`dmesg` to see whether it's the filesystem, dm-crypt, an NBD/EBS volume, or just disk pressure.
+- **`sink_http`** — `dc_pct` high, `workers_in_ingest` high, HTTP sink, but the HTTP writer's own channels aren't full. Unusual; usually you'd see `compress` or `upload` for HTTP-bound runs.
+- **`compress`** *(HTTP only)* — the HTTP writer's line channel is full. The compressor task pool isn't keeping up. Raise `--http-compressor-tasks` (or rely on the auto-inferred default).
+- **`upload`** *(HTTP only)* — the HTTP writer's batch channel is full. The uploader pool can't get batches out to the API fast enough. Raise `--http-upload-tasks`, raise `--max-upload-rate`, or check the upstream API.
+- **`sink_void`** — should never realistically appear; void's ingest is a counter bump. If it shows up, something is wrong.
+- **`sink_busy`** — generic fallback if the sink kind doesn't match a known label. Means: filter workers are stuck inside `sink.ingest` but we couldn't be more specific.
+
+### Caveats
+
+- The classifier reports the *dominant* signal at sampling time. A flapping pipeline (e.g. download bursts followed by sink bursts) will rotate labels across consecutive reports — that's a useful signal in itself.
+- The threshold for "channel saturated" is 80% fill; for "sink busy" it's ≥ half of filter workers inside `sink.ingest`. Both are heuristics and may need adjustment as workloads shift.
+- For the S3 sink, the codec-vs-network drill-down doesn't see *inside* the AWS transfer manager — once bytes leave our `ChannelWriter`, we lose visibility. If TM has its own internal queueing under pressure, we'd report `sink_s3_codec` (low local inflight) even though the actual bottleneck is downstream. Use the upload throughput numbers and `multipart_concurrency` setting alongside the label.

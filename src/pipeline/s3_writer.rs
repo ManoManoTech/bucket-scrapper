@@ -110,7 +110,7 @@ use aws_sdk_s3_transfer_manager as tm;
 use bytes::Bytes;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -223,6 +223,12 @@ struct Inner {
     /// `OutputStats.extras` so the e2e suite can assert the sink doesn't
     /// buffer the whole run in memory.
     peak_inflight_bytes: Arc<AtomicU64>,
+    /// Count of currently-open TM upload contexts. Incremented when
+    /// `open_upload` spawns a driver task; decremented at the end of
+    /// that driver task (i.e. once TM finalizes the multipart). Sampled
+    /// by the progress reporter via `SinkObservability` to scale the
+    /// per-upload "channel backed up" threshold.
+    active_uploads: Arc<AtomicUsize>,
     fatal: Arc<AtomicBool>,
     /// Once `true`, the sink is finalized and `ingest` returns an error
     /// instead of opening a fresh upload. Prevents `flush_batch`-style
@@ -295,6 +301,7 @@ impl S3OutputSink {
             objects_written: AtomicU64::new(0),
             inflight_bytes: Arc::new(AtomicU64::new(0)),
             peak_inflight_bytes: Arc::new(AtomicU64::new(0)),
+            active_uploads: Arc::new(AtomicUsize::new(0)),
             fatal: Arc::new(AtomicBool::new(false)),
             finished: AtomicBool::new(false),
         });
@@ -389,6 +396,13 @@ impl S3OutputSink {
             .initiate()
             .map_err(|e| anyhow!("S3 sink: failed to initiate upload for `{key}`: {e}"))?;
 
+        // From this moment until the TM driver task exits, this upload
+        // contributes to `inflight_bytes` (channel + reader pending) and
+        // counts as an "active upload" for the progress reporter's
+        // backpressure heuristic. Decrement in the driver task's
+        // closure below.
+        inner.active_uploads.fetch_add(1, Ordering::Relaxed);
+
         let batch_stats = Arc::new(BatchStats::default());
 
         // Spawn a tiny driver task that awaits TM completion, then folds
@@ -401,6 +415,9 @@ impl S3OutputSink {
             let bytes_sent_for_task = bytes_sent.clone();
             async move {
                 let result = upload_handle.join().await;
+                // Whatever TM's outcome, this upload is no longer active —
+                // its mpsc is fully drained and its driver is exiting.
+                inner.active_uploads.fetch_sub(1, Ordering::Relaxed);
                 let lines = stats.lines.load(Ordering::Relaxed);
                 let plaintext = stats.plaintext.load(Ordering::Relaxed);
                 let bytes = bytes_sent_for_task.load(Ordering::Relaxed);
@@ -744,6 +761,13 @@ impl OutputSink for S3OutputSink {
 
     fn type_name(&self) -> &'static str {
         "s3"
+    }
+
+    fn sink_observability(&self) -> crate::pipeline::SinkObservability {
+        crate::pipeline::SinkObservability {
+            inflight_bytes: Some(self.inner.inflight_bytes.clone()),
+            active_uploads: Some(self.inner.active_uploads.clone()),
+        }
     }
 }
 

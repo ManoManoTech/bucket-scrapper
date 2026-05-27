@@ -217,6 +217,13 @@ impl StreamingDownloader {
         let filter_lines_in = Arc::new(AtomicUsize::new(0));
         let filter_bytes_in = Arc::new(AtomicUsize::new(0));
         let workers_alive = Arc::new(AtomicUsize::new(self.config.filter_tasks));
+        // Sink-agnostic "how many filter workers are inside sink.ingest
+        // right now" gauge. Filter workers bump it via a RAII guard
+        // around each `sink.ingest` call; the progress reporter samples
+        // it instantaneously to distinguish `filter` vs `sink_*` labels.
+        let workers_in_ingest: crate::progress::IngestGauge = Arc::new(AtomicUsize::new(0));
+        let sink_obs = sink.sink_observability();
+        let sink_kind = sink.type_name();
 
         let progress = Arc::new(Mutex::new(PipelineProgress::new(
             objects.len(),
@@ -230,6 +237,10 @@ impl StreamingDownloader {
             filter_lines_in.clone(),
             filter_bytes_in.clone(),
             workers_alive.clone(),
+            self.config.filter_tasks,
+            workers_in_ingest.clone(),
+            sink_obs,
+            sink_kind,
         )));
 
         // Emit initial progress at t=0 so charts always have a starting point
@@ -282,6 +293,7 @@ impl StreamingDownloader {
             let filter_bytes_in = filter_bytes_in.clone();
             let fe = fatal_error.clone();
             let wa = workers_alive.clone();
+            let wii = workers_in_ingest.clone();
 
             worker_set.spawn(async move {
                 let result = Self::filter_worker(
@@ -294,6 +306,7 @@ impl StreamingDownloader {
                     filter_lines_in,
                     filter_bytes_in,
                     fe,
+                    wii,
                 )
                 .await;
                 wa.fetch_sub(1, Ordering::Relaxed);
@@ -854,6 +867,7 @@ impl StreamingDownloader {
         filter_lines_in: Arc<AtomicUsize>,
         filter_bytes_in: Arc<AtomicUsize>,
         fatal_error: Option<Arc<AtomicBool>>,
+        workers_in_ingest: crate::progress::IngestGauge,
     ) -> Result<usize> {
         let result = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut local = 0usize;
@@ -875,6 +889,12 @@ impl StreamingDownloader {
                 filter_bytes_in.fetch_add(line_len, Ordering::Relaxed);
 
                 if searcher.matches_line(&line.data) {
+                    // RAII gauge so the progress reporter can tell whether
+                    // filter workers are stuck inside the sink (codec /
+                    // mpsc send / I/O) or actually doing filter-side work.
+                    // Drop on the same line frees the slot regardless of
+                    // panics / early returns.
+                    let _ingest_guard = crate::progress::IngestGuard::new(&workers_in_ingest);
                     sink.ingest(&line.source.prefix, &line.data)?;
                     local += 1;
                     match_count.fetch_add(1, Ordering::Relaxed);
