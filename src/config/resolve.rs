@@ -156,7 +156,9 @@ impl OutputCli {
         v
     }
 
-    fn is_empty(&self) -> bool {
+    /// `true` when no per-output CLI flag was set. Used by `--tune` mode to
+    /// warn that any output flags will be ignored.
+    pub fn is_empty(&self) -> bool {
         self.set_flags().is_empty()
     }
 }

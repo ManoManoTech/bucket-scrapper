@@ -31,6 +31,7 @@ use bucket_scrapper::s3::dns_cache;
 use bucket_scrapper::s3::S3ObjectInfo;
 use bucket_scrapper::sampling::{parse_unit_interval, FileSampler};
 use bucket_scrapper::sharding::ShardSelector;
+use bucket_scrapper::tune::{self, Objective, TuneConfig};
 use bucket_scrapper::utils::date::date_range_to_date_hour_list;
 use std::collections::HashMap;
 
@@ -136,6 +137,37 @@ struct Cli {
     /// Must be set together with `--shard-count`.
     #[arg(long, requires = "shard_count")]
     shard_number: Option<usize>,
+
+    // ── Auto-tune mode ──────────────────────────────────────────────────────
+    /// Run the offline auto-tuner instead of a normal scrape. Repeatedly runs
+    /// the read-side pipeline (download + filter, void sink) over a fixed
+    /// sampled slice and uses the bottleneck classifier to search for the best
+    /// `--max-parallel` / `--filter-tasks` / `--line-buffer-size` for this
+    /// instance. Prints the winning settings as a ready-to-paste flag string.
+    /// Any `--output*` flags are ignored (tuning always uses the void sink).
+    #[arg(long)]
+    tune: bool,
+
+    /// Tuning sample size in GB (cumulative compressed bytes). Default 20.
+    #[arg(long, default_value = "20")]
+    tune_sample_gb: f64,
+
+    /// Tuning objective to maximize. Default download.
+    #[arg(long, value_enum, default_value = "download")]
+    tune_objective: TuneObjectiveArg,
+
+    /// Seed for the tuning sample shuffle. Falls back to `--sampling-seed` /
+    /// config `sampling_seed`, else 0.
+    #[arg(long)]
+    tune_seed: Option<u64>,
+
+    /// Maximum tuning trials before stopping. Default 20.
+    #[arg(long, default_value = "20")]
+    tune_max_trials: usize,
+
+    /// Write the tuning profile as JSON to this path.
+    #[arg(long)]
+    tune_output: Option<PathBuf>,
 
     // ── Output selection / per-output overrides ────────────────────────────
     //
@@ -294,6 +326,22 @@ impl From<CodecFormatArg> for CodecFormat {
 enum LogFormat {
     Text,
     Json,
+}
+
+/// CLI mirror of [`Objective`] for the `--tune-objective` flag.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TuneObjectiveArg {
+    Download,
+    Filter,
+}
+
+impl From<TuneObjectiveArg> for Objective {
+    fn from(v: TuneObjectiveArg) -> Self {
+        match v {
+            TuneObjectiveArg::Download => Objective::Download,
+            TuneObjectiveArg::Filter => Objective::Filter,
+        }
+    }
 }
 
 impl Cli {
@@ -463,13 +511,24 @@ async fn main() -> Result<()> {
         line_buffer_size: p_line_buffer_size.value,
     };
 
-    let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
+    let downloader =
+        StreamingDownloader::new(s3_client.get_client().await?, download_config.clone());
 
     // Resolve output configuration before listing — fail fast if misconfigured.
-    let resolved_output = resolve_output(
-        &cli.to_output_cli(),
-        config.as_ref().unwrap_or(&ConfigSchema::default()),
-    )?;
+    // In tune mode the sink is always void (read-side tuning), so we skip
+    // resolution entirely and warn if the operator passed output flags that
+    // will be ignored.
+    let resolved_output = if cli.tune {
+        if !cli.to_output_cli().is_empty() {
+            warn!("--tune ignores --output* flags; tuning always uses the void sink");
+        }
+        OutputConfig::Void
+    } else {
+        resolve_output(
+            &cli.to_output_cli(),
+            config.as_ref().unwrap_or(&ConfigSchema::default()),
+        )?
+    };
 
     // Emit the effective-parameter report at startup so operators can see
     // exactly what defaults and inferences are in play before any work
@@ -532,7 +591,13 @@ async fn main() -> Result<()> {
         OutputConfig::Void => info!(output_type = "void", "Sink configured"),
     }
 
-    let sink = build_sink(&resolved_output, &s3_client, p_max_retries.value).await?;
+    // The configured sink is only built for a real run; `--tune` builds a
+    // fresh void sink per trial inside the tuner.
+    let sink = if cli.tune {
+        None
+    } else {
+        Some(build_sink(&resolved_output, &s3_client, p_max_retries.value).await?)
+    };
 
     // List all objects in parallel across all buckets × hourly prefixes
     let mut all_bucket_objects = {
@@ -686,10 +751,45 @@ async fn main() -> Result<()> {
         "Processing objects"
     );
 
+    // ── Auto-tune mode: search the read-side knobs and emit a profile ───────
+    if cli.tune {
+        let tune_seed = cli
+            .tune_seed
+            .or(cli.sampling_seed)
+            .or_else(|| config.as_ref().and_then(|c| c.sampling_seed))
+            .unwrap_or(0);
+        let tune_cfg = TuneConfig {
+            objective: cli.tune_objective.into(),
+            sample_bytes: (cli.tune_sample_gb * 1_000_000_000.0) as u64,
+            seed: tune_seed,
+            max_trials: cli.tune_max_trials,
+            ..TuneConfig::default()
+        };
+        let report = tune::run_tune(
+            s3_client.get_client().await?,
+            download_config,
+            &all_bucket_objects,
+            searcher.clone(),
+            tune_cfg,
+        )
+        .await?;
+
+        println!("{}", report.flag_string());
+        if let Some(path) = &cli.tune_output {
+            std::fs::write(path, serde_json::to_string_pretty(&report.to_json())?)
+                .with_context(|| format!("writing tune profile to {}", path.display()))?;
+            info!(path = %path.display(), "Wrote tune profile");
+        }
+        return Ok(());
+    }
+
+    let sink = sink.expect("non-tune mode always builds a sink");
     let batch_start = std::time::Instant::now();
-    let (files_searched, matched_lines) = downloader
+    let outcome = downloader
         .search_objects(&all_bucket_objects, searcher.clone(), sink.clone())
         .await?;
+    let files_searched = outcome.files_searched;
+    let matched_lines = outcome.total_matches;
 
     let stats = sink.finish().await?;
     report_completion(

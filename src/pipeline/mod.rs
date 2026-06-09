@@ -19,7 +19,7 @@ pub use framing::{FramedEncoder, OutputFormat};
 pub use http_sink::HttpOutputSink;
 pub use http_writer::{HttpResultWriter, HttpWriterConfig, HttpWriterStats};
 pub use observer::{ChannelObserver, DownloadObserver, PipelineObserver};
-pub use orchestrator::{StreamingDownloader, StreamingDownloaderConfig};
+pub use orchestrator::{RunOutcome, StreamingDownloader, StreamingDownloaderConfig};
 pub use output::{OutputSink, OutputStats, SinkObservability};
 pub use s3_writer::S3OutputSink;
 pub use streaming_writer::{FileWriterStats, SharedFileWriter};

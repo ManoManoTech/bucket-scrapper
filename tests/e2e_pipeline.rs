@@ -242,6 +242,89 @@ async fn file_output_end_to_end_sharded() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_tune_end_to_end() {
+    skip_unless_docker!();
+    if let Err(e) = run_tune_test().await {
+        panic!("auto_tune_end_to_end failed: {e:#}");
+    }
+}
+
+/// `--tune` smoke test against the real Garage fixture: the tuner must run a
+/// handful of trials over the read-side pipeline (void sink), print a
+/// ready-to-paste flag string, and emit a parseable JSON profile naming the
+/// best read-side knobs.
+async fn run_tune_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    let s3 = garage.s3_client();
+    let staged = build_fixture(DATE, HOURS);
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    // No `outputs:` block — tune mode forces the void sink and skips output
+    // resolution entirely.
+    let config_path = workdir.path().join("config.yaml");
+    write_config_yaml_with_codec(&config_path, None, None)?;
+    let profile_path = workdir.path().join("tune-profile.json");
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    let assert = cmd
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--tune")
+        .arg("--tune-max-trials")
+        .arg("3")
+        .arg("--tune-seed")
+        .arg("1")
+        .arg("--tune-output")
+        .arg(&profile_path)
+        .arg("--log-format")
+        .arg("json")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    // The flag string is printed to stdout.
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.lines().any(|l| l.contains("--max-parallel")
+            && l.contains("--filter-tasks")
+            && l.contains("--line-buffer-size")),
+        "expected a flag-string line on stdout, got:\n{stdout}"
+    );
+
+    // The JSON profile must exist and name the best read-side knobs.
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&profile_path)?)?;
+    let best = &json["best"];
+    assert!(best["max_parallel"].as_u64().is_some(), "profile: {json}");
+    assert!(best["filter_tasks"].as_u64().is_some(), "profile: {json}");
+    assert!(
+        best["line_buffer_size"].as_u64().is_some(),
+        "profile: {json}"
+    );
+    assert!(
+        json["trials"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "profile must record trials: {json}"
+    );
+    Ok(())
+}
+
 /// Three independent scrapper invocations against the same Garage fixture,
 /// each owning one of three shards. The union of their outputs must equal the
 /// no-shard expected set (coverage), and total line count across shards must

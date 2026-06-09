@@ -87,6 +87,25 @@ impl Read for ChunkReader {
     }
 }
 
+/// Outcome of a single [`StreamingDownloader::search_objects`] run.
+///
+/// Carries both the user-facing counts and the read-side telemetry the
+/// auto-tuner needs to score a trial: total bytes pulled from S3, total
+/// bytes that entered the filter stage, wall-clock elapsed, and the
+/// per-tick bottleneck histogram (see [`crate::progress::dominant_label`]).
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub files_searched: usize,
+    pub total_matches: usize,
+    /// Raw bytes downloaded from S3 (compressed, pre-decompression).
+    pub downloaded_bytes: usize,
+    /// Decompressed bytes that entered the filter stage.
+    pub filter_bytes_in: usize,
+    pub elapsed: Duration,
+    /// Histogram of per-tick bottleneck labels over the run.
+    pub bottleneck_tally: HashMap<&'static str, u64>,
+}
+
 /// Configuration for the streaming downloader
 #[derive(Clone)]
 pub struct StreamingDownloaderConfig {
@@ -150,17 +169,24 @@ impl StreamingDownloader {
     /// entire download+decompress duration (S3 connection stays open).
     /// On transient errors, range-based resume retries from the last byte offset.
     ///
-    /// Returns (files_searched, total_matches)
+    /// Returns a [`RunOutcome`] with the counts plus read-side telemetry.
     pub async fn search_objects(
         &self,
         objects: &[S3ObjectInfo],
         searcher: Arc<LineMatcher>,
         sink: Arc<dyn OutputSink>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<RunOutcome> {
         let pipeline = sink.observer();
         let fatal_error = sink.fatal_error_flag();
         if objects.is_empty() {
-            return Ok((0, 0));
+            return Ok(RunOutcome {
+                files_searched: 0,
+                total_matches: 0,
+                downloaded_bytes: 0,
+                filter_bytes_in: 0,
+                elapsed: Duration::ZERO,
+                bottleneck_tally: HashMap::new(),
+            });
         }
 
         // Sort objects by source prefix so the bounded download semaphore
@@ -431,13 +457,28 @@ impl StreamingDownloader {
         // Emit a final progress report so the last log line carries the accurate
         // end-of-run totals (filter input volume, matched ratios, etc.) — useful
         // for short runs where the periodic ticker may only have fired at t=0.
-        let files_searched = {
+        // Snapshot the read-side telemetry from the same locked progress so the
+        // auto-tuner can score this trial without scraping logs.
+        let (files_searched, downloaded_bytes, filter_bytes_in_total, elapsed, bottleneck_tally) = {
             let mut prog = progress.lock().await;
             prog.report();
-            prog.files_processed
+            (
+                prog.files_processed,
+                prog.download_observer.bytes(),
+                prog.filter_bytes_in.load(Ordering::Relaxed),
+                prog.start_time.elapsed(),
+                prog.bottleneck_tally.clone(),
+            )
         };
 
-        Ok((files_searched, total_matches))
+        Ok(RunOutcome {
+            files_searched,
+            total_matches,
+            downloaded_bytes,
+            filter_bytes_in: filter_bytes_in_total,
+            elapsed,
+            bottleneck_tally,
+        })
     }
 
     /// Coordinates download+decompress tasks using semaphore + JoinSet.

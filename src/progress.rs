@@ -1,6 +1,7 @@
 //! Cross-cutting progress tracking for the download → search → export pipeline.
 
 use crate::pipeline::{ChannelObserver, DownloadObserver, PipelineObserver, SinkObservability};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,6 +100,11 @@ pub struct PipelineProgress {
     /// `sink.type_name()` snapshot, used by the classifier to pick the
     /// right per-sink drill-down label (`sink_s3_*`, `sink_file`, ...).
     pub sink_kind: &'static str,
+    /// Per-tick histogram of the classified bottleneck label. Accumulated
+    /// across every `report()` call so callers (e.g. the auto-tuner) can
+    /// ask which stage was the dominant lid over a whole run, instead of
+    /// scraping log lines. See [`dominant_label`].
+    pub bottleneck_tally: HashMap<&'static str, u64>,
 }
 
 impl PipelineProgress {
@@ -144,6 +150,7 @@ impl PipelineProgress {
             workers_in_ingest,
             sink_obs,
             sink_kind,
+            bottleneck_tally: HashMap::new(),
         }
     }
 
@@ -217,6 +224,7 @@ impl PipelineProgress {
                 in_ingest,
                 self.total_workers,
             );
+            *self.bottleneck_tally.entry(bottleneck).or_insert(0) += 1;
 
             let throttle_mbps = pipe.throttle_rate_mbps();
 
@@ -263,6 +271,7 @@ impl PipelineProgress {
                 sink_active_uploads,
                 self.sink_kind,
             );
+            *self.bottleneck_tally.entry(bottleneck).or_insert(0) += 1;
 
             info!(
                 files_done = self.files_processed,
@@ -295,6 +304,18 @@ impl PipelineProgress {
         self.prev_filter_bytes_in = filter_bytes_now;
         self.last_report_time = std::time::Instant::now();
     }
+}
+
+/// Pick the most-frequently-observed bottleneck label from a tally.
+///
+/// Ties are broken deterministically by label string (lexicographically
+/// smallest wins) so repeated tuner runs over identical input agree on the
+/// dominant stage. Returns `None` for an empty tally.
+pub fn dominant_label(tally: &HashMap<&'static str, u64>) -> Option<&'static str> {
+    tally
+        .iter()
+        .max_by(|(la, ca), (lb, cb)| ca.cmp(cb).then_with(|| lb.cmp(la)))
+        .map(|(label, _)| *label)
 }
 
 /// Classify the dominant pipeline bottleneck for the HTTP-output path.
@@ -531,6 +552,30 @@ mod tests {
             classify_bottleneck_non_http(90, 4, 8, Some(999_999), Some(0), "s3"),
             "sink_s3_codec"
         );
+    }
+
+    #[test]
+    fn dominant_label_picks_max_count() {
+        let mut t = HashMap::new();
+        t.insert("download", 3u64);
+        t.insert("filter", 7u64);
+        assert_eq!(dominant_label(&t), Some("filter"));
+    }
+
+    #[test]
+    fn dominant_label_breaks_ties_lexicographically() {
+        // Equal counts → smallest label wins, deterministically, regardless
+        // of HashMap iteration order.
+        let mut t = HashMap::new();
+        t.insert("filter", 5u64);
+        t.insert("download", 5u64);
+        assert_eq!(dominant_label(&t), Some("download"));
+    }
+
+    #[test]
+    fn dominant_label_empty_is_none() {
+        let t: HashMap<&'static str, u64> = HashMap::new();
+        assert_eq!(dominant_label(&t), None);
     }
 
     #[test]
