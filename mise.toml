@@ -2,4 +2,6 @@
 "cargo:cargo-audit" = "latest"
 "cargo:samply" = "latest"
 lefthook = "latest"
-rust = "latest"
+# Pinned (not "latest", which froze to a stale install and drifted behind CI).
+# Keep this in lockstep with the toolchain in .github/workflows/ci.yml.
+rust = "1.96.0"
