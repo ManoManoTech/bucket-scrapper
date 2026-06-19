@@ -9,8 +9,8 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ConfigSchema> {
     let config_str = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
 
-    let config: ConfigSchema =
-        serde_yaml::from_str(&config_str).with_context(|| "Failed to parse YAML config")?;
+    let config: ConfigSchema = serde_yaml::from_str(&config_str)
+        .with_context(|| format!("Failed to parse YAML config {}", path.as_ref().display()))?;
 
     info!(buckets = config.buckets.len(), "Config loaded");
     Ok(config)

@@ -320,6 +320,32 @@ Usage: bucket-scrapper [OPTIONS] --start <START>
 | `--http-upload-tasks` | 4x compressors | Concurrent upload tasks |
 | `--http-upload-channel-size` | 4 | Batch channel size |
 
+## Parallel chunked download
+
+By default each S3 object is one download task. When a run targets few
+dates/hours it often hits a handful of very large objects, so download
+concurrency collapses to that object count and S3 bandwidth is wasted.
+
+`--download-chunk-size-mb <N>` (0 = off) splits each object into `N`-MB
+byte-ranges fetched **concurrently** and reassembled **in order** before the
+(sequential) decoder — so even one giant object saturates many S3 connections.
+Out-of-order ranges are held in a startup-capped pool:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--download-chunk-size-mb` | 0 (off) | Range size; >0 enables chunking |
+| `--max-input-buffer-memory-mb` | 4096 | B1 pool cap: resident chunk bytes (bounds RSS, backpressures) |
+| `--decode-input-buffer-mb` | 128 | B2 per-file decode-input buffer |
+| `--max-parallel-files` | `--max-parallel` | Concurrent file decoders |
+| `--max-parallel` | `max(8, cpus)` | Concurrent range GETs |
+
+Because gzip/zstd decode sequentially, chunking parallelizes the *network*; a
+single huge object can then become `decompress`-bound (see the bottleneck
+labels). The progress logs expose per-buffer occupancy — `dl_active`,
+`chunks_remaining`, `b1_held_mb`/`pool_used_mb`/`pool_peak_mb`/`pool_waiters`,
+`b2_used_mb`/`b2_pct`, `decoders_input_wait`, `reassembly_blocked` — and the
+runtime report prints every buffer's capacity with provenance.
+
 ## Profiling
 
 **CPU**: Use samply with the profiling build profile.
@@ -339,7 +365,9 @@ Every `Search progress` log record carries a `bottleneck` field that names the s
 
 ### Label meanings
 
-- **`download`** — `dc_pct` is low. The download stage isn't filling the line channel fast enough. Causes: S3 per-connection throughput, network bandwidth, low `--max-parallel`, or storage class.
+- **`download`** — `dc_pct` low, decoders starved (`decoders_input_wait` high), nothing reassembly-blocked. The network isn't delivering bytes fast enough. Causes: S3 per-connection throughput, network bandwidth, low `--max-parallel`, or storage class. With few large objects, enable parallel chunked download (`--download-chunk-size-mb`) so one object is fetched as many concurrent ranges.
+- **`decompress`** — `dc_pct` low (the line channel B3 has room) but decoders are *not* starved (`decoders_input_wait` low): they have input queued in B2 yet can't convert it fast enough. The per-file decoder (zstd / gzip) CPU is the lid. This is inherently sequential per object, so it can become the ceiling once chunked download removes the network bottleneck. Mitigate with more concurrent objects/decoders (`--max-parallel-files`) or, for huge single files, accept it as the per-stream limit.
+- **`chunk_reassembly`** *(chunked download only)* — decoders starved **and** `reassembly_blocked > 0`: a later byte-range is buffered in the pool (B1) but the next in-order one hasn't arrived (head-of-line). Should be rare thanks to ordered dispatch; sustained values suggest a slow/failing range or too small a look-ahead.
 - **`filter`** — `dc_pct` high, `workers_in_ingest` low. Filter workers are spending their time on regex matching or waiting on channel receives. Causes: an expensive regex, lots of non-matching lines, or simply too few filter workers (`--filter-tasks`).
 - **`sink_s3_codec`** — `dc_pct` high, `workers_in_ingest` high, sink mpsc is roughly empty. Workers are in `sink.ingest` but bytes are leaving fast — the codec (zstd / gzip) is the producer-side cost. Try `--compression-format none`, raise the level only with eyes on this label, or look at per-prefix lock contention if you have many concurrent prefixes hitting the same per-prefix mutex.
 - **`sink_s3_network`** — `dc_pct` high, `workers_in_ingest` high, sink mpsc is backed up. `ChannelWriter::blocking_send` is waiting because TM / S3 isn't accepting parts fast enough. Causes: network bandwidth ceiling, `multipart_concurrency` set too low, S3 throttling.

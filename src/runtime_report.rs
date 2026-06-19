@@ -348,6 +348,13 @@ pub struct PipelineParams {
     pub progress_interval_s: Param<f64>,
     pub filter_tasks: Param<usize>,
     pub line_buffer_size: Param<usize>,
+    // ── Parallel chunked download (None ⇒ disabled) ──
+    pub chunk_size: Option<usize>,
+    pub file_slots: usize,
+    pub file_slots_user_set: bool,
+    pub file_slots_clamped: bool,
+    pub max_input_buffer_bytes: usize,
+    pub decode_input_buffer_bytes: usize,
 }
 
 /// Build the effective-parameter report.
@@ -392,6 +399,64 @@ pub fn build_report(pipeline: &PipelineParams, resolved_output: &OutputConfig) -
         "source.decompress.chunk_channel_capacity",
         4,
     ));
+
+    // ── source.download (parallel chunked download) + buffer budget ─────────
+    match pipeline.chunk_size {
+        None => out.push(ReportEntry::static_default(
+            "source.download.chunk_size_mb",
+            "disabled",
+        )),
+        Some(cs) => {
+            let cs_mb = cs / 1_000_000;
+            out.push(ReportEntry::user_defined(
+                "source.download.chunk_size_mb",
+                cs_mb,
+            ));
+            // file_slots: user-set, clamped, or inferred from max_parallel.
+            out.push(if pipeline.file_slots_clamped {
+                ReportEntry::inferred_from_setting(
+                    "source.download.file_slots",
+                    pipeline.file_slots,
+                    "min(requested, max_input_buffer / chunk_size)",
+                    "clamped so pool ≥ file_slots × chunk_size",
+                )
+            } else if pipeline.file_slots_user_set {
+                ReportEntry::user_defined("source.download.file_slots", pipeline.file_slots)
+            } else {
+                ReportEntry::inferred_from_default(
+                    "source.download.file_slots",
+                    pipeline.file_slots,
+                    "= max_parallel",
+                    format!("max_parallel = {}", pipeline.max_parallel.value),
+                )
+            });
+            // B1 reassembly pool.
+            out.push(ReportEntry::user_defined(
+                "buffer.b1_input_pool_mb",
+                pipeline.max_input_buffer_bytes / 1_000_000,
+            ));
+            out.push(ReportEntry::inferred_from_setting(
+                "buffer.b1_pool_slots",
+                pipeline.max_input_buffer_bytes / cs.max(1),
+                "max_input_buffer / chunk_size",
+                format!(
+                    "pool {} MB / chunk {cs_mb} MB",
+                    pipeline.max_input_buffer_bytes / 1_000_000
+                ),
+            ));
+            // B2 decode-input.
+            out.push(ReportEntry::user_defined(
+                "buffer.b2_decode_input_mb_per_file",
+                pipeline.decode_input_buffer_bytes / 1_000_000,
+            ));
+            out.push(ReportEntry::inferred_from_setting(
+                "buffer.b2_decode_input_mb_total",
+                (pipeline.decode_input_buffer_bytes / 1_000_000) * pipeline.file_slots,
+                "decode_input × file_slots",
+                format!("file_slots = {}", pipeline.file_slots),
+            ));
+        }
+    }
 
     // ── filter ─────────────────────────────────────────────────────────────
     out.push(pipeline.filter_tasks.clone().into_entry("filter.tasks"));
@@ -888,6 +953,12 @@ mod tests {
                 "available_parallelism = 32".into(),
             ),
             line_buffer_size: Param::static_default(1000),
+            chunk_size: None,
+            file_slots: 64,
+            file_slots_user_set: false,
+            file_slots_clamped: false,
+            max_input_buffer_bytes: 4096 * 1_000_000,
+            decode_input_buffer_bytes: 128 * 1_000_000,
         }
     }
 

@@ -15,7 +15,13 @@ buckets:
 region: eu-west-3
 
 # Output configuration
-output_dir: ./scrapper-output
+# NOTE: there is no top-level `output_dir` key. Output is either:
+#   - driven entirely from the CLI (e.g. `--output-dir ./scrapper-output`), or
+#   - declared here via an `outputs:` list (config-driven mode).
+# Mixing the two is a hard error. Example config-driven file sink:
+# outputs:
+#   - type: file
+#     dir: ./scrapper-output
 
 # Note: AWS credentials should be configured via:
 # - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)

@@ -1,6 +1,8 @@
 //! Cross-cutting progress tracking for the download → search → export pipeline.
 
-use crate::pipeline::{ChannelObserver, DownloadObserver, PipelineObserver, SinkObservability};
+use crate::pipeline::{
+    ChannelObserver, DownloadObserver, PipelineObserver, ReadPathMetrics, SinkObservability,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,6 +101,9 @@ pub struct PipelineProgress {
     /// `sink.type_name()` snapshot, used by the classifier to pick the
     /// right per-sink drill-down label (`sink_s3_*`, `sink_file`, ...).
     pub sink_kind: &'static str,
+    /// Read-path gauges (chunked download + B1/B2 buffering). Read each tick;
+    /// drives the `download`/`chunk_reassembly`/`decompress` split.
+    pub read_metrics: Arc<ReadPathMetrics>,
 }
 
 impl PipelineProgress {
@@ -119,6 +124,7 @@ impl PipelineProgress {
         workers_in_ingest: IngestGauge,
         sink_obs: SinkObservability,
         sink_kind: &'static str,
+        read_metrics: Arc<ReadPathMetrics>,
     ) -> Self {
         let now = std::time::Instant::now();
         Self {
@@ -144,6 +150,7 @@ impl PipelineProgress {
             workers_in_ingest,
             sink_obs,
             sink_kind,
+            read_metrics,
         }
     }
 
@@ -196,6 +203,33 @@ impl PipelineProgress {
             .as_ref()
             .map(|a| a.load(Ordering::Relaxed));
 
+        // Read-path gauges: B1 (pool) → B2 (decode-input) → B3 (line channel).
+        let rm = &self.read_metrics;
+        let dl_active = rm.dl_active.load(Ordering::Relaxed);
+        let files_in_flight = rm.files_in_flight.load(Ordering::Relaxed);
+        let chunks_remaining = rm.chunks_remaining.load(Ordering::Relaxed);
+        let b1_held = rm.b1_held_bytes.load(Ordering::Relaxed);
+        let b2_used = rm.b2_used_bytes.load(Ordering::Relaxed);
+        let b2_pct = if rm.b2_capacity > 0 {
+            (b2_used * 100 / rm.b2_capacity).min(100)
+        } else {
+            0
+        };
+        let reassembly_blocked = rm.reassembly_blocked.load(Ordering::Relaxed);
+        let decoders_input_wait = rm.decoders_input_wait.load(Ordering::Relaxed);
+        let (pool_used_mb, pool_total_mb, pool_peak_mb, pool_waiters) = match &rm.pool {
+            Some(p) => {
+                let s = p.stats();
+                (
+                    s.used / 1_000_000,
+                    s.total / 1_000_000,
+                    s.peak / 1_000_000,
+                    s.waiters,
+                )
+            }
+            None => (0, 0, 0, 0),
+        };
+
         if let Some(ref pipe) = self.pipeline {
             let uploaded_now = pipe.compressed_bytes_sent();
             let upload_delta = uploaded_now - self.prev_uploaded_bytes;
@@ -246,6 +280,18 @@ impl PipelineProgress {
                 avg_upload_ms = format_args!("{:.1}", pipe.avg_upload_ms()),
                 workers_alive = self.workers_alive.load(Ordering::Relaxed),
                 workers_in_ingest = in_ingest,
+                dl_active = dl_active,
+                files_in_flight = files_in_flight,
+                chunks_remaining = chunks_remaining,
+                b1_held_mb = b1_held / 1_000_000,
+                b2_used_mb = b2_used / 1_000_000,
+                b2_pct = b2_pct,
+                decoders_input_wait = decoders_input_wait,
+                reassembly_blocked = reassembly_blocked,
+                pool_used_mb = pool_used_mb,
+                pool_total_mb = pool_total_mb,
+                pool_peak_mb = pool_peak_mb,
+                pool_waiters = pool_waiters,
                 open_fds = open_fds(),
                 rss_mb = rss_mb(),
                 bottleneck = bottleneck,
@@ -262,6 +308,9 @@ impl PipelineProgress {
                 sink_inflight_bytes,
                 sink_active_uploads,
                 self.sink_kind,
+                decoders_input_wait,
+                files_in_flight,
+                reassembly_blocked,
             );
 
             info!(
@@ -281,6 +330,18 @@ impl PipelineProgress {
                 dc_ch = format_args!("{dc_len}/{dc_cap}"),
                 workers_alive = self.workers_alive.load(Ordering::Relaxed),
                 workers_in_ingest = in_ingest,
+                dl_active = dl_active,
+                files_in_flight = files_in_flight,
+                chunks_remaining = chunks_remaining,
+                b1_held_mb = b1_held / 1_000_000,
+                b2_used_mb = b2_used / 1_000_000,
+                b2_pct = b2_pct,
+                decoders_input_wait = decoders_input_wait,
+                reassembly_blocked = reassembly_blocked,
+                pool_used_mb = pool_used_mb,
+                pool_total_mb = pool_total_mb,
+                pool_peak_mb = pool_peak_mb,
+                pool_waiters = pool_waiters,
                 sink_inflight_bytes = sink_inflight_bytes,
                 sink_active_uploads = sink_active_uploads,
                 open_fds = open_fds(),
@@ -351,6 +412,16 @@ fn classify_bottleneck_http(
 /// - `sink_void` — should never realistically fire (void's `ingest` is a
 ///   counter bump); included for completeness so the classifier returns
 ///   a meaningful label rather than falling through.
+///
+/// When the decompressed-line channel (B3) is **not** full, upstream can't fill
+/// it. The B2/reassembly signals split that formerly-catch-all `download` case:
+/// - `decompress` — decoders have input (few are waiting on B2) yet B3 still
+///   isn't full: the decoder CPU is the lid.
+/// - `chunk_reassembly` — decoders are starved and a file is head-of-line
+///   blocked (a later chunk is buffered but the next in-order one isn't).
+/// - `download` — decoders are starved and nothing's reassembly-blocked: the
+///   network isn't delivering.
+#[allow(clippy::too_many_arguments)]
 fn classify_bottleneck_non_http(
     dc_pct: usize,
     in_ingest: usize,
@@ -358,8 +429,18 @@ fn classify_bottleneck_non_http(
     sink_inflight_bytes: Option<u64>,
     sink_active_uploads: Option<usize>,
     sink_kind: &str,
+    decoders_input_wait: usize,
+    files_in_flight: usize,
+    reassembly_blocked: usize,
 ) -> &'static str {
     if dc_pct <= 80 {
+        // B3 has room — the lid is upstream of the filter stage.
+        if decoders_decompress_bound(decoders_input_wait, files_in_flight) {
+            return "decompress";
+        }
+        if reassembly_blocked > 0 {
+            return "chunk_reassembly";
+        }
         return "download";
     }
     if !sink_is_busy(in_ingest, total_workers) {
@@ -386,6 +467,14 @@ fn classify_bottleneck_non_http(
 /// dominant cost — over half the workers are doing other work.
 fn sink_is_busy(in_ingest: usize, total_workers: usize) -> bool {
     in_ingest * 2 >= total_workers.max(1)
+}
+
+/// `true` when decoders have input to chew on (fewer than half are blocked
+/// waiting for B2) — so if the line channel still isn't full, the decoder CPU
+/// is the lid. Requires at least one live decoder. Mirrors [`sink_is_busy`]'s
+/// majority threshold on the input-wait gauge.
+fn decoders_decompress_bound(decoders_input_wait: usize, files_in_flight: usize) -> bool {
+    files_in_flight > 0 && decoders_input_wait * 2 < files_in_flight
 }
 
 /// Heuristic: the S3 sink's mpsc channels are considered "backed up" when
@@ -450,12 +539,12 @@ mod tests {
     fn non_http_dc_empty_reports_download() {
         for kind in ["file", "s3", "void"] {
             assert_eq!(
-                classify_bottleneck_non_http(0, 0, 8, None, None, kind),
+                classify_bottleneck_non_http(0, 0, 8, None, None, kind, 0, 0, 0),
                 "download",
                 "kind={kind}"
             );
             assert_eq!(
-                classify_bottleneck_non_http(80, 8, 8, None, None, kind),
+                classify_bottleneck_non_http(80, 8, 8, None, None, kind, 0, 0, 0),
                 "download",
                 "kind={kind}"
             );
@@ -468,12 +557,12 @@ mod tests {
         // lid (regex, channel-recv, work that doesn't touch the sink).
         for kind in ["file", "s3", "void"] {
             assert_eq!(
-                classify_bottleneck_non_http(90, 0, 8, None, None, kind),
+                classify_bottleneck_non_http(90, 0, 8, None, None, kind, 0, 0, 0),
                 "filter",
                 "kind={kind}"
             );
             assert_eq!(
-                classify_bottleneck_non_http(90, 3, 8, None, None, kind),
+                classify_bottleneck_non_http(90, 3, 8, None, None, kind, 0, 0, 0),
                 "filter",
                 "kind={kind} below-half threshold"
             );
@@ -484,16 +573,16 @@ mod tests {
     fn non_http_dc_full_busy_sink_picks_per_sink_label() {
         // half-or-more workers stuck in sink.ingest → the sink is the lid.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, None, None, "file"),
+            classify_bottleneck_non_http(90, 4, 8, None, None, "file", 0, 0, 0),
             "sink_file"
         );
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, None, None, "void"),
+            classify_bottleneck_non_http(90, 4, 8, None, None, "void", 0, 0, 0),
             "sink_void"
         );
         // Unknown sink — fall back to a generic, honest label.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, None, None, "exotic"),
+            classify_bottleneck_non_http(90, 4, 8, None, None, "exotic", 0, 0, 0),
             "sink_busy"
         );
     }
@@ -502,13 +591,13 @@ mod tests {
     fn non_http_s3_distinguishes_codec_vs_network() {
         // sink busy + S3 mpsc nearly empty → producer (codec) is the lid.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, Some(0), Some(4), "s3"),
+            classify_bottleneck_non_http(90, 4, 8, Some(0), Some(4), "s3", 0, 0, 0),
             "sink_s3_codec"
         );
         // sink busy + S3 mpsc backed up → consumer (TM / network) is the lid.
         // 4 active × 128 KB threshold = 512 KB, so 1 MB inflight crosses it.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, Some(1024 * 1024), Some(4), "s3"),
+            classify_bottleneck_non_http(90, 4, 8, Some(1024 * 1024), Some(4), "s3", 0, 0, 0),
             "sink_s3_network"
         );
     }
@@ -519,18 +608,62 @@ mod tests {
         // production but worth being explicit), we prefer to say `codec`
         // rather than falsely blame the network.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, None, Some(4), "s3"),
+            classify_bottleneck_non_http(90, 4, 8, None, Some(4), "s3", 0, 0, 0),
             "sink_s3_codec"
         );
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, Some(1024 * 1024), None, "s3"),
+            classify_bottleneck_non_http(90, 4, 8, Some(1024 * 1024), None, "s3", 0, 0, 0),
             "sink_s3_codec"
         );
         // Zero active uploads with high inflight is nonsensical, treat as codec.
         assert_eq!(
-            classify_bottleneck_non_http(90, 4, 8, Some(999_999), Some(0), "s3"),
+            classify_bottleneck_non_http(90, 4, 8, Some(999_999), Some(0), "s3", 0, 0, 0),
             "sink_s3_codec"
         );
+    }
+
+    // B3-has-room split: decompress vs chunk_reassembly vs download.
+
+    #[test]
+    fn non_http_decompress_when_decoders_busy_and_b3_has_room() {
+        // dc_pct ≤ 80 (B3 has room) + decoders mostly NOT waiting for input
+        // (1 of 8) → the decoder CPU is the lid.
+        assert_eq!(
+            classify_bottleneck_non_http(50, 0, 8, None, None, "file", 1, 8, 0),
+            "decompress"
+        );
+    }
+
+    #[test]
+    fn non_http_chunk_reassembly_when_starved_and_blocked() {
+        // Decoders starved (all 8 waiting) AND a file is head-of-line blocked.
+        assert_eq!(
+            classify_bottleneck_non_http(10, 0, 8, None, None, "s3", 8, 8, 1),
+            "chunk_reassembly"
+        );
+    }
+
+    #[test]
+    fn non_http_download_when_starved_not_blocked() {
+        // Starved, nothing reassembly-blocked → network is the lid.
+        assert_eq!(
+            classify_bottleneck_non_http(10, 0, 8, None, None, "s3", 8, 8, 0),
+            "download"
+        );
+        // Startup: no live decoders yet → download, not decompress.
+        assert_eq!(
+            classify_bottleneck_non_http(0, 0, 8, None, None, "file", 0, 0, 0),
+            "download"
+        );
+    }
+
+    #[test]
+    fn decoders_decompress_bound_threshold() {
+        assert!(!decoders_decompress_bound(0, 0)); // no decoders
+        assert!(decoders_decompress_bound(0, 4)); // none waiting → busy
+        assert!(decoders_decompress_bound(1, 4)); // 1 of 4 waiting → busy
+        assert!(!decoders_decompress_bound(2, 4)); // half waiting → not bound
+        assert!(!decoders_decompress_bound(4, 4)); // all waiting → starved
     }
 
     #[test]

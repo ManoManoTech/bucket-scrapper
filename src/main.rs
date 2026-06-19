@@ -109,6 +109,28 @@ struct Cli {
     #[arg(long)]
     line_buffer_size: Option<usize>,
 
+    /// Parallel chunked download: split each object into byte-ranges of this
+    /// many MB, fetched concurrently and reassembled in order before the
+    /// decoder. `0` disables (one stream per object). Multiplies download
+    /// concurrency when a run hits a few very large objects.
+    #[arg(long, default_value = "0")]
+    download_chunk_size_mb: u64,
+
+    /// B1 input-buffer pool cap in MB — total resident download-chunk bytes.
+    /// Only used when chunking is enabled; set generously (bounds RSS + provides
+    /// backpressure). Default 4096.
+    #[arg(long, default_value = "4096")]
+    max_input_buffer_memory_mb: u64,
+
+    /// B2 decode-input buffer per file in MB — bytes queued ahead of each
+    /// decoder. Default 128.
+    #[arg(long, default_value = "128")]
+    decode_input_buffer_mb: u64,
+
+    /// Max concurrent file decoders (live reassemblers). Default = --max-parallel.
+    #[arg(long)]
+    max_parallel_files: Option<usize>,
+
     /// Memory limit in GB (enforced via setrlimit RLIMIT_AS, 0 = no limit)
     #[arg(long, default_value = "0")]
     memory_limit_gb: u64,
@@ -387,7 +409,7 @@ async fn main() -> Result<()> {
                 Some(cfg)
             }
             Err(e) => {
-                info!(path = %cli.config.display(), error = %e, "Could not load config");
+                warn!(path = %cli.config.display(), error = format!("{e:#}"), "Could not load config");
                 None
             }
         }
@@ -454,6 +476,34 @@ async fn main() -> Result<()> {
         runtime_report::cli_or_inferred(cli.filter_tasks, runtime_report::infer_filter_tasks());
     let p_line_buffer_size = runtime_report::cli_or_static(cli.line_buffer_size, 1000);
 
+    // Chunked-download / input-buffer resolution.
+    let chunk_size_bytes = (cli.download_chunk_size_mb * 1_000_000) as usize;
+    let chunk_size = (chunk_size_bytes > 0).then_some(chunk_size_bytes);
+    let max_input_buffer_bytes = (cli.max_input_buffer_memory_mb * 1_000_000) as usize;
+    let decode_input_buffer_bytes = (cli.decode_input_buffer_mb * 1_000_000) as usize;
+    let requested_file_slots = cli.max_parallel_files.unwrap_or(p_max_parallel.value);
+    // Deadlock-safety invariant: the pool must hold at least one in-order chunk
+    // per live file. Clamp file_slots if the operator asked for more than the
+    // pool can back.
+    let file_slots = match chunk_size {
+        Some(cs) => {
+            let max_files = (max_input_buffer_bytes / cs.max(1)).max(1);
+            if requested_file_slots > max_files {
+                warn!(
+                    requested = requested_file_slots,
+                    clamped_to = max_files,
+                    pool_mb = cli.max_input_buffer_memory_mb,
+                    chunk_mb = cli.download_chunk_size_mb,
+                    "Clamping --max-parallel-files so pool ≥ file_slots × chunk_size"
+                );
+                max_files
+            } else {
+                requested_file_slots
+            }
+        }
+        None => requested_file_slots,
+    };
+
     let download_config = StreamingDownloaderConfig {
         max_concurrent_downloads: p_max_parallel.value,
         max_retries: p_max_retries.value,
@@ -461,6 +511,10 @@ async fn main() -> Result<()> {
         progress_interval: Duration::from_secs_f64(p_progress_interval.value),
         filter_tasks: p_filter_tasks.value,
         line_buffer_size: p_line_buffer_size.value,
+        chunk_size,
+        file_slots,
+        max_input_buffer_bytes,
+        decode_input_buffer_bytes,
     };
 
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
@@ -482,6 +536,12 @@ async fn main() -> Result<()> {
         progress_interval_s: p_progress_interval.clone(),
         filter_tasks: p_filter_tasks.clone(),
         line_buffer_size: p_line_buffer_size.clone(),
+        chunk_size,
+        file_slots,
+        file_slots_user_set: cli.max_parallel_files.is_some(),
+        file_slots_clamped: chunk_size.is_some() && file_slots < requested_file_slots,
+        max_input_buffer_bytes,
+        decode_input_buffer_bytes,
     };
     let perf_report = runtime_report::build_report(&pipeline_params, &resolved_output);
     runtime_report::emit("startup", &perf_report);

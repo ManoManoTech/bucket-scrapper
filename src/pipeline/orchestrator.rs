@@ -4,7 +4,8 @@
 //! bounded channel (`ChunkReader`), avoiding full-object buffering.  Retries
 //! resume mid-object using S3 range requests (`bytes=N-`).
 
-use super::observer::{ChannelObserver, DownloadObserver};
+use super::mem_pool::InputBufferPool;
+use super::observer::{ChannelObserver, DownloadObserver, InputWaitGuard, ReadPathMetrics};
 use super::output::OutputSink;
 use super::prefix_progress::PrefixProgress;
 use crate::matcher::LineMatcher;
@@ -59,13 +60,18 @@ struct ChunkReader {
     rx: flume::Receiver<Bytes>,
     /// Leftover bytes from the last chunk not yet consumed by `read()`.
     remainder: Bytes,
+    /// Read-path gauges: this is the B2 (decode-input) consumer, so it
+    /// decrements `b2_used_bytes` as it pulls chunks and marks
+    /// `decoders_input_wait` while blocked waiting for input.
+    metrics: Arc<ReadPathMetrics>,
 }
 
 impl ChunkReader {
-    fn new(rx: flume::Receiver<Bytes>) -> Self {
+    fn new(rx: flume::Receiver<Bytes>, metrics: Arc<ReadPathMetrics>) -> Self {
         Self {
             rx,
             remainder: Bytes::new(),
+            metrics,
         }
     }
 }
@@ -74,11 +80,21 @@ impl Read for ChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Serve leftover bytes from the previous chunk first.
         if self.remainder.is_empty() {
-            match self.rx.recv() {
-                Ok(chunk) => self.remainder = chunk,
-                // Sender dropped — EOF.
-                Err(_) => return Ok(0),
-            }
+            // While blocked here the decoder is starved of input (B2 empty) —
+            // the signal that distinguishes upstream-bound from decompress-bound.
+            let chunk = {
+                let _wait = InputWaitGuard::new(&self.metrics.decoders_input_wait);
+                match self.rx.recv() {
+                    Ok(chunk) => chunk,
+                    // Sender dropped — EOF.
+                    Err(_) => return Ok(0),
+                }
+            };
+            // These bytes have left B2 and are now being decompressed.
+            self.metrics
+                .b2_used_bytes
+                .fetch_sub(chunk.len() as u64, Ordering::Relaxed);
+            self.remainder = chunk;
         }
         let n = buf.len().min(self.remainder.len());
         buf[..n].copy_from_slice(&self.remainder[..n]);
@@ -87,9 +103,50 @@ impl Read for ChunkReader {
     }
 }
 
+/// Forward bytes into the B2 (decode-input) channel, accounting the occupancy.
+/// Increments `b2_used_bytes` **before** the send so the consumer's matching
+/// `fetch_sub` can't underflow. Returns `Err` if the receiver is gone.
+async fn forward_to_decoder(
+    chunk_tx: &flume::Sender<Bytes>,
+    chunk: Bytes,
+    metrics: &ReadPathMetrics,
+) -> std::result::Result<(), flume::SendError<Bytes>> {
+    metrics
+        .b2_used_bytes
+        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    chunk_tx.send_async(chunk).await
+}
+
+/// Outcome of a producer (single-stream or chunked reassembler) feeding the
+/// decoder. `ReceiverGone` means the decoder side dropped its receiver (it
+/// errored/cancelled) — the caller awaits the emit task to surface that error.
+enum Produced {
+    Done(usize),
+    ReceiverGone(usize),
+}
+
+/// RAII guard that bumps the `dl_active` (in-flight range GETs) gauge for the
+/// duration of a GET, decrementing on every exit path.
+struct ActiveGetGuard(Arc<AtomicUsize>);
+
+impl ActiveGetGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveGetGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Configuration for the streaming downloader
 #[derive(Clone)]
 pub struct StreamingDownloaderConfig {
+    /// Max concurrent S3 range GETs (chunks). One whole object counts as one
+    /// "range" when chunking is off, so small-file behavior is unchanged.
     pub max_concurrent_downloads: usize,
     pub max_retries: u32,
     pub initial_retry_delay: Duration,
@@ -99,6 +156,17 @@ pub struct StreamingDownloaderConfig {
     /// Line channel capacity between download+decompress and filter workers
     /// (RAM ≈ this × ~200 bytes avg line)
     pub line_buffer_size: usize,
+    /// Chunk size in bytes for parallel ranged download. `None` disables
+    /// chunking (one streamed GET per object — the original path). Objects
+    /// `≤ chunk_size` also take the single-stream path.
+    pub chunk_size: Option<usize>,
+    /// Max concurrent live file tasks (decoders). Bounds decoder threads and
+    /// the number of in-order reassemblers.
+    pub file_slots: usize,
+    /// B1 capacity: total resident chunk bytes the input-buffer pool admits.
+    pub max_input_buffer_bytes: usize,
+    /// B2 capacity per file: decoder-input channel size in bytes.
+    pub decode_input_buffer_bytes: usize,
 }
 
 impl Default for StreamingDownloaderConfig {
@@ -114,6 +182,10 @@ impl Default for StreamingDownloaderConfig {
             progress_interval: Duration::from_secs(1),
             filter_tasks,
             line_buffer_size: 1_000,
+            chunk_size: None,
+            file_slots: 32,
+            max_input_buffer_bytes: 4096 * 1_000_000,
+            decode_input_buffer_bytes: 128 * 1_000_000,
         }
     }
 }
@@ -123,17 +195,28 @@ impl Default for StreamingDownloaderConfig {
 pub struct StreamingDownloader {
     client: Client,
     config: StreamingDownloaderConfig,
+    /// Bounds concurrent range GETs (chunks), shared across all file tasks.
     download_semaphore: Arc<Semaphore>,
+    /// Bounds concurrent live file tasks (decoders).
+    file_semaphore: Arc<Semaphore>,
+    /// B1 input-buffer pool — present only when chunking is enabled.
+    pool: Option<Arc<InputBufferPool>>,
 }
 
 impl StreamingDownloader {
     pub fn new(client: Client, config: StreamingDownloaderConfig) -> Self {
         let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
+        let file_semaphore = Arc::new(Semaphore::new(config.file_slots.max(1)));
+        let pool = config
+            .chunk_size
+            .map(|_| InputBufferPool::new(config.max_input_buffer_bytes));
 
         Self {
             client,
             config,
             download_semaphore,
+            file_semaphore,
+            pool,
         }
     }
 
@@ -198,15 +281,30 @@ impl StreamingDownloader {
         }
 
         let total_bytes: usize = objects.iter().map(|o| o.size).sum();
+        let total_chunks: usize = objects
+            .iter()
+            .map(|o| Self::chunk_count(o.size, self.config.chunk_size))
+            .sum();
         info!(
             objects = objects.len(),
+            chunks = total_chunks,
             prefixes = progress_vec.len(),
             mb = total_bytes / 1_000_000,
-            download_concurrency = self.config.max_concurrent_downloads,
+            range_get_concurrency = self.config.max_concurrent_downloads,
+            file_slots = self.config.file_slots,
+            chunk_size_mb = self.config.chunk_size.map(|c| c / 1_000_000),
             filter_workers = self.config.filter_tasks,
             line_buffer = self.config.line_buffer_size,
             "Starting search"
         );
+
+        // Shared read-path gauges (chunked-download + buffering metrics).
+        let b2_capacity =
+            (self.config.decode_input_buffer_bytes as u64) * self.config.file_slots as u64;
+        let metrics = ReadPathMetrics::new(b2_capacity, self.pool.clone());
+        metrics
+            .chunks_remaining
+            .store(total_chunks, Ordering::Relaxed);
 
         // Line channel between download+decompress and filter workers
         let (line_tx, line_rx) = flume::bounded::<DecompressedLine>(self.config.line_buffer_size);
@@ -241,6 +339,7 @@ impl StreamingDownloader {
             workers_in_ingest.clone(),
             sink_obs,
             sink_kind,
+            metrics.clone(),
         )));
 
         // Emit initial progress at t=0 so charts always have a starting point
@@ -254,12 +353,15 @@ impl StreamingDownloader {
             let client = self.client.clone();
             let config = self.config.clone();
             let semaphore = self.download_semaphore.clone();
+            let file_semaphore = self.file_semaphore.clone();
+            let pool = self.pool.clone();
             let objects = objects.clone();
             let progress_lookup = progress_lookup.clone();
             let tx = line_tx;
             let progress = progress.clone();
             let fe = fatal_error.clone();
             let sink = sink.clone();
+            let metrics = metrics.clone();
 
             tokio::spawn(async move {
                 let result = Self::download_coordinator(
@@ -269,10 +371,13 @@ impl StreamingDownloader {
                     sink,
                     config,
                     semaphore,
+                    file_semaphore,
+                    pool,
                     tx,
                     download_observer,
                     progress,
                     fe,
+                    metrics,
                 )
                 .await;
                 // tx is dropped here → channel closes → workers drain and exit
@@ -453,10 +558,13 @@ impl StreamingDownloader {
         sink: Arc<dyn OutputSink>,
         config: StreamingDownloaderConfig,
         semaphore: Arc<Semaphore>,
+        file_semaphore: Arc<Semaphore>,
+        pool: Option<Arc<InputBufferPool>>,
         line_tx: flume::Sender<DecompressedLine>,
         download_observer: DownloadObserver,
         progress: Arc<Mutex<PipelineProgress>>,
         fatal_error: Option<Arc<AtomicBool>>,
+        metrics: Arc<ReadPathMetrics>,
     ) -> Result<usize> {
         let mut spawned = 0usize;
         let mut completed = 0usize;
@@ -511,12 +619,14 @@ impl StreamingDownloader {
                 ));
             }
 
-            // Acquire semaphore BEFORE spawn — lazy spawning
-            let permit = semaphore
+            // Acquire a FILE slot before spawn — bounds live decoders. Range-GET
+            // concurrency is bounded separately by `semaphore`, acquired per
+            // chunk inside `download_and_stream`.
+            let file_permit = file_semaphore
                 .clone()
                 .acquire_owned()
                 .await
-                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("File semaphore closed: {e}"))?;
 
             drain_completed!();
 
@@ -526,6 +636,9 @@ impl StreamingDownloader {
             let dl_obs = download_observer.clone();
             let tx = line_tx.clone();
             let fe = fatal_error.clone();
+            let dl_sem = semaphore.clone();
+            let pool = pool.clone();
+            let metrics = metrics.clone();
             // `downloads_pending` was pre-incremented once per object in
             // the run-startup pass above — don't double-count here. The
             // spawned task owns the matching `fetch_sub` in all exit
@@ -538,6 +651,7 @@ impl StreamingDownloader {
 
             join_set.spawn(async move {
                 let source = Arc::new(obj_clone);
+                metrics.files_in_flight.fetch_add(1, Ordering::Relaxed);
                 let result = Self::download_and_stream(
                     &client,
                     &source,
@@ -547,12 +661,15 @@ impl StreamingDownloader {
                     &dl_obs,
                     fe,
                     prefix_progress.clone(),
+                    dl_sem,
+                    pool,
+                    metrics.clone(),
                 )
                 .await;
+                metrics.files_in_flight.fetch_sub(1, Ordering::Relaxed);
 
-                // Release permit AFTER streaming+decompress completes
-                // (S3 connection was open throughout).
-                drop(permit);
+                // Release the file slot AFTER streaming+decompress completes.
+                drop(file_permit);
 
                 // Decrement downloads_pending unconditionally — even on
                 // error this prefix has one fewer in-flight download.
@@ -695,6 +812,31 @@ impl StreamingDownloader {
     /// compressed stream exactly where it left off.
     ///
     /// Returns the total number of compressed bytes streamed.
+    /// How many chunks an object splits into under the given chunking config.
+    /// `None` / objects `≤ chunk_size` → 1 (single-stream path).
+    fn chunk_count(size: usize, chunk_size: Option<usize>) -> usize {
+        match chunk_size {
+            Some(cs) if cs > 0 && size > cs => size.div_ceil(cs),
+            _ => 1,
+        }
+    }
+
+    /// Retry backoff delay for `attempt` (1-based), exp + ±25% jitter, ≤ 60 s.
+    fn retry_delay(config: &StreamingDownloaderConfig, attempt: u32) -> Duration {
+        let base = config
+            .initial_retry_delay
+            .mul_f64(2.0f64.powi(attempt as i32 - 1))
+            .min(Duration::from_secs(60));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let jitter_factor = 0.75 + (nanos % 500) as f64 / 1000.0;
+        base.mul_f64(jitter_factor)
+    }
+
+    /// Set up the decoder side (shared by both producers) and dispatch to the
+    /// single-stream or chunked-reassembler producer based on config + size.
     #[allow(clippy::too_many_arguments)]
     async fn download_and_stream(
         client: &Client,
@@ -705,149 +847,360 @@ impl StreamingDownloader {
         download_observer: &DownloadObserver,
         fatal_error: Option<Arc<AtomicBool>>,
         progress: Arc<PrefixProgress>,
+        dl_sem: Arc<Semaphore>,
+        pool: Option<Arc<InputBufferPool>>,
+        metrics: Arc<ReadPathMetrics>,
     ) -> Result<usize> {
-        // Bounded channel for async→sync chunk bridging.
-        // Capacity 4 ≈ 256 KB of S3 chunks in flight (typical chunk ~64 KB).
-        let (chunk_tx, chunk_rx) = flume::bounded::<Bytes>(4);
+        let chunked =
+            matches!(config.chunk_size, Some(cs) if cs > 0 && obj.size > cs) && pool.is_some();
 
-        // Spawn the synchronous decompressor side.
+        // B2 (decode-input) channel. Chunked items are whole ranges, so size by
+        // how many ranges fit the per-file decode-input budget; the single
+        // stream uses ~64 KB SDK chunks, so keep the original small capacity.
+        let chunk_cap = if chunked {
+            (config.decode_input_buffer_bytes / config.chunk_size.unwrap()).max(2)
+        } else {
+            4
+        };
+        let (chunk_tx, chunk_rx) = flume::bounded::<Bytes>(chunk_cap);
+
         let emit_source = source.clone();
         let emit_progress = progress.clone();
+        let emit_metrics = metrics.clone();
         let emit_handle = tokio::task::spawn_blocking(move || {
-            let reader = ChunkReader::new(chunk_rx);
+            let reader = ChunkReader::new(chunk_rx, emit_metrics);
             Self::emit_lines(reader, &emit_source, &line_tx, fatal_error, &emit_progress)
         });
 
-        debug!(
-            bucket = %obj.bucket,
-            key = %obj.key,
-            bytes = obj.size,
-            "Streaming download"
-        );
+        debug!(bucket = %obj.bucket, key = %obj.key, bytes = obj.size, chunked, "Streaming download");
+
+        let produced = if chunked {
+            Self::stream_chunked(
+                client,
+                obj,
+                config,
+                download_observer,
+                &chunk_tx,
+                &dl_sem,
+                pool.as_ref().unwrap(),
+                &metrics,
+            )
+            .await
+        } else {
+            Self::stream_single(
+                client,
+                obj,
+                config,
+                download_observer,
+                &chunk_tx,
+                &dl_sem,
+                &metrics,
+            )
+            .await
+        };
+
+        // Drop the sender to signal EOF to the decoder before joining it.
+        drop(chunk_tx);
+
+        match produced {
+            Ok(Produced::Done(bytes)) => {
+                emit_handle
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))??;
+                Ok(bytes)
+            }
+            Ok(Produced::ReceiverGone(bytes)) => {
+                // The decoder dropped its receiver — surface its error.
+                emit_handle
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))?
+                    .map(|()| bytes)
+            }
+            Err(e) => {
+                emit_handle.abort();
+                Err(e)
+            }
+        }
+    }
+
+    /// Original single-stream producer: one open-ended GET, range-resume on
+    /// transient errors, forwarding SDK chunks straight into the decoder.
+    /// Holds one download-semaphore permit for the whole stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_single(
+        client: &Client,
+        obj: &S3ObjectInfo,
+        config: &StreamingDownloaderConfig,
+        download_observer: &DownloadObserver,
+        chunk_tx: &flume::Sender<Bytes>,
+        dl_sem: &Arc<Semaphore>,
+        metrics: &ReadPathMetrics,
+    ) -> Result<Produced> {
+        let _permit = dl_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("Download semaphore closed: {e}"))?;
+        let _dl_guard = ActiveGetGuard::new(metrics.dl_active.clone());
 
         let mut bytes_forwarded: usize = 0;
-        let mut succeeded = false;
-
         for attempt in 0..=config.max_retries {
             if attempt > 0 {
-                // Exponential backoff with simple jitter (±25%).
-                let base = config
-                    .initial_retry_delay
-                    .mul_f64(2.0f64.powi(attempt as i32 - 1))
-                    .min(Duration::from_secs(60));
-                // Jitter: vary by ±25% using low bits of the current instant.
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos();
-                let jitter_factor = 0.75 + (nanos % 500) as f64 / 1000.0;
-                let delay = base.mul_f64(jitter_factor);
-
-                warn!(
-                    bucket = %obj.bucket,
-                    key = %obj.key,
-                    attempt,
-                    bytes_forwarded,
-                    retry_in_s = delay.as_secs_f64(),
-                    "Retry scheduled (range resume)"
-                );
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(Self::retry_delay(config, attempt)).await;
             }
-
-            // Build GetObject request, adding Range header when resuming.
             let mut req = client.get_object().bucket(&obj.bucket).key(&obj.key);
             if bytes_forwarded > 0 {
                 req = req.range(format!("bytes={bytes_forwarded}-"));
             }
-
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("{e}");
                     if !s3::is_recoverable_s3_error(&msg) {
-                        drop(chunk_tx);
-                        // Abort the emit task — we won't send more data.
-                        emit_handle.abort();
                         return Err(anyhow::anyhow!("Fatal S3 error: {e}"));
                     }
-                    warn!(
-                        bucket = %obj.bucket,
-                        key = %obj.key,
-                        attempt,
-                        error = %e,
-                        "S3 request failed"
-                    );
+                    warn!(bucket = %obj.bucket, key = %obj.key, attempt, error = %e, "S3 request failed");
                     continue;
                 }
             };
-
-            // Stream body chunks into the decompressor channel.
             let mut body = resp.body;
             let mut stream_failed = false;
-
             while let Some(chunk_result) = body.next().await {
                 match chunk_result {
                     Ok(chunk) => {
                         bytes_forwarded += chunk.len();
                         download_observer.add_bytes(chunk.len());
-
-                        if chunk_tx.send_async(chunk).await.is_err() {
-                            // Receiver dropped — emit_lines errored or was cancelled.
-                            drop(chunk_tx);
-                            return emit_handle
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))?
-                                .map(|()| bytes_forwarded);
+                        if forward_to_decoder(chunk_tx, chunk, metrics).await.is_err() {
+                            return Ok(Produced::ReceiverGone(bytes_forwarded));
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            bucket = %obj.bucket,
-                            key = %obj.key,
-                            attempt,
-                            bytes_forwarded,
-                            error = %e,
-                            "S3 body stream error"
-                        );
+                        warn!(bucket = %obj.bucket, key = %obj.key, attempt, bytes_forwarded, error = %e, "S3 body stream error");
                         stream_failed = true;
                         break;
                     }
                 }
             }
-
             if !stream_failed {
-                succeeded = true;
+                metrics.chunks_remaining.fetch_sub(1, Ordering::Relaxed);
+                return Ok(Produced::Done(bytes_forwarded));
+            }
+        }
+        Err(anyhow::anyhow!(
+            "S3 download failed after {} retries (streamed {bytes_forwarded} bytes): {}/{}",
+            config.max_retries,
+            obj.bucket,
+            obj.key,
+        ))
+    }
+
+    /// Chunked reassembler: fetch byte-ranges concurrently (ordered dispatch,
+    /// lowest index first) into pool-reserved buffers, forward them to the
+    /// decoder strictly in order. Bounded by the download semaphore (range-GET
+    /// concurrency) and the input-buffer pool (resident bytes).
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chunked(
+        client: &Client,
+        obj: &S3ObjectInfo,
+        config: &StreamingDownloaderConfig,
+        download_observer: &DownloadObserver,
+        chunk_tx: &flume::Sender<Bytes>,
+        dl_sem: &Arc<Semaphore>,
+        pool: &Arc<InputBufferPool>,
+        metrics: &ReadPathMetrics,
+    ) -> Result<Produced> {
+        let cs = config.chunk_size.unwrap();
+        let n = obj.size.div_ceil(cs);
+        // Per-file look-ahead window; the global download semaphore is the real
+        // cap, so let a lone big file use full range-GET concurrency.
+        let window = config.max_concurrent_downloads.max(1);
+
+        let mut fetches: tokio::task::JoinSet<Result<(usize, Bytes, super::mem_pool::Loan)>> =
+            tokio::task::JoinSet::new();
+        let mut next_fetch = 0usize;
+        let mut next_forward = 0usize;
+        let mut ready: std::collections::BTreeMap<usize, (Bytes, super::mem_pool::Loan)> =
+            std::collections::BTreeMap::new();
+        let mut blocked = false;
+        // Chains pool *reservations* into ascending index order: chunk `i`
+        // reserves only after `i-1` has. This keeps the in-order `next_forward`
+        // chunk first in the pool's FIFO queue, so an out-of-order later chunk
+        // can never grab the file's last reservation and starve the one we're
+        // waiting to forward (within-file deadlock). The GETs themselves still
+        // run concurrently once reserved.
+        let mut prev_reserved: Option<tokio::sync::oneshot::Receiver<()>> = None;
+
+        loop {
+            // Ordered dispatch: keep the window full, always issuing the lowest
+            // outstanding index first.
+            while next_fetch < n && fetches.len() < window {
+                let idx = next_fetch;
+                next_fetch += 1;
+                let start = idx * cs;
+                let end = ((idx + 1) * cs).min(obj.size);
+                let len = end - start;
+                let client = client.clone();
+                let bucket = obj.bucket.clone();
+                let key = obj.key.clone();
+                let dl_sem = dl_sem.clone();
+                let pool = pool.clone();
+                let dl_obs = download_observer.clone();
+                let metrics = metrics.clone();
+                let max_retries = config.max_retries;
+                let initial_delay = config.initial_retry_delay;
+                let prev = prev_reserved.take();
+                let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
+                prev_reserved = Some(reserved_rx);
+                fetches.spawn(async move {
+                    // Wait our turn to reserve (ascending index order), reserve
+                    // memory, then let the next index reserve. Then acquire a
+                    // range-GET permit and fetch.
+                    if let Some(prev) = prev {
+                        let _ = prev.await;
+                    }
+                    let loan = pool.reserve(len).await?;
+                    let _ = reserved_tx.send(());
+                    let _permit = dl_sem
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Download semaphore closed: {e}"))?;
+                    let _dl_guard = ActiveGetGuard::new(metrics.dl_active.clone());
+                    let bytes = Self::fetch_range_buffered(
+                        &client,
+                        &bucket,
+                        &key,
+                        start,
+                        end,
+                        max_retries,
+                        initial_delay,
+                        &dl_obs,
+                    )
+                    .await?;
+                    Ok((idx, bytes, loan))
+                });
+            }
+
+            if fetches.is_empty() && next_forward >= n {
                 break;
+            }
+
+            let joined = match fetches.join_next().await {
+                Some(j) => j,
+                None => break,
+            };
+            let (idx, bytes, loan) = match joined {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    fetches.abort_all();
+                    return Err(e);
+                }
+                Err(e) => {
+                    fetches.abort_all();
+                    return Err(anyhow::anyhow!("Chunk fetch task panic: {e}"));
+                }
+            };
+            metrics
+                .b1_held_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            ready.insert(idx, (bytes, loan));
+
+            // Forward all now-contiguous chunks in order.
+            while let Some((bytes, loan)) = ready.remove(&next_forward) {
+                metrics
+                    .b1_held_bytes
+                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                if forward_to_decoder(chunk_tx, bytes, metrics).await.is_err() {
+                    fetches.abort_all();
+                    if blocked {
+                        metrics.reassembly_blocked.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return Ok(Produced::ReceiverGone(next_forward * cs));
+                }
+                drop(loan); // release pool reservation once forwarded into B2
+                metrics.chunks_remaining.fetch_sub(1, Ordering::Relaxed);
+                next_forward += 1;
+            }
+
+            // Head-of-line: we hold later chunks but not `next_forward`.
+            let now_blocked = !ready.is_empty();
+            if now_blocked != blocked {
+                if now_blocked {
+                    metrics.reassembly_blocked.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.reassembly_blocked.fetch_sub(1, Ordering::Relaxed);
+                }
+                blocked = now_blocked;
             }
         }
 
-        // Drop sender to signal EOF to ChunkReader.
-        drop(chunk_tx);
-
-        if !succeeded {
-            // Abort the emit task — partial data was sent but we can't finish.
-            emit_handle.abort();
-            return Err(anyhow::anyhow!(
-                "S3 download failed after {} retries (streamed {bytes_forwarded} bytes): {}/{}",
-                config.max_retries,
-                obj.bucket,
-                obj.key,
-            ));
+        if blocked {
+            metrics.reassembly_blocked.fetch_sub(1, Ordering::Relaxed);
         }
+        Ok(Produced::Done(obj.size))
+    }
 
-        // Wait for the decompressor to finish.
-        emit_handle
-            .await
-            .map_err(|e| anyhow::anyhow!("Streaming emit task panic: {e}"))??;
-
-        debug!(
-            bucket = %obj.bucket,
-            key = %obj.key,
-            compressed_bytes = bytes_forwarded,
-            "Streamed"
-        );
-
-        Ok(bytes_forwarded)
+    /// Fetch a single `[start, end)` byte-range fully into memory, with
+    /// range-resume retry on transient errors. Returns the assembled bytes.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_range_buffered(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        start: usize,
+        end: usize,
+        max_retries: u32,
+        initial_delay: Duration,
+        download_observer: &DownloadObserver,
+    ) -> Result<Bytes> {
+        let len = end - start;
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let base = initial_delay
+                    .mul_f64(2.0f64.powi(attempt as i32 - 1))
+                    .min(Duration::from_secs(60));
+                tokio::time::sleep(base).await;
+                buf.clear(); // re-fetch the whole range on retry (idempotent)
+            }
+            let from = start + buf.len();
+            let req = client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .range(format!("bytes={from}-{}", end - 1));
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !s3::is_recoverable_s3_error(&msg) {
+                        return Err(anyhow::anyhow!("Fatal S3 error: {e}"));
+                    }
+                    warn!(bucket, key, attempt, range_start = start, error = %e, "S3 range request failed");
+                    continue;
+                }
+            };
+            let mut body = resp.body;
+            let mut stream_failed = false;
+            while let Some(chunk_result) = body.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        download_observer.add_bytes(chunk.len());
+                        buf.extend_from_slice(&chunk);
+                    }
+                    Err(e) => {
+                        warn!(bucket, key, attempt, range_start = start, error = %e, "S3 range body error");
+                        stream_failed = true;
+                        break;
+                    }
+                }
+            }
+            if !stream_failed {
+                return Ok(Bytes::from(buf));
+            }
+        }
+        Err(anyhow::anyhow!(
+            "S3 range [{start},{end}) failed after {max_retries} retries: {bucket}/{key}"
+        ))
     }
 
     /// Filter worker: pulls lines from channel, applies regex, emits matches.
@@ -947,10 +1300,23 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn chunk_count_splits_on_size_and_config() {
+        // Disabled / single-stream cases → 1.
+        assert_eq!(StreamingDownloader::chunk_count(1000, None), 1);
+        assert_eq!(StreamingDownloader::chunk_count(1000, Some(0)), 1);
+        assert_eq!(StreamingDownloader::chunk_count(50, Some(50)), 1); // size == cs
+        assert_eq!(StreamingDownloader::chunk_count(10, Some(50)), 1); // size < cs
+                                                                       // Chunked: ceil(size / cs).
+        assert_eq!(StreamingDownloader::chunk_count(100, Some(50)), 2);
+        assert_eq!(StreamingDownloader::chunk_count(120, Some(50)), 3); // last chunk partial
+        assert_eq!(StreamingDownloader::chunk_count(101, Some(50)), 3);
+    }
+
+    #[test]
     fn chunk_reader_returns_eof_when_sender_dropped() {
         let (tx, rx) = flume::bounded::<Bytes>(4);
         drop(tx);
-        let mut reader = ChunkReader::new(rx);
+        let mut reader = ChunkReader::new(rx, ReadPathMetrics::new(0, None));
         let mut buf = [0u8; 16];
         assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
@@ -960,7 +1326,7 @@ mod tests {
         let (tx, rx) = flume::bounded::<Bytes>(4);
         tx.send(Bytes::from_static(b"hello")).unwrap();
         drop(tx);
-        let mut reader = ChunkReader::new(rx);
+        let mut reader = ChunkReader::new(rx, ReadPathMetrics::new(0, None));
         let mut buf = [0u8; 16];
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(n, 5);
@@ -974,7 +1340,7 @@ mod tests {
         let (tx, rx) = flume::bounded::<Bytes>(4);
         tx.send(Bytes::from_static(b"abcdef")).unwrap();
         drop(tx);
-        let mut reader = ChunkReader::new(rx);
+        let mut reader = ChunkReader::new(rx, ReadPathMetrics::new(0, None));
         let mut buf = [0u8; 2];
         assert_eq!(reader.read(&mut buf).unwrap(), 2);
         assert_eq!(&buf, b"ab");
@@ -997,7 +1363,7 @@ mod tests {
             // tx dropped here -> EOF
         });
 
-        let reader = ChunkReader::new(rx);
+        let reader = ChunkReader::new(rx, ReadPathMetrics::new(0, None));
         let lines: Vec<String> = BufReader::new(reader)
             .lines()
             .collect::<io::Result<_>>()
@@ -1018,7 +1384,7 @@ mod tests {
         tx.send(Bytes::new()).unwrap();
         tx.send(Bytes::from_static(b"bar")).unwrap();
         drop(tx);
-        let mut reader = ChunkReader::new(rx);
+        let mut reader = ChunkReader::new(rx, ReadPathMetrics::new(0, None));
         let mut out = Vec::new();
         reader.read_to_end(&mut out).unwrap();
         assert_eq!(

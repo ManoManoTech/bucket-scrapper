@@ -1,5 +1,74 @@
+use super::mem_pool::InputBufferPool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Shared read-path gauges for the chunked-download + buffering metrics.
+///
+/// One `Arc<ReadPathMetrics>` is built per run and shared between the download
+/// tasks (which update it) and [`crate::progress::PipelineProgress`] (which reads
+/// it each tick). All counters are `Relaxed` — they're diagnostics, not
+/// correctness state. See the buffer topology in the progress classifier:
+/// B1 (download→reassembly, the pool) → B2 (reassembly→decode) → B3 (line ch).
+#[derive(Clone)]
+pub struct ReadPathMetrics {
+    /// In-flight range GETs (network concurrency in use).
+    pub dl_active: Arc<AtomicUsize>,
+    /// Live file tasks (decoders) currently running.
+    pub files_in_flight: Arc<AtomicUsize>,
+    /// Chunks not yet forwarded to a decoder (counts down to 0).
+    pub chunks_remaining: Arc<AtomicUsize>,
+    /// B1: bytes of fetched-but-not-yet-forwarded (out-of-order held) chunks.
+    pub b1_held_bytes: Arc<AtomicU64>,
+    /// B2: bytes forwarded to decoders but not yet consumed by the decompressor.
+    pub b2_used_bytes: Arc<AtomicU64>,
+    /// B2 capacity (sum across `file_slots`), for fill %. 0 ⇒ unknown/uncapped.
+    pub b2_capacity: u64,
+    /// Files currently head-of-line blocked (next in-order chunk absent while a
+    /// later chunk is already held in B1). Chunked mode only.
+    pub reassembly_blocked: Arc<AtomicUsize>,
+    /// Decoder threads currently blocked waiting for input bytes (B2 empty).
+    pub decoders_input_wait: Arc<AtomicUsize>,
+    /// The input-buffer pool (B1 capacity), when chunked download is enabled.
+    pub pool: Option<Arc<InputBufferPool>>,
+}
+
+impl ReadPathMetrics {
+    /// All-zero gauges with no pool — the chunking-disabled / default state.
+    /// B2/`decoders_input_wait` are still updated by `ChunkReader` in the
+    /// single-stream path, so the download-vs-decompress split works too.
+    pub fn new(b2_capacity: u64, pool: Option<Arc<InputBufferPool>>) -> Arc<Self> {
+        Arc::new(Self {
+            dl_active: Arc::new(AtomicUsize::new(0)),
+            files_in_flight: Arc::new(AtomicUsize::new(0)),
+            chunks_remaining: Arc::new(AtomicUsize::new(0)),
+            b1_held_bytes: Arc::new(AtomicU64::new(0)),
+            b2_used_bytes: Arc::new(AtomicU64::new(0)),
+            b2_capacity,
+            reassembly_blocked: Arc::new(AtomicUsize::new(0)),
+            decoders_input_wait: Arc::new(AtomicUsize::new(0)),
+            pool,
+        })
+    }
+}
+
+/// RAII guard: bumps `decoders_input_wait` while a decoder is blocked waiting
+/// for input bytes, decrements on drop. Mirrors `IngestGuard`.
+pub struct InputWaitGuard<'a> {
+    gauge: &'a AtomicUsize,
+}
+
+impl<'a> InputWaitGuard<'a> {
+    pub fn new(gauge: &'a AtomicUsize) -> Self {
+        gauge.fetch_add(1, Ordering::Relaxed);
+        Self { gauge }
+    }
+}
+
+impl Drop for InputWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.gauge.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Tracks raw bytes downloaded from S3 (before decompression).
 ///

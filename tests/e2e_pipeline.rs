@@ -235,6 +235,94 @@ async fn run_file_test(codec: TestCodec) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_download_end_to_end() {
+    skip_unless_docker!();
+    if let Err(e) = run_chunked_test().await {
+        panic!("chunked_download_end_to_end failed: {e:#}");
+    }
+}
+
+/// Seeds one multi-MB object and runs with `--download-chunk-size-mb 1`, so the
+/// object is fetched as several concurrent byte-ranges and reassembled in order.
+/// Asserts the matched output equals the expected ERROR lines — i.e. ranged
+/// fetch + in-order reassembly reconstructs the object byte-exactly.
+async fn run_chunked_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    let s3 = garage.s3_client();
+
+    // ~4 MB plaintext object with high-entropy filler (so it stays large) and
+    // alternating INFO/ERROR lines. Plain encoding ⇒ on-disk size ≈ plaintext,
+    // well above the 1 MB chunk size ⇒ multiple ranges.
+    let mut lines = Vec::new();
+    for i in 0..25_000usize {
+        let level = if i % 2 == 0 { "INFO" } else { "ERROR" };
+        let filler: String = (0..120)
+            .map(|j| char::from(b'a' + (((i * 7 + j * 13) % 26) as u8)))
+            .collect();
+        lines.push(format!(
+            r#"{{"seq":{i},"level":"{level}","f":"{filler}","msg":"{level} #{i}"}}"#
+        ));
+    }
+    let staged = vec![StagedObject {
+        key: format!("logs/dt={DATE}/hour=10/service-big-001.json"),
+        lines,
+        encoding: Encoding::Plain,
+    }];
+    seed_bucket(&s3, BUCKET, &staged).await?;
+
+    let workdir = TempDir::new()?;
+    let output_dir = workdir.path().join("out");
+    std::fs::create_dir_all(&output_dir)?;
+    let config_path = workdir.path().join("config.yaml");
+    // Plain output codec so we can read matches back verbatim.
+    write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(TestCodec::None))?;
+
+    let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    for (k, v) in garage.env_for_scrapper() {
+        cmd.env(k, v);
+    }
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("--region")
+        .arg("garage")
+        .arg("--start")
+        .arg("2026-01-01T10:00:00Z")
+        .arg("--end")
+        .arg("2026-01-01T11:00:00Z")
+        .arg("--line-pattern-regex")
+        .arg(PATTERN)
+        .arg("--filter")
+        .arg(r"service-.*\.(json|json\.gz|json\.zst)$")
+        .arg("--download-chunk-size-mb")
+        .arg("1")
+        .arg("--max-input-buffer-memory-mb")
+        .arg("16")
+        .arg("--decode-input-buffer-mb")
+        .arg("2")
+        .arg("--max-parallel")
+        .arg("4")
+        .arg("--log-format")
+        .arg("json")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let outputs = collect_outputs(&output_dir, TestCodec::None);
+    assert!(!outputs.is_empty(), "no outputs written");
+    let mut received: Vec<String> = Vec::new();
+    for f in &outputs {
+        for line in decode_file(f, TestCodec::None)?.lines() {
+            if !line.is_empty() {
+                received.push(line.to_string());
+            }
+        }
+    }
+    let expected = expected_matches(&staged, PATTERN);
+    assert_multiset_eq(&received, &expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn file_output_end_to_end_sharded() {
     skip_unless_docker!();
     if let Err(e) = run_sharded_test().await {
