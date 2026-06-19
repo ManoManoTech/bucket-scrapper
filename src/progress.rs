@@ -210,11 +210,10 @@ impl PipelineProgress {
         let chunks_remaining = rm.chunks_remaining.load(Ordering::Relaxed);
         let b1_held = rm.b1_held_bytes.load(Ordering::Relaxed);
         let b2_used = rm.b2_used_bytes.load(Ordering::Relaxed);
-        let b2_pct = if rm.b2_capacity > 0 {
-            (b2_used * 100 / rm.b2_capacity).min(100)
-        } else {
-            0
-        };
+        let b2_pct = (b2_used * 100)
+            .checked_div(rm.b2_capacity)
+            .unwrap_or(0)
+            .min(100);
         let reassembly_blocked = rm.reassembly_blocked.load(Ordering::Relaxed);
         let decoders_input_wait = rm.decoders_input_wait.load(Ordering::Relaxed);
         let (pool_used_mb, pool_total_mb, pool_peak_mb, pool_waiters) = match &rm.pool {
