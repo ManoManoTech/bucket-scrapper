@@ -14,6 +14,7 @@ use e2e::nginx::start_nginx;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
 use tempfile::TempDir;
 
 const BUCKET: &str = "logs-bucket";
@@ -1518,6 +1519,15 @@ fn assert_multiset_eq(got: &[String], expected: &[String]) {
 // peak process RSS, the only metric that actually reflects the OOM in
 // production.
 
+/// Serializes the two RSS variants. `cargo test` runs `#[tokio::test]`s on
+/// parallel threads by default; without this lock both memory-heavy variants
+/// (each: a Garage container + the scrapper subprocess) run at once and the
+/// aggregate OOM-kills the 7 GB GitHub runner (SIGKILL/signal 9, empty stderr).
+/// A `tokio::sync::Mutex` is held cleanly across `.await`s and serializes even
+/// across the per-test runtimes, so only one variant is resident at a time.
+static RSS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 const RSS_TEST_NUM_PREFIXES: usize = 64;
 /// Objects per prefix — production-shaped (multiple service logs per
 /// hour). Sort+FIFO download means at most ~32 / OBJECTS_PER_PREFIX
@@ -1567,6 +1577,10 @@ async fn s3_output_rss_bounded_under_high_concurrency_with_auto_concurrency() {
 }
 
 async fn run_rss_high_concurrency_test(multipart_concurrency: Option<&str>) -> Result<()> {
+    // Serialize the two variants so only one Garage container + scrapper is
+    // resident at a time (see RSS_TEST_LOCK). Held for the whole run.
+    let _serial = RSS_TEST_LOCK.lock().await;
+
     let garage = start_garage(BUCKET).await?;
     garage.create_bucket(RESULTS_BUCKET).await?;
     let s3 = garage.s3_client();
@@ -1588,6 +1602,10 @@ async fn run_rss_high_concurrency_test(multipart_concurrency: Option<&str>) -> R
         }
     }
     seed_bucket(&s3, BUCKET, &staged).await?;
+    // The staged fixture is ~10.75M owned Strings (~1.9 GB resident). It's only
+    // needed for seeding; drop it before launching the scrapper so the test
+    // process isn't holding it alongside the subprocess + Garage container.
+    drop(staged);
 
     let workdir = TempDir::new()?;
     let config_path = workdir.path().join("config.yaml");
