@@ -40,9 +40,13 @@ Key modules:
 
 ## Runtime control plane (`bsctl`)
 
-Start the pipeline with `--control-socket <PATH>` to expose a Unix-domain-socket
-control plane; `bsctl --socket <PATH> <cmd>` retunes a *running* sweep without a
-restart. Knobs are live because the pipeline shares them via `Arc`:
+The pipeline exposes a Unix-domain-socket control plane by default at `bs.sock`
+in its working directory; `bsctl <cmd>` (defaulting to the same path) retunes a
+*running* sweep without a restart. `--control-socket <PATH>` / `bsctl --socket
+<PATH>` relocate it; `--no-socket` disables the plane entirely. Because the
+default is relative, `docker exec <container> ./bsctl status` just works against
+the image's `/app` WORKDIR. Knobs are live because the pipeline shares them via
+`Arc`:
 
 - `bsctl … download-tasks ±N` — concurrent downloaders (the file semaphore; the
   coordinator spawns/retires download tasks as permits are added/forgotten).
@@ -56,8 +60,9 @@ restart. Knobs are live because the pipeline shares them via `Arc`:
 - `bsctl … line-buffer <N>` — **unsupported in v1** (flume bounded channels can't
   resize in place); the daemon returns an `unsupported` notice.
 
-Absent `--control-socket`, the server never starts (zero overhead, behavior
-identical to before).
+With `--no-socket`, the server never starts (zero overhead). A socket bind
+failure is non-fatal — it's logged and the sweep continues without a control
+plane.
 
 ## Tech Stack
 

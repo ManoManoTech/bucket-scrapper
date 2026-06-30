@@ -104,11 +104,16 @@ struct Cli {
     #[arg(long)]
     filter_tasks: Option<usize>,
 
-    /// Path to a Unix domain socket for the runtime control plane. When set,
-    /// the running pipeline listens for `bsctl` commands (retune workers /
-    /// download concurrency / part size, read live status). Absent ⇒ disabled.
-    #[arg(long)]
+    /// Path to the runtime control-plane Unix domain socket. The pipeline
+    /// listens here for `bsctl` commands (retune workers / download concurrency
+    /// / part size, read live status). Defaults to `bs.sock` in the working
+    /// directory; use --no-socket to disable the control plane entirely.
+    #[arg(long, conflicts_with = "no_socket")]
     control_socket: Option<PathBuf>,
+
+    /// Disable the runtime control plane (do not create a control socket).
+    #[arg(long)]
+    no_socket: bool,
 
     /// Line channel capacity between download+decompress and filter workers
     /// (RAM ≈ this × ~200 bytes avg line). Default 1000.
@@ -523,8 +528,19 @@ async fn main() -> Result<()> {
         decode_input_buffer_bytes,
     };
 
+    // Control plane defaults on at `bs.sock` in the working dir; --no-socket
+    // turns it off, --control-socket relocates it.
+    let control_socket = if cli.no_socket {
+        None
+    } else {
+        Some(
+            cli.control_socket
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(bucket_scrapper::control::DEFAULT_SOCKET_PATH)),
+        )
+    };
     let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config)
-        .with_control_socket(cli.control_socket.clone());
+        .with_control_socket(control_socket);
 
     // Resolve output configuration before listing — fail fast if misconfigured.
     let resolved_output = resolve_output(

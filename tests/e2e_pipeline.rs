@@ -189,6 +189,7 @@ async fn run_file_test(codec: TestCodec) -> Result<()> {
     write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(codec))?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -279,6 +280,7 @@ async fn run_chunked_test() -> Result<()> {
     write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(TestCodec::None))?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -355,6 +357,7 @@ async fn run_sharded_test() -> Result<()> {
         write_config_yaml_with_codec(&config_path, Some(&output_dir), Some(codec))?;
 
         let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+        cmd.arg("--no-socket");
         for (k, v) in garage.env_for_scrapper() {
             cmd.env(k, v);
         }
@@ -456,6 +459,7 @@ async fn run_http_test(codec: TestCodec) -> Result<()> {
     write_config_yaml(&config_path, None)?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -539,6 +543,7 @@ async fn run_http_json_array_test() -> Result<()> {
     write_config_yaml(&config_path, None)?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -695,6 +700,7 @@ async fn run_s3_json_array_test() -> Result<()> {
     let key_template = "out/{prefix}/{run_id}-{seq}.json";
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -847,6 +853,7 @@ async fn run_multipart_test() -> Result<()> {
     let key_template = "out/{prefix}/{run_id}-{seq}.ndjson.{ext}";
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -961,6 +968,7 @@ async fn run_s3_oom_regression_test() -> Result<()> {
     let key_template = "out/{prefix}/{run_id}-{seq}.ndjson";
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -1080,6 +1088,7 @@ async fn run_s3_test(
     let key_template = "out/{prefix}/{run_id}-{seq}.ndjson.{ext}";
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -1288,6 +1297,7 @@ async fn run_void_test() -> Result<()> {
     write_config_yaml(&config_path, None)?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -1382,6 +1392,7 @@ async fn run_progress_metrics_test() -> Result<()> {
     write_config_yaml(&config_path, Some(&output_dir))?;
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }
@@ -1625,6 +1636,7 @@ async fn run_rss_high_concurrency_test(multipart_concurrency: Option<&str>) -> R
     let (start, end) = time_range_covering(&prefixes);
 
     let mut cmd = Command::cargo_bin("bucket-scrapper")?;
+    cmd.arg("--no-socket");
     for (k, v) in garage.env_for_scrapper() {
         cmd.env(k, v);
     }

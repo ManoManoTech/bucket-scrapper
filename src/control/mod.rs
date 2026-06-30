@@ -21,6 +21,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Default control-socket path, shared by the daemon (where it listens) and
+/// `bsctl` (where it connects). Relative, so it resolves to the process's
+/// working directory — for the container image that's the `/app` WORKDIR, so
+/// `docker exec <container> ./bsctl status` reaches the running scrapper with
+/// no flags. Override on either side with `--control-socket` / `--socket`;
+/// disable the daemon's plane entirely with `--no-socket`.
+pub const DEFAULT_SOCKET_PATH: &str = "bs.sock";
+
 /// Live, shared tuning state for one pipeline run. Built once in
 /// `StreamingDownloader::new`, held behind an `Arc`, and mutated by the
 /// control server while the pipeline reads from it.

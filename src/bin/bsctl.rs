@@ -13,14 +13,17 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use bucket_scrapper::control::{encode_request, ControlRequest, ControlResponse, StatusSnapshot};
+use bucket_scrapper::control::{
+    encode_request, ControlRequest, ControlResponse, StatusSnapshot, DEFAULT_SOCKET_PATH,
+};
 
 #[derive(Parser)]
 #[command(name = "bsctl")]
 #[command(about = "Runtime control client for bucket-scrapper", version)]
 struct Cli {
     /// Path to the pipeline's control socket (its --control-socket value).
-    #[arg(long, short)]
+    /// Defaults to `bs.sock` in the working directory, matching the daemon.
+    #[arg(long, short, default_value = DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
 
     /// Emit the raw JSON response instead of the human-readable rendering.
