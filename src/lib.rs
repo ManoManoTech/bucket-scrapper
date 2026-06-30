@@ -1,4 +1,5 @@
 pub mod config;
+pub mod control;
 pub mod matcher;
 pub mod pipeline;
 pub mod progress;

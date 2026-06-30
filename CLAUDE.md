@@ -29,11 +29,35 @@ Key modules:
 - `src/pipeline/s3_writer.rs` — S3 output sink with per-prefix batching
 - `src/pipeline/void_writer.rs` — no-op sink with atomic counters
 - `src/pipeline/observer.rs` — observer primitives: `PipelineObserver`, `ChannelObserver`, `DownloadObserver`
+- `src/control/mod.rs` — runtime control plane: wire protocol (`ControlRequest`/`ControlResponse`/`StatusSnapshot`) + `RuntimeControls` (live-tunable shared state)
+- `src/control/server.rs` — Unix-domain-socket control server (`serve`, `ControlContext`, `StatusHandles`)
+- `src/bin/bsctl.rs` — control client binary (`bsctl`)
 - `src/config/output.rs` — `OutputConfig` tagged enum + `${ENV}` interpolation + template/codec validation
 - `src/config/resolve.rs` — selects config-driven vs CLI-driven mode (mixing is a hard error)
 - `src/matcher.rs` — `LineMatcher`: stateless regex wrapper around `grep-matcher`
 - `src/progress.rs` — periodic structured-log progress reports with bottleneck detection
 - `src/config/path_formatter.rs` — date/hour prefix formatting from `BucketConfig` path schemas
+
+## Runtime control plane (`bsctl`)
+
+Start the pipeline with `--control-socket <PATH>` to expose a Unix-domain-socket
+control plane; `bsctl --socket <PATH> <cmd>` retunes a *running* sweep without a
+restart. Knobs are live because the pipeline shares them via `Arc`:
+
+- `bsctl … download-tasks ±N` — concurrent downloaders (the file semaphore; the
+  coordinator spawns/retires download tasks as permits are added/forgotten).
+- `bsctl … range-concurrency ±N` — range-GET concurrency within chunked
+  downloads (the download semaphore).
+- `bsctl … filter-workers ±N` — grow spawns into the filter `JoinSet`; shrink
+  posts to a retire-counter workers honor at their next line boundary.
+- `bsctl … part-size <MB>` — chunked-download part size (0 disables); applies to
+  objects dispatched after the change.
+- `bsctl … status` — live snapshot (effective knobs + gauges).
+- `bsctl … line-buffer <N>` — **unsupported in v1** (flume bounded channels can't
+  resize in place); the daemon returns an `unsupported` notice.
+
+Absent `--control-socket`, the server never starts (zero overhead, behavior
+identical to before).
 
 ## Tech Stack
 

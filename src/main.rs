@@ -104,6 +104,12 @@ struct Cli {
     #[arg(long)]
     filter_tasks: Option<usize>,
 
+    /// Path to a Unix domain socket for the runtime control plane. When set,
+    /// the running pipeline listens for `bsctl` commands (retune workers /
+    /// download concurrency / part size, read live status). Absent ⇒ disabled.
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
+
     /// Line channel capacity between download+decompress and filter workers
     /// (RAM ≈ this × ~200 bytes avg line). Default 1000.
     #[arg(long)]
@@ -517,7 +523,8 @@ async fn main() -> Result<()> {
         decode_input_buffer_bytes,
     };
 
-    let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config);
+    let downloader = StreamingDownloader::new(s3_client.get_client().await?, download_config)
+        .with_control_socket(cli.control_socket.clone());
 
     // Resolve output configuration before listing — fail fast if misconfigured.
     let resolved_output = resolve_output(

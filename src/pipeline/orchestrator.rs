@@ -8,6 +8,8 @@ use super::mem_pool::InputBufferPool;
 use super::observer::{ChannelObserver, DownloadObserver, InputWaitGuard, ReadPathMetrics};
 use super::output::OutputSink;
 use super::prefix_progress::PrefixProgress;
+use crate::control::server::{ControlContext, StatusHandles};
+use crate::control::RuntimeControls;
 use crate::matcher::LineMatcher;
 use crate::progress::PipelineProgress;
 use crate::s3::{self, S3ObjectInfo};
@@ -16,6 +18,7 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,29 +198,46 @@ impl Default for StreamingDownloaderConfig {
 pub struct StreamingDownloader {
     client: Client,
     config: StreamingDownloaderConfig,
-    /// Bounds concurrent range GETs (chunks), shared across all file tasks.
-    download_semaphore: Arc<Semaphore>,
-    /// Bounds concurrent live file tasks (decoders).
-    file_semaphore: Arc<Semaphore>,
-    /// B1 input-buffer pool — present only when chunking is enabled.
-    pool: Option<Arc<InputBufferPool>>,
+    /// Live tuning state: the download + file semaphores, the filter-retire
+    /// counter, and the active part size. Shared with the control server.
+    controls: Arc<RuntimeControls>,
+    /// B1 input-buffer pool. Always present so part size can be enabled at
+    /// runtime even if the run started with chunking off — the pool is just a
+    /// byte-counting semaphore and holds no buffers until reservations happen.
+    pool: Arc<InputBufferPool>,
+    /// Optional control-socket path; when set, `search_objects` spawns the
+    /// UDS control server for the duration of the run.
+    control_socket: Option<PathBuf>,
 }
 
 impl StreamingDownloader {
     pub fn new(client: Client, config: StreamingDownloaderConfig) -> Self {
-        let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
-        let file_semaphore = Arc::new(Semaphore::new(config.file_slots.max(1)));
-        let pool = config
-            .chunk_size
-            .map(|_| InputBufferPool::new(config.max_input_buffer_bytes));
+        let controls = RuntimeControls::new(
+            config.file_slots,
+            config.max_concurrent_downloads,
+            config.chunk_size.unwrap_or(0),
+        );
+        let pool = InputBufferPool::new(config.max_input_buffer_bytes);
 
         Self {
             client,
             config,
-            download_semaphore,
-            file_semaphore,
+            controls,
             pool,
+            control_socket: None,
         }
+    }
+
+    /// Enable the runtime control socket at `path` for the next run. No-op
+    /// when `path` is `None` (the default — zero overhead).
+    pub fn with_control_socket(mut self, path: Option<PathBuf>) -> Self {
+        self.control_socket = path;
+        self
+    }
+
+    /// Shared tuning handle, e.g. for tests or an in-process tuner.
+    pub fn controls(&self) -> Arc<RuntimeControls> {
+        self.controls.clone()
     }
 
     /// Generic batch processor with decoupled download+decompress and filter stages.
@@ -301,7 +321,7 @@ impl StreamingDownloader {
         // Shared read-path gauges (chunked-download + buffering metrics).
         let b2_capacity =
             (self.config.decode_input_buffer_bytes as u64) * self.config.file_slots as u64;
-        let metrics = ReadPathMetrics::new(b2_capacity, self.pool.clone());
+        let metrics = ReadPathMetrics::new(b2_capacity, Some(self.pool.clone()));
         metrics
             .chunks_remaining
             .store(total_chunks, Ordering::Relaxed);
@@ -348,12 +368,17 @@ impl StreamingDownloader {
             prog.report();
         }
 
+        // Observer for the control server's `status` (a second WeakSender view
+        // of the line channel — must be built before `line_tx` is moved).
+        let control_line_obs = ChannelObserver::from_sender(&line_tx);
+
         // --- Spawn download coordinator ---
         let mut download_handle = {
             let client = self.client.clone();
             let config = self.config.clone();
-            let semaphore = self.download_semaphore.clone();
-            let file_semaphore = self.file_semaphore.clone();
+            let semaphore = self.controls.download_semaphore.clone();
+            let file_semaphore = self.controls.file_semaphore.clone();
+            let chunk_size = self.controls.chunk_size.clone();
             let pool = self.pool.clone();
             let objects = objects.clone();
             let progress_lookup = progress_lookup.clone();
@@ -362,6 +387,7 @@ impl StreamingDownloader {
             let fe = fatal_error.clone();
             let sink = sink.clone();
             let metrics = metrics.clone();
+            let dl_obs = download_observer.clone();
 
             tokio::spawn(async move {
                 let result = Self::download_coordinator(
@@ -372,9 +398,10 @@ impl StreamingDownloader {
                     config,
                     semaphore,
                     file_semaphore,
+                    chunk_size,
                     pool,
                     tx,
-                    download_observer,
+                    dl_obs,
                     progress,
                     fe,
                     metrics,
@@ -386,49 +413,99 @@ impl StreamingDownloader {
         };
 
         // --- Spawn filter workers ---
+        // Workers can be added at runtime (control plane), so factor the spawn
+        // into a macro reused by the startup loop and the join-loop grow arm.
+        // Each spawn clones the shared handles and bumps `workers_alive`; the
+        // worker decrements it on exit. `worker_id` is monotonic across the run
+        // (never reused) so log lines stay unambiguous.
         let mut worker_set: JoinSet<Result<usize>> = JoinSet::new();
+        let filter_retire = self.controls.filter_retire.clone();
 
-        for worker_id in 0..self.config.filter_tasks {
-            let rx = line_rx.clone();
-            let searcher = searcher.clone();
-            let sink = sink.clone();
-            let match_count = match_count.clone();
-            let match_bytes = match_bytes.clone();
-            let filter_lines_in = filter_lines_in.clone();
-            let filter_bytes_in = filter_bytes_in.clone();
-            let fe = fatal_error.clone();
-            let wa = workers_alive.clone();
-            let wii = workers_in_ingest.clone();
-
-            worker_set.spawn(async move {
-                let result = Self::filter_worker(
-                    worker_id,
-                    rx,
-                    searcher,
-                    sink,
-                    match_count,
-                    match_bytes,
-                    filter_lines_in,
-                    filter_bytes_in,
-                    fe,
-                    wii,
-                )
-                .await;
-                wa.fetch_sub(1, Ordering::Relaxed);
-                match &result {
-                    Ok(matches) => {
-                        info!(worker = worker_id, matches, "Filter worker exited");
+        macro_rules! spawn_filter_worker {
+            ($worker_id:expr) => {{
+                let worker_id = $worker_id;
+                let rx = line_rx.clone();
+                let searcher = searcher.clone();
+                let sink = sink.clone();
+                let match_count = match_count.clone();
+                let match_bytes = match_bytes.clone();
+                let filter_lines_in = filter_lines_in.clone();
+                let filter_bytes_in = filter_bytes_in.clone();
+                let fe = fatal_error.clone();
+                let wa = workers_alive.clone();
+                let wii = workers_in_ingest.clone();
+                let retire = filter_retire.clone();
+                wa.fetch_add(1, Ordering::Relaxed);
+                worker_set.spawn(async move {
+                    let result = Self::filter_worker(
+                        worker_id,
+                        rx,
+                        searcher,
+                        sink,
+                        match_count,
+                        match_bytes,
+                        filter_lines_in,
+                        filter_bytes_in,
+                        fe,
+                        wii,
+                        retire,
+                    )
+                    .await;
+                    wa.fetch_sub(1, Ordering::Relaxed);
+                    match &result {
+                        Ok(matches) => {
+                            info!(worker = worker_id, matches, "Filter worker exited");
+                        }
+                        Err(e) => {
+                            warn!(worker = worker_id, error = %e, "Filter worker failed");
+                        }
                     }
-                    Err(e) => {
-                        warn!(worker = worker_id, error = %e, "Filter worker failed");
-                    }
-                }
-                result
-            });
+                    result
+                });
+            }};
         }
 
-        // Drop our clone of line_rx so channel closes when coordinator drops tx
-        drop(line_rx);
+        // `workers_alive` was pre-seeded to `filter_tasks` (so the t=0 progress
+        // report reads right); the macro also bumps it, so reset to 0 first and
+        // let the startup spawns set the true count.
+        workers_alive.store(0, Ordering::Relaxed);
+        let mut next_worker_id = 0usize;
+        let mut workers_spawned = 0usize;
+        for _ in 0..self.config.filter_tasks {
+            spawn_filter_worker!(next_worker_id);
+            next_worker_id += 1;
+            workers_spawned += 1;
+        }
+
+        // Channel for runtime "grow filter workers by N" requests from the
+        // control server; handled in the join loop below (it owns `worker_set`).
+        let (grow_workers_tx, grow_workers_rx) = flume::unbounded::<usize>();
+
+        // --- Spawn the control server (only if a socket was configured) ---
+        // NOTE: we deliberately keep `line_rx` alive past here so the grow arm
+        // can clone a fresh receiver for new workers. This means the implicit
+        // "all workers died ⇒ coordinator sees SendError" safety net no longer
+        // fires (a live receiver remains), so the join loop explicitly aborts
+        // the coordinator if every worker exits before download completes.
+        let control_server = self.control_socket.clone().map(|socket_path| {
+            let ctx = Arc::new(ControlContext {
+                controls: self.controls.clone(),
+                grow_workers: grow_workers_tx,
+                status: StatusHandles {
+                    workers_alive: workers_alive.clone(),
+                    metrics: metrics.clone(),
+                    download_observer: download_observer.clone(),
+                    match_count: match_count.clone(),
+                    line_channel: control_line_obs,
+                    line_buffer_size: self.config.line_buffer_size,
+                },
+            });
+            tokio::spawn(async move {
+                if let Err(e) = crate::control::server::serve(socket_path, ctx).await {
+                    warn!(error = %e, "Control server exited with error");
+                }
+            })
+        });
 
         // --- Spawn periodic progress ticker ---
         // Reports progress even when no files complete (e.g. pipeline backed up).
@@ -451,18 +528,21 @@ impl StreamingDownloader {
         // coordinator finishes, we detect it immediately instead of deadlocking
         // (the coordinator would block on a full line channel forever).
         //
-        // Invariant: if all workers exit before the coordinator, the line
-        // channel's receivers are gone, so the next `emit_lines` send returns
-        // SendError, which `download_coordinator` propagates as Err (see
-        // `emit_lines` — "Filter workers gone, channel closed"). The
-        // coordinator therefore exits promptly; this loop will not hang.
+        // `workers_spawned` is dynamic: the control plane can grow the pool at
+        // runtime via `grow_workers_rx`. The run is done when the coordinator
+        // has finished AND every worker ever spawned has exited.
+        //
+        // Because we keep `line_rx` alive (to clone for runtime-spawned
+        // workers), the old "all workers died ⇒ coordinator hits SendError"
+        // safety net no longer fires — a live receiver remains. So if every
+        // worker exits before download completes, we abort the coordinator
+        // explicitly here rather than waiting for a send error that won't come.
         let mut download_done = false;
         let mut total_matches = 0usize;
-
-        let total_workers = self.config.filter_tasks;
         let mut workers_finished = 0usize;
+        let mut can_grow = true;
 
-        loop {
+        let run_result: Result<()> = loop {
             tokio::select! {
                 dl_result = &mut download_handle, if !download_done => {
                     match dl_result {
@@ -470,16 +550,23 @@ impl StreamingDownloader {
                             debug!(files = files_processed, "Download coordinator finished");
                             download_done = true;
                         }
-                        Ok(Err(e)) => {
-                            progress_ticker.abort();
-                            worker_set.abort_all();
-                            return Err(e);
+                        Ok(Err(e)) => break Err(e),
+                        Err(e) => break Err(anyhow::anyhow!("Download coordinator panicked: {e}")),
+                    }
+                }
+                grow = grow_workers_rx.recv_async(), if can_grow && !download_done => {
+                    match grow {
+                        Ok(n) => {
+                            for _ in 0..n {
+                                spawn_filter_worker!(next_worker_id);
+                                next_worker_id += 1;
+                                workers_spawned += 1;
+                            }
+                            info!(added = n, total_spawned = workers_spawned, "Filter workers added");
                         }
-                        Err(e) => {
-                            progress_ticker.abort();
-                            worker_set.abort_all();
-                            return Err(anyhow::anyhow!("Download coordinator panicked: {e}"));
-                        }
+                        // All grow senders dropped (no control server / run ending):
+                        // disable this arm so the select doesn't busy-spin on Err.
+                        Err(_) => { can_grow = false; }
                     }
                 }
                 Some(worker_result) = worker_set.join_next() => {
@@ -489,29 +576,60 @@ impl StreamingDownloader {
                             total_matches += matches;
                         }
                         Ok(Err(e)) => {
-                            progress_ticker.abort();
                             download_handle.abort();
-                            return Err(e);
+                            break Err(e);
                         }
                         Err(e) => {
-                            progress_ticker.abort();
                             download_handle.abort();
-                            return Err(anyhow::anyhow!("Filter worker panicked: {e}"));
+                            break Err(anyhow::anyhow!("Filter worker panicked: {e}"));
                         }
                     }
-                    if workers_finished == total_workers && !download_done {
-                        warn!("All filter workers exited before download coordinator finished");
+                    if workers_finished == workers_spawned && !download_done {
+                        // All workers have exited. The normal end-of-run shape:
+                        // the coordinator dropped `tx`, closing the channel, so
+                        // workers drained and returned — `select!` just observed
+                        // their completions before the coordinator's result.
+                        // We can't rely on the coordinator hitting SendError to
+                        // unblock (a spare `line_rx` is held open for runtime
+                        // worker growth), so await its result directly. The
+                        // timeout bounds a genuinely wedged coordinator so the
+                        // run can't hang.
+                        match tokio::time::timeout(Duration::from_secs(30), &mut download_handle)
+                            .await
+                        {
+                            Ok(Ok(Ok(files_processed))) => {
+                                debug!(files = files_processed, "Download coordinator finished");
+                                download_done = true;
+                            }
+                            Ok(Ok(Err(e))) => break Err(e),
+                            Ok(Err(e)) => {
+                                break Err(anyhow::anyhow!("Download coordinator panicked: {e}"))
+                            }
+                            Err(_) => {
+                                warn!("All filter workers exited before download coordinator finished");
+                                download_handle.abort();
+                                break Err(anyhow::anyhow!(
+                                    "All filter workers exited before downloads completed"
+                                ));
+                            }
+                        }
                     }
                 }
             }
 
-            if download_done && workers_finished == total_workers {
-                break;
+            if download_done && workers_finished == workers_spawned {
+                break Ok(());
             }
-        }
+        };
 
-        // Stop the progress ticker
+        // Cleanup on every path: stop the ticker, the control server, and
+        // release our retained line receiver.
         progress_ticker.abort();
+        if let Some(handle) = &control_server {
+            handle.abort();
+        }
+        drop(line_rx);
+        run_result?;
 
         // I4: at end of run every prefix's `sent == processed` and every
         // prefix was either closed early or will be closed by sink.finish().
@@ -559,7 +677,8 @@ impl StreamingDownloader {
         config: StreamingDownloaderConfig,
         semaphore: Arc<Semaphore>,
         file_semaphore: Arc<Semaphore>,
-        pool: Option<Arc<InputBufferPool>>,
+        chunk_size: Arc<AtomicUsize>,
+        pool: Arc<InputBufferPool>,
         line_tx: flume::Sender<DecompressedLine>,
         download_observer: DownloadObserver,
         progress: Arc<Mutex<PipelineProgress>>,
@@ -639,6 +758,10 @@ impl StreamingDownloader {
             let dl_sem = semaphore.clone();
             let pool = pool.clone();
             let metrics = metrics.clone();
+            // Snapshot the (live-tunable) part size once per object so the
+            // chunk/single decision and the chunk math stay consistent even if
+            // an operator retunes mid-run.
+            let cur_chunk = chunk_size.load(Ordering::Relaxed);
             // `downloads_pending` was pre-incremented once per object in
             // the run-startup pass above — don't double-count here. The
             // spawned task owns the matching `fetch_sub` in all exit
@@ -658,6 +781,7 @@ impl StreamingDownloader {
                     source.clone(),
                     tx,
                     &config,
+                    cur_chunk,
                     &dl_obs,
                     fe,
                     prefix_progress.clone(),
@@ -844,21 +968,24 @@ impl StreamingDownloader {
         source: Arc<S3ObjectInfo>,
         line_tx: flume::Sender<DecompressedLine>,
         config: &StreamingDownloaderConfig,
+        chunk_size: usize,
         download_observer: &DownloadObserver,
         fatal_error: Option<Arc<AtomicBool>>,
         progress: Arc<PrefixProgress>,
         dl_sem: Arc<Semaphore>,
-        pool: Option<Arc<InputBufferPool>>,
+        pool: Arc<InputBufferPool>,
         metrics: Arc<ReadPathMetrics>,
     ) -> Result<usize> {
-        let chunked =
-            matches!(config.chunk_size, Some(cs) if cs > 0 && obj.size > cs) && pool.is_some();
+        // `chunk_size` is a per-object snapshot of the live part-size knob
+        // (`0` ⇒ chunking disabled). The B1 pool is always present, so the
+        // decision rests solely on the part size vs. object size.
+        let chunked = chunk_size > 0 && obj.size > chunk_size;
 
         // B2 (decode-input) channel. Chunked items are whole ranges, so size by
         // how many ranges fit the per-file decode-input budget; the single
         // stream uses ~64 KB SDK chunks, so keep the original small capacity.
         let chunk_cap = if chunked {
-            (config.decode_input_buffer_bytes / config.chunk_size.unwrap()).max(2)
+            (config.decode_input_buffer_bytes / chunk_size).max(2)
         } else {
             4
         };
@@ -879,10 +1006,11 @@ impl StreamingDownloader {
                 client,
                 obj,
                 config,
+                chunk_size,
                 download_observer,
                 &chunk_tx,
                 &dl_sem,
-                pool.as_ref().unwrap(),
+                &pool,
                 &metrics,
             )
             .await
@@ -1003,13 +1131,14 @@ impl StreamingDownloader {
         client: &Client,
         obj: &S3ObjectInfo,
         config: &StreamingDownloaderConfig,
+        chunk_size: usize,
         download_observer: &DownloadObserver,
         chunk_tx: &flume::Sender<Bytes>,
         dl_sem: &Arc<Semaphore>,
         pool: &Arc<InputBufferPool>,
         metrics: &ReadPathMetrics,
     ) -> Result<Produced> {
-        let cs = config.chunk_size.unwrap();
+        let cs = chunk_size;
         let n = obj.size.div_ceil(cs);
         // Per-file look-ahead window; the global download semaphore is the real
         // cap, so let a lone big file use full range-GET concurrency.
@@ -1206,9 +1335,10 @@ impl StreamingDownloader {
     /// Filter worker: pulls lines from channel, applies regex, emits matches.
     /// Runs entirely in spawn_blocking (CPU-bound regex + blocking channel recv).
     ///
-    /// Checks `fatal_error` every 1024 lines so the worker exits promptly when
-    /// the HTTP pipeline is dead, even with low match rates where the send-side
-    /// error would not be hit often.
+    /// Checks `fatal_error` and the `retire` counter every 1024 lines so the
+    /// worker exits promptly when the HTTP pipeline is dead, and so the control
+    /// plane can shrink the pool: a retiring worker claims one retirement via
+    /// CAS and returns, leaving the rest of the pool running.
     #[allow(clippy::too_many_arguments)]
     async fn filter_worker(
         worker_id: usize,
@@ -1221,18 +1351,36 @@ impl StreamingDownloader {
         filter_bytes_in: Arc<AtomicUsize>,
         fatal_error: Option<Arc<AtomicBool>>,
         workers_in_ingest: crate::progress::IngestGauge,
+        retire: Arc<AtomicUsize>,
     ) -> Result<usize> {
         let result = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut local = 0usize;
             let mut lines_processed = 0u64;
             while let Ok(line) = rx.recv() {
-                // Check fatal error every 1024 lines — bail early so the
-                // decompressed-line channel drains and download tasks can stop.
+                // Every 1024 lines: bail on fatal error (so the channel drains
+                // and downloads can stop), then check for a retire request.
                 lines_processed += 1;
                 if lines_processed & 0x3FF == 0 {
                     if let Some(ref fe) = fatal_error {
                         if fe.load(Ordering::Relaxed) {
                             return Ok(local);
+                        }
+                    }
+                    // Claim a pending retirement (if any) via CAS so exactly one
+                    // worker exits per requested shrink, then stop.
+                    let mut pending = retire.load(Ordering::Relaxed);
+                    while pending > 0 {
+                        match retire.compare_exchange_weak(
+                            pending,
+                            pending - 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                debug!(worker = worker_id, "Filter worker retiring on request");
+                                return Ok(local);
+                            }
+                            Err(observed) => pending = observed,
                         }
                     }
                 }
