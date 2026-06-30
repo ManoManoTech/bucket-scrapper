@@ -1534,9 +1534,13 @@ const RSS_TEST_NUM_PREFIXES: usize = 64;
 /// prefixes have downloads in flight simultaneously, capping the
 /// number of open S3 uploads at the sink.
 const RSS_TEST_OBJECTS_PER_PREFIX: usize = 6;
-/// ~28_000 × ~140 B per line ≈ 4 MB matched plaintext per object,
-/// 24 MB per prefix. Total fixture ≈ 1.5 GB plaintext.
-const RSS_TEST_LINES_PER_OBJECT: usize = 28_000;
+/// ~20_000 × ~150 B per line ≈ 3 MB matched plaintext per object,
+/// 18 MB per prefix. Total fixture ≈ 1.15 GB plaintext — still well above
+/// the 800 MB cap, so a volume-proportional leak would still breach it,
+/// while keeping the Garage container's stored bytes (and the seeding
+/// time) modest on the CI runner. Trimmed from 28_000 (~1.6 GB) once the
+/// concurrent-test OOM was traced to harness memory, not the scrapper.
+const RSS_TEST_LINES_PER_OBJECT: usize = 20_000;
 /// Peak RSS cap. Measured ~545–580 MB in practice under this workload
 /// with close-on-completion enabled; `multipart_concurrency` barely
 /// moves it (TM staging is only ~36 MB of the total) so the bulk is
@@ -1548,8 +1552,14 @@ const RSS_TEST_LINES_PER_OBJECT: usize = 28_000;
 /// 800 MB catches a regression toward either of those baselines while
 /// leaving headroom for the current ~580 MB working set. Critically,
 /// the curve is *flat in `match_mb`* — verified by the test running
-/// to 1.6 GB matched without RSS climbing further — which is the
+/// to >1.1 GB matched without RSS climbing further — which is the
 /// architectural property the close-on-completion machinery provides.
+///
+/// The cap can't be tightened much below this: ~580 MB is the genuine
+/// volume-independent working set (pipeline + glibc page retention), not
+/// a leak, so a sub-580 cap would red-fail healthy builds. A coarse
+/// absolute ceiling is deliberate — RSS legitimately drifts upward as
+/// the allocator holds pages, so a tight differential bound would flake.
 const RSS_TEST_CAP_MB: u64 = 800;
 
 /// Many concurrent prefixes + explicit `multipart_concurrency` cap. This
