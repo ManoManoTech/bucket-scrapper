@@ -15,6 +15,11 @@ WORKDIR /app
 COPY --chown=bucket-scrapper:bucket-scrapper \
     --chmod=755 bucket-scrapper-${TARGETARCH} ./bucket-scrapper
 
+# Runtime control client. Not the entrypoint — run it against a live scrapper
+# (started with --control-socket) via `docker exec <container> ./bsctl …`.
+COPY --chown=bucket-scrapper:bucket-scrapper \
+    --chmod=755 bsctl-${TARGETARCH} ./bsctl
+
 USER bucket-scrapper
 
 ENTRYPOINT ["./bucket-scrapper"]

@@ -42,10 +42,10 @@ jobs:
 
       - run: cargo build --release
 
-      - name: Package binary
+      - name: Package binaries
         run: |
           cd target/release
-          tar czf ../../bucket-scrapper-${{ matrix.target }}.tar.gz bucket-scrapper
+          tar czf ../../bucket-scrapper-${{ matrix.target }}.tar.gz bucket-scrapper bsctl
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
@@ -53,12 +53,14 @@ jobs:
           name: bucket-scrapper-${{ matrix.target }}
           path: bucket-scrapper-${{ matrix.target }}.tar.gz
 
-      - name: Upload raw binary (Linux only)
+      - name: Upload raw binaries (Linux only)
         if: matrix.arch == 'amd64' || matrix.arch == 'arm64'
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.arch }}
-          path: target/release/bucket-scrapper
+          path: |
+            target/release/bucket-scrapper
+            target/release/bsctl
 
   release:
     name: GitHub Release
@@ -100,8 +102,10 @@ jobs:
           name: binary-${{ matrix.arch }}
           path: infra/docker/
 
-      - name: Rename binary for Dockerfile
-        run: mv infra/docker/bucket-scrapper infra/docker/bucket-scrapper-${{ matrix.arch }}
+      - name: Rename binaries for Dockerfile
+        run: |
+          mv infra/docker/bucket-scrapper infra/docker/bucket-scrapper-${{ matrix.arch }}
+          mv infra/docker/bsctl infra/docker/bsctl-${{ matrix.arch }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
