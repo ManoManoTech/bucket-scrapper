@@ -43,10 +43,13 @@ Key modules:
 The pipeline exposes a Unix-domain-socket control plane by default at `bs.sock`
 in its working directory; `bsctl <cmd>` (defaulting to the same path) retunes a
 *running* sweep without a restart. `--control-socket <PATH>` / `bsctl --socket
-<PATH>` relocate it; `--no-socket` disables the plane entirely. Because the
-default is relative, `docker exec <container> ./bsctl status` just works against
-the image's `/app` WORKDIR. Knobs are live because the pipeline shares them via
-`Arc`:
+<PATH>` relocate it; `--no-socket` disables the plane entirely. The default is
+relative, so in the image it lands in the `/app` WORKDIR (which the Dockerfile
+`chown`s to the runtime user so the bind succeeds) and `docker exec <container>
+./bsctl status` reaches it. A bind failure is non-fatal — logged as a warning,
+the sweep continues without a plane — so on a read-only-rootfs pod either mount
+a writable dir and point `--control-socket` at it, or accept no control plane.
+Knobs are live because the pipeline shares them via `Arc`:
 
 - `bsctl … download-tasks ±N` — concurrent downloaders (the file semaphore; the
   coordinator spawns/retires download tasks as permits are added/forgotten).

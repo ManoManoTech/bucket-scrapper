@@ -12,6 +12,13 @@ RUN useradd --create-home --user-group bucket-scrapper
 
 WORKDIR /app
 
+# `WORKDIR` creates /app as root; the process runs as `bucket-scrapper` and
+# defaults its control socket to `./bs.sock` (cwd), so the working dir must be
+# writable by that user or the bind fails (silently, as a warning) and no
+# socket is created. (Read-only-rootfs pods still need an emptyDir mount +
+# --control-socket pointing into it.)
+RUN chown bucket-scrapper:bucket-scrapper /app
+
 COPY --chown=bucket-scrapper:bucket-scrapper \
     --chmod=755 bucket-scrapper-${TARGETARCH} ./bucket-scrapper
 
