@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "bucket_scrapper",
+  "project_id": "9c5996d6-78ff-4c53-a1f9-6a9cd934cfed"
+}
