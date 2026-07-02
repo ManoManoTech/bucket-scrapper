@@ -3,9 +3,11 @@
 //! lines. Spawned from `StreamingDownloader::search_objects` only when a
 //! socket path was configured, and aborted when the run ends.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,6 +19,13 @@ use super::{
     StatusSnapshot,
 };
 use crate::pipeline::observer::{ChannelObserver, DownloadObserver, ReadPathMetrics};
+use crate::pipeline::SinkObservability;
+use crate::progress::classify_bottleneck_non_http;
+
+/// How long a history we keep for the trailing-window rates, and how often the
+/// background sampler records a point.
+const WINDOW_RETAIN: Duration = Duration::from_secs(62);
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read-only handles the server samples to answer `status`. These mirror the
 /// gauges the periodic progress reporter already reads, so `status` and the
@@ -24,16 +33,98 @@ use crate::pipeline::observer::{ChannelObserver, DownloadObserver, ReadPathMetri
 pub struct StatusHandles {
     /// Live filter workers.
     pub workers_alive: Arc<AtomicUsize>,
-    /// Read-path gauges (`dl_active`, `files_in_flight`).
+    /// Read-path gauges (`dl_active`, `files_in_flight`, `decoders_input_wait`).
     pub metrics: Arc<ReadPathMetrics>,
     /// Cumulative raw S3 bytes downloaded.
     pub download_observer: DownloadObserver,
+    /// Cumulative decompressed bytes fed to the filter (for filter throughput).
+    pub filter_bytes_in: Arc<AtomicUsize>,
     /// Cumulative matched lines.
     pub match_count: Arc<AtomicUsize>,
+    /// Filter workers currently inside `sink.ingest` (classifier input).
+    pub workers_in_ingest: Arc<AtomicUsize>,
+    /// Sink-side gauges (classifier input; all `None` for the void sink).
+    pub sink_obs: SinkObservability,
+    /// Sink kind label (classifier input).
+    pub sink_kind: &'static str,
     /// Fill level of the download→filter line channel.
     pub line_channel: ChannelObserver,
     /// Configured line-channel capacity (fixed for the run in v1).
     pub line_buffer_size: usize,
+}
+
+/// One throughput sample: elapsed-since-start plus the two cumulative byte
+/// counters. Storing elapsed millis (not `Instant`) keeps the rate math a pure,
+/// testable function.
+#[derive(Clone, Copy)]
+struct Sample {
+    at_ms: u64,
+    dl_bytes: u64,
+    filter_bytes: u64,
+}
+
+/// Trailing-window throughput tracker. A background task records a [`Sample`]
+/// each second; `status` computes MB/s over 10/30/60s windows from the ring.
+pub struct ThroughputWindows {
+    base: Instant,
+    samples: Mutex<VecDeque<Sample>>,
+}
+
+impl ThroughputWindows {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            samples: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    fn record(&self, dl_bytes: u64, filter_bytes: u64) {
+        let at_ms = self.base.elapsed().as_millis() as u64;
+        let mut q = self.samples.lock().unwrap();
+        q.push_back(Sample {
+            at_ms,
+            dl_bytes,
+            filter_bytes,
+        });
+        let cutoff = at_ms.saturating_sub(WINDOW_RETAIN.as_millis() as u64);
+        while q.front().is_some_and(|s| s.at_ms < cutoff) {
+            q.pop_front();
+        }
+    }
+
+    /// (download, filter) MB/s over the trailing `window`.
+    fn rates(&self, window: Duration) -> (f64, f64) {
+        let now_ms = self.base.elapsed().as_millis() as u64;
+        let q = self.samples.lock().unwrap();
+        let dl: Vec<(u64, u64)> = q.iter().map(|s| (s.at_ms, s.dl_bytes)).collect();
+        let filt: Vec<(u64, u64)> = q.iter().map(|s| (s.at_ms, s.filter_bytes)).collect();
+        let w = window.as_millis() as u64;
+        (
+            windowed_mbps(&dl, w, now_ms),
+            windowed_mbps(&filt, w, now_ms),
+        )
+    }
+}
+
+/// Pure MB/s over a trailing `window_ms`: (bytes now − bytes at window start) /
+/// elapsed. Uses the oldest sample within the window as the baseline; returns
+/// 0.0 until there are two usable points spanning real time.
+fn windowed_mbps(samples: &[(u64, u64)], window_ms: u64, now_ms: u64) -> f64 {
+    let Some(&(last_ms, last_bytes)) = samples.last() else {
+        return 0.0;
+    };
+    let cutoff = now_ms.saturating_sub(window_ms);
+    // Oldest sample at or after the cutoff is the window baseline.
+    let Some(&(first_ms, first_bytes)) = samples.iter().find(|&&(t, _)| t >= cutoff) else {
+        return 0.0;
+    };
+    let dt_ms = last_ms.saturating_sub(first_ms);
+    if dt_ms == 0 {
+        return 0.0;
+    }
+    let dbytes = last_bytes.saturating_sub(first_bytes);
+    // MB/s = (bytes / seconds) / 1e6 = (bytes / (ms/1000)) / 1e6 = bytes/ms / 1000.
+    dbytes as f64 / dt_ms as f64 / 1000.0
 }
 
 /// Everything the server needs to apply commands and answer `status`.
@@ -43,24 +134,75 @@ pub struct ControlContext {
     /// owns the `JoinSet`. Shrink uses `controls.filter_retire` directly.
     pub grow_workers: flume::Sender<usize>,
     pub status: StatusHandles,
+    throughput: Arc<ThroughputWindows>,
 }
 
 impl ControlContext {
+    /// Build a context, allocating its throughput tracker.
+    pub fn new(
+        controls: Arc<RuntimeControls>,
+        grow_workers: flume::Sender<usize>,
+        status: StatusHandles,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            controls,
+            grow_workers,
+            status,
+            throughput: ThroughputWindows::new(),
+        })
+    }
+
     fn snapshot(&self) -> StatusSnapshot {
         let s = &self.status;
+        let dc_len = s.line_channel.len();
+        let dc_cap = s.line_channel.capacity();
+        let dc_pct = (dc_len * 100).checked_div(dc_cap).unwrap_or(0);
+        let workers_alive = s.workers_alive.load(Ordering::Relaxed);
+        let decoders_input_wait = s.metrics.decoders_input_wait.load(Ordering::Relaxed);
+        let files_in_flight = s.metrics.files_in_flight.load(Ordering::Relaxed);
+        let reassembly_blocked = s.metrics.reassembly_blocked.load(Ordering::Relaxed);
+        let bottleneck = classify_bottleneck_non_http(
+            dc_pct,
+            s.workers_in_ingest.load(Ordering::Relaxed),
+            workers_alive.max(1),
+            s.sink_obs
+                .inflight_bytes
+                .as_ref()
+                .map(|a| a.load(Ordering::Relaxed)),
+            s.sink_obs
+                .active_uploads
+                .as_ref()
+                .map(|a| a.load(Ordering::Relaxed)),
+            s.sink_kind,
+            decoders_input_wait,
+            files_in_flight,
+            reassembly_blocked,
+        );
+        let (dl10, f10) = self.throughput.rates(Duration::from_secs(10));
+        let (dl30, f30) = self.throughput.rates(Duration::from_secs(30));
+        let (dl60, f60) = self.throughput.rates(Duration::from_secs(60));
+
         StatusSnapshot {
-            filter_workers_alive: s.workers_alive.load(Ordering::Relaxed),
+            filter_workers_alive: workers_alive,
             filter_retire_pending: self.controls.filter_retire_pending(),
             download_tasks_limit: self.controls.file_limit(),
             range_concurrency_limit: self.controls.range_limit(),
             part_size_mb: self.controls.part_size_mb(),
             line_buffer_size: s.line_buffer_size,
             dl_active: s.metrics.dl_active.load(Ordering::Relaxed),
-            files_in_flight: s.metrics.files_in_flight.load(Ordering::Relaxed),
-            line_channel_len: s.line_channel.len(),
-            line_channel_cap: s.line_channel.capacity(),
+            files_in_flight,
+            decoders_input_wait,
+            line_channel_len: dc_len,
+            line_channel_cap: dc_cap,
             downloaded_bytes: s.download_observer.bytes() as u64,
             match_count: s.match_count.load(Ordering::Relaxed),
+            download_mbps_10s: dl10,
+            download_mbps_30s: dl30,
+            download_mbps_60s: dl60,
+            filter_mbps_10s: f10,
+            filter_mbps_30s: f30,
+            filter_mbps_60s: f60,
+            bottleneck: bottleneck.to_string(),
         }
     }
 
@@ -182,7 +324,23 @@ pub async fn serve(socket_path: PathBuf, ctx: Arc<ControlContext>) -> Result<()>
     restrict_permissions(&socket_path);
     info!(socket = %socket_path.display(), "Control socket listening");
 
+    // Background sampler feeding the trailing-window rates.
+    let sampler = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
+            loop {
+                tick.tick().await;
+                ctx.throughput.record(
+                    ctx.status.download_observer.bytes() as u64,
+                    ctx.status.filter_bytes_in.load(Ordering::Relaxed) as u64,
+                );
+            }
+        })
+    };
+
     let result = accept_loop(&listener, ctx).await;
+    sampler.abort();
     let _ = std::fs::remove_file(&socket_path);
     result
 }
@@ -234,5 +392,35 @@ fn restrict_permissions(path: &Path) {
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             warn!(error = %e, "Could not restrict control socket permissions");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windowed_mbps;
+
+    #[test]
+    fn windowed_mbps_bytes_per_ms_equals_mb_per_s() {
+        // 100 MB over 1000 ms = 100 MB/s. Samples: (t_ms, cumulative_bytes).
+        let s = [(0u64, 0u64), (1000, 100_000_000)];
+        assert!((windowed_mbps(&s, 10_000, 1000) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn windowed_mbps_uses_only_samples_within_window() {
+        // Old fast burst then a slow second; a 10s window baseline is the
+        // oldest point ≥ (now-10s), so only recent throughput counts.
+        let s = [
+            (0u64, 0u64),            // outside a 10s window ending at 40_000
+            (30_000, 3_000_000_000), // baseline within window
+            (40_000, 3_050_000_000), // +50 MB over 10s = 5 MB/s
+        ];
+        assert!((windowed_mbps(&s, 10_000, 40_000) - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn windowed_mbps_zero_without_span() {
+        assert_eq!(windowed_mbps(&[], 10_000, 0), 0.0);
+        assert_eq!(windowed_mbps(&[(500, 42)], 10_000, 500), 0.0); // single point
     }
 }

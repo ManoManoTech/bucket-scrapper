@@ -151,11 +151,21 @@ fn print_status(s: &StatusSnapshot) {
     println!("part_size_mb            {}", s.part_size_mb);
     println!("line_buffer_size        {}", s.line_buffer_size);
     println!("--");
+    println!("bottleneck              {}", s.bottleneck);
     println!("dl_active               {}", s.dl_active);
     println!("files_in_flight         {}", s.files_in_flight);
+    println!("decoders_input_wait     {}", s.decoders_input_wait);
     println!(
         "line_channel            {}/{}",
         s.line_channel_len, s.line_channel_cap
+    );
+    println!(
+        "download_mbps           {:.1} / {:.1} / {:.1}   (10s/30s/60s)",
+        s.download_mbps_10s, s.download_mbps_30s, s.download_mbps_60s
+    );
+    println!(
+        "filter_mbps             {:.1} / {:.1} / {:.1}   (10s/30s/60s)",
+        s.filter_mbps_10s, s.filter_mbps_30s, s.filter_mbps_60s
     );
     println!("downloaded_bytes        {}", s.downloaded_bytes);
     println!("match_count             {}", s.match_count);

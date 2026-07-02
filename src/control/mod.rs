@@ -199,7 +199,7 @@ pub enum ControlResponse {
 /// observers the periodic progress reporter uses. All values are an
 /// instantaneous read; rates are cumulative counters the caller can diff
 /// across two `status` calls.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     // ── tunable knobs (current effective values) ──
     /// Filter worker tasks currently alive.
@@ -220,6 +220,8 @@ pub struct StatusSnapshot {
     pub dl_active: usize,
     /// Live download+decompress tasks right now.
     pub files_in_flight: usize,
+    /// Decoders currently blocked waiting for input bytes.
+    pub decoders_input_wait: usize,
     /// Lines queued in the download→filter channel.
     pub line_channel_len: usize,
     /// Capacity of that channel.
@@ -228,6 +230,19 @@ pub struct StatusSnapshot {
     pub downloaded_bytes: u64,
     /// Cumulative matched lines emitted to the sink.
     pub match_count: usize,
+
+    // ── smoothed throughput (MB/s) over trailing windows ──
+    /// Compressed download rate (10s / 30s / 60s trailing avg).
+    pub download_mbps_10s: f64,
+    pub download_mbps_30s: f64,
+    pub download_mbps_60s: f64,
+    /// Decompressed filter-input rate (10s / 30s / 60s trailing avg).
+    pub filter_mbps_10s: f64,
+    pub filter_mbps_30s: f64,
+    pub filter_mbps_60s: f64,
+
+    /// Dominant bottleneck label (same classifier as the progress log).
+    pub bottleneck: String,
 }
 
 /// Parse one request line. Trims the trailing newline for the caller.
@@ -277,10 +292,18 @@ mod tests {
             line_buffer_size: 1000,
             dl_active: 3,
             files_in_flight: 5,
+            decoders_input_wait: 1,
             line_channel_len: 12,
             line_channel_cap: 1000,
             downloaded_bytes: 123_456,
             match_count: 42,
+            download_mbps_10s: 100.0,
+            download_mbps_30s: 95.5,
+            download_mbps_60s: 90.0,
+            filter_mbps_10s: 4200.0,
+            filter_mbps_30s: 4100.0,
+            filter_mbps_60s: 4000.0,
+            bottleneck: "filter".into(),
         };
         let cases = [
             ControlResponse::Status(snap),

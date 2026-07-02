@@ -35,18 +35,22 @@ async fn start(file_slots: usize, range: usize, chunk_bytes: usize, workers: usi
     let (grow_tx, grow_rx) = flume::unbounded::<usize>();
     let (line_tx, _line_rx) = flume::bounded::<u8>(1000);
 
-    let ctx = Arc::new(ControlContext {
-        controls: controls.clone(),
-        grow_workers: grow_tx,
-        status: StatusHandles {
+    let ctx = ControlContext::new(
+        controls.clone(),
+        grow_tx,
+        StatusHandles {
             workers_alive: workers_alive.clone(),
             metrics: ReadPathMetrics::new(0, None),
             download_observer: DownloadObserver::new(),
+            filter_bytes_in: Arc::new(AtomicUsize::new(0)),
             match_count: Arc::new(AtomicUsize::new(0)),
+            workers_in_ingest: Arc::new(AtomicUsize::new(0)),
+            sink_obs: bucket_scrapper::pipeline::SinkObservability::default(),
+            sink_kind: "void",
             line_channel: ChannelObserver::from_sender(&line_tx),
             line_buffer_size: 1000,
         },
-    });
+    );
 
     let socket_for_task = socket.clone();
     let server = tokio::spawn(async move {

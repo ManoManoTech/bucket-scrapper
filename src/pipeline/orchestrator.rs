@@ -488,18 +488,22 @@ impl StreamingDownloader {
         // fires (a live receiver remains), so the join loop explicitly aborts
         // the coordinator if every worker exits before download completes.
         let control_server = self.control_socket.clone().map(|socket_path| {
-            let ctx = Arc::new(ControlContext {
-                controls: self.controls.clone(),
-                grow_workers: grow_workers_tx,
-                status: StatusHandles {
+            let ctx = ControlContext::new(
+                self.controls.clone(),
+                grow_workers_tx,
+                StatusHandles {
                     workers_alive: workers_alive.clone(),
                     metrics: metrics.clone(),
                     download_observer: download_observer.clone(),
+                    filter_bytes_in: filter_bytes_in.clone(),
                     match_count: match_count.clone(),
+                    workers_in_ingest: workers_in_ingest.clone(),
+                    sink_obs: sink.sink_observability(),
+                    sink_kind: sink.type_name(),
                     line_channel: control_line_obs,
                     line_buffer_size: self.config.line_buffer_size,
                 },
-            });
+            );
             tokio::spawn(async move {
                 if let Err(e) = crate::control::server::serve(socket_path, ctx).await {
                     warn!(error = %e, "Control server exited with error");

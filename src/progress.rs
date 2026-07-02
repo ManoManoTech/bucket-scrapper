@@ -421,7 +421,7 @@ fn classify_bottleneck_http(
 /// - `download` — decoders are starved and nothing's reassembly-blocked: the
 ///   network isn't delivering.
 #[allow(clippy::too_many_arguments)]
-fn classify_bottleneck_non_http(
+pub(crate) fn classify_bottleneck_non_http(
     dc_pct: usize,
     in_ingest: usize,
     total_workers: usize,

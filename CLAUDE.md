@@ -59,7 +59,10 @@ Knobs are live because the pipeline shares them via `Arc`:
   posts to a retire-counter workers honor at their next line boundary.
 - `bsctl … part-size <MB>` — chunked-download part size (0 disables); applies to
   objects dispatched after the change.
-- `bsctl … status` — live snapshot (effective knobs + gauges).
+- `bsctl … status` — live snapshot: effective knobs, gauges (`dl_active`,
+  `files_in_flight`, `decoders_input_wait`, line-channel fill), the `bottleneck`
+  label (same classifier as the progress log), and smoothed download/filter
+  MB/s over 10s/30s/60s windows.
 - `bsctl … line-buffer <N>` — **unsupported in v1** (flume bounded channels can't
   resize in place); the daemon returns an `unsupported` notice.
 
