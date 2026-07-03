@@ -7,4 +7,6 @@ pub mod runtime_report;
 pub mod s3;
 pub mod sampling;
 pub mod sharding;
+pub mod sysmetrics;
+pub mod tune;
 pub mod utils;

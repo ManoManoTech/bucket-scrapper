@@ -350,3 +350,92 @@ async fn run_filter_workers_test() -> Result<()> {
     run.abort();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autotune_converges_against_void() {
+    skip_unless_docker!();
+    if let Err(e) = run_autotune_test().await {
+        panic!("autotune_converges_against_void failed: {e:#}");
+    }
+}
+
+/// End-to-end smoke of the real `bsctl autotune` binary against a live
+/// Garage→void pipeline: it must reset to baseline, run trials, settle on a
+/// best, and exit 0. Fast settle/window keep it inside the run's lifetime;
+/// high ceilings keep the box's ambient pressure from cutting it short — this
+/// checks the loop machinery, not tuning quality.
+async fn run_autotune_test() -> Result<()> {
+    let garage = start_garage(BUCKET).await?;
+    let staged = tiny_fixture(24000); // ~15s at 2 slots — outlives the loop
+    seed_parallel(&garage.s3_client(), &staged).await?;
+    let objects = object_infos(&staged)?;
+
+    let tmp = tempfile::tempdir()?;
+    let sock = tmp.path().join("ctl.sock");
+    let config = StreamingDownloaderConfig {
+        max_concurrent_downloads: 8,
+        filter_tasks: 4,
+        line_buffer_size: 1000,
+        file_slots: 8,
+        ..Default::default()
+    };
+    let downloader = StreamingDownloader::new(garage.s3_client(), config)
+        .with_control_socket(Some(sock.clone()));
+    let run = tokio::spawn(async move {
+        let sink: Arc<dyn OutputSink> = Arc::new(VoidOutputSink::new());
+        downloader.search_objects(&objects, searcher(), sink).await
+    });
+
+    wait_for_socket(&sock).await?;
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bsctl"))
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "autotune",
+            "--settle-secs",
+            "1",
+            "--window",
+            "10",
+            "--max-trials",
+            "4",
+            "--dl-start",
+            "2",
+            "--dl-cap",
+            "12",
+            "--filter-start",
+            "2",
+            "--filter-cap",
+            "12",
+            "--cpu-ceiling",
+            "100",
+            "--mem-ceiling",
+            "100",
+        ])
+        .output()
+        .await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "bsctl autotune failed; stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("autotune done") && stdout.contains("applied"),
+        "expected a settled+applied summary; got:\n{stdout}"
+    );
+    // It ran real trials starting from the baseline reset (dl=2), proving the
+    // loop actually applied knobs rather than passing vacuously.
+    assert!(
+        stdout.contains("trial  1: dl=2 "),
+        "expected trial 1 at the baseline reset dl=2: {stdout}"
+    );
+    let s = status(&sock).await?;
+    assert!(
+        (2..=12).contains(&s.download_tasks_limit) && (2..=12).contains(&s.filter_workers_alive),
+        "settled knobs out of searched range: {s:?}"
+    );
+
+    run.abort();
+    Ok(())
+}

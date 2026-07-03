@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use super::{
 use crate::pipeline::observer::{ChannelObserver, DownloadObserver, ReadPathMetrics};
 use crate::pipeline::SinkObservability;
 use crate::progress::classify_bottleneck_non_http;
+use crate::sysmetrics::{self, CpuMeter};
 
 /// How long a history we keep for the trailing-window rates, and how often the
 /// background sampler records a point.
@@ -135,6 +136,8 @@ pub struct ControlContext {
     pub grow_workers: flume::Sender<usize>,
     pub status: StatusHandles,
     throughput: Arc<ThroughputWindows>,
+    /// Latest busy %CPU (f64 bits; NaN = no reading), published by the sampler.
+    cpu_percent: Arc<AtomicU64>,
 }
 
 impl ControlContext {
@@ -149,6 +152,7 @@ impl ControlContext {
             grow_workers,
             status,
             throughput: ThroughputWindows::new(),
+            cpu_percent: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
         })
     }
 
@@ -181,6 +185,7 @@ impl ControlContext {
         let (dl10, f10) = self.throughput.rates(Duration::from_secs(10));
         let (dl30, f30) = self.throughput.rates(Duration::from_secs(30));
         let (dl60, f60) = self.throughput.rates(Duration::from_secs(60));
+        let cpu_psi = sysmetrics::cpu_pressure();
 
         StatusSnapshot {
             filter_workers_alive: workers_alive,
@@ -203,6 +208,10 @@ impl ControlContext {
             filter_mbps_30s: f30,
             filter_mbps_60s: f60,
             bottleneck: bottleneck.to_string(),
+            cpu_percent: sysmetrics::load_f64(&self.cpu_percent),
+            cpu_pressure_avg10: cpu_psi.map(|p| p.some_avg10),
+            cpu_pressure_avg60: cpu_psi.map(|p| p.some_avg60),
+            mem_pressure_avg10: sysmetrics::memory_pressure().map(|p| p.some_avg10),
         }
     }
 
@@ -324,17 +333,19 @@ pub async fn serve(socket_path: PathBuf, ctx: Arc<ControlContext>) -> Result<()>
     restrict_permissions(&socket_path);
     info!(socket = %socket_path.display(), "Control socket listening");
 
-    // Background sampler feeding the trailing-window rates.
+    // Background sampler feeding the trailing-window rates and %CPU.
     let sampler = {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
+            let mut cpu = CpuMeter::new();
             loop {
                 tick.tick().await;
                 ctx.throughput.record(
                     ctx.status.download_observer.bytes() as u64,
                     ctx.status.filter_bytes_in.load(Ordering::Relaxed) as u64,
                 );
+                sysmetrics::store_f64(&ctx.cpu_percent, cpu.sample());
             }
         })
     };

@@ -31,7 +31,9 @@ Key modules:
 - `src/pipeline/observer.rs` — observer primitives: `PipelineObserver`, `ChannelObserver`, `DownloadObserver`
 - `src/control/mod.rs` — runtime control plane: wire protocol (`ControlRequest`/`ControlResponse`/`StatusSnapshot`) + `RuntimeControls` (live-tunable shared state)
 - `src/control/server.rs` — Unix-domain-socket control server (`serve`, `ControlContext`, `StatusHandles`)
-- `src/bin/bsctl.rs` — control client binary (`bsctl`)
+- `src/bin/bsctl.rs` — control client binary (`bsctl`) incl. the `autotune` loop
+- `src/tune/mod.rs` — pure hill-climb auto-tune policy (`HillClimbPolicy`, ceiling-aware, ported from the `wip/auto-tuner` tag)
+- `src/sysmetrics.rs` — host saturation signals (PSI cpu/memory pressure + `/proc/stat` %CPU)
 - `src/config/output.rs` — `OutputConfig` tagged enum + `${ENV}` interpolation + template/codec validation
 - `src/config/resolve.rs` — selects config-driven vs CLI-driven mode (mixing is a hard error)
 - `src/matcher.rs` — `LineMatcher`: stateless regex wrapper around `grep-matcher`
@@ -65,6 +67,13 @@ Knobs are live because the pipeline shares them via `Arc`:
   MB/s over 10s/30s/60s windows.
 - `bsctl … line-buffer <N>` — **unsupported in v1** (flume bounded channels can't
   resize in place); the daemon returns an `unsupported` notice.
+- `bsctl … autotune [--dry-run]` — classifier-guided hill-climb over the live
+  run: resets to a conservative baseline, then grows the *current bottleneck's*
+  knob (download-concurrency or filter-workers), reverting on regression and
+  saturating a knob once PSI `cpu`/`memory.pressure` crosses the ceiling — so it
+  settles at the peak without driving into the oversubscription cliff. Objective
+  is smoothed download MB/s; `--dry-run` logs proposals without applying. Policy
+  lives in `src/tune`; the loop is in `bsctl`.
 
 With `--no-socket`, the server never starts (zero overhead). A socket bind
 failure is non-fatal — it's logged and the sweep continues without a control

@@ -243,6 +243,16 @@ pub struct StatusSnapshot {
 
     /// Dominant bottleneck label (same classifier as the progress log).
     pub bottleneck: String,
+
+    // ── host saturation signals (None when unavailable) ──
+    /// Busy %CPU from /proc/stat over the last sampler tick. Weak on its own
+    /// (counts stall cycles as busy); read beside the pressure fields.
+    pub cpu_percent: Option<f64>,
+    /// PSI cpu.pressure `some` avg10 / avg60 (% of time a task waited on CPU).
+    pub cpu_pressure_avg10: Option<f64>,
+    pub cpu_pressure_avg60: Option<f64>,
+    /// PSI memory.pressure `some` avg10 (high ⇒ memory-bound; shrink, don't grow).
+    pub mem_pressure_avg10: Option<f64>,
 }
 
 /// Parse one request line. Trims the trailing newline for the caller.
@@ -304,6 +314,10 @@ mod tests {
             filter_mbps_30s: 4100.0,
             filter_mbps_60s: 4000.0,
             bottleneck: "filter".into(),
+            cpu_percent: Some(97.5),
+            cpu_pressure_avg10: Some(12.3),
+            cpu_pressure_avg60: Some(8.0),
+            mem_pressure_avg10: None,
         };
         let cases = [
             ControlResponse::Status(snap),

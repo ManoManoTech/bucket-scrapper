@@ -217,3 +217,58 @@ async fn bad_request_line_yields_error_response() {
         serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert!(matches!(resp, ControlResponse::Error(_)), "got {resp:?}");
 }
+
+/// Drive the real `bsctl autotune --dry-run` binary against the synthetic
+/// server: it must run the loop (proposing, reading status) but apply nothing —
+/// no adjust reaches the daemon, the knob limits are untouched, and no filter
+/// grow is signalled. Hermetic (no Docker); settle 0 keeps it instant.
+#[tokio::test]
+async fn autotune_dry_run_proposes_without_applying() {
+    let h = start(32, 16, 0, 8).await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bsctl"))
+        .args([
+            "--socket",
+            h.socket.to_str().unwrap(),
+            "autotune",
+            "--dry-run",
+            "--settle-secs",
+            "0",
+            "--max-trials",
+            "4",
+            "--dl-start",
+            "4",
+            "--filter-start",
+            "2",
+            "--cpu-ceiling",
+            "100",
+            "--mem-ceiling",
+            "100",
+        ])
+        .output()
+        .await
+        .expect("run bsctl");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "bsctl failed; stdout={stdout}");
+    assert!(
+        stdout.contains("DRY-RUN"),
+        "expected dry-run banner: {stdout}"
+    );
+    assert!(
+        stdout.contains("would set"),
+        "expected proposal log: {stdout}"
+    );
+    assert!(
+        stdout.contains("not applied"),
+        "expected no-apply notice: {stdout}"
+    );
+
+    // Nothing was actually applied: limits untouched, no filter-grow signalled.
+    assert_eq!(h.controls.file_limit(), 32);
+    assert_eq!(h.controls.range_limit(), 16);
+    assert_eq!(h.controls.filter_retire_pending(), 0);
+    assert!(
+        h.grow_rx.try_recv().is_err(),
+        "dry-run must not grow workers"
+    );
+}
