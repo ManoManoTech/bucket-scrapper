@@ -12,7 +12,9 @@ use crate::pipeline::codec::{Codec, CompressionConfig};
 use crate::pipeline::framing::OutputFormat;
 use crate::pipeline::path_template::{validate_template, TemplateRules};
 use anyhow::{anyhow, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// One configured output.
 ///
@@ -67,6 +69,12 @@ pub struct HttpOutputConfig {
     pub url: String,
     #[serde(default)]
     pub bearer_auth: Option<String>,
+    /// Additional static HTTP headers sent with every request (e.g.
+    /// `DD-API-KEY`). Values support `${ENV}` interpolation. The names
+    /// `content-type`, `content-encoding`, and `authorization` are managed
+    /// internally and rejected at validation time.
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_http_batch_max_mb")]
@@ -231,6 +239,9 @@ pub fn expand_env(cfg: &mut OutputConfig) -> Result<()> {
             if let Some(s) = c.bearer_auth.as_mut() {
                 expand_in_place(s, "outputs[].bearer_auth")?;
             }
+            for (name, value) in c.extra_headers.iter_mut() {
+                expand_in_place(value, &format!("outputs[].extra_headers[{name}]"))?;
+            }
         }
         OutputConfig::S3(c) => {
             expand_in_place(&mut c.bucket, "outputs[].bucket")?;
@@ -268,6 +279,24 @@ pub fn validate_output(cfg: &OutputConfig) -> Result<()> {
         OutputConfig::Http(c) => {
             Codec::from_config(&c.compression)
                 .map_err(|e| anyhow!("outputs[].compression: {e}"))?;
+            for (name, value) in &c.extra_headers {
+                let lower = name.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "content-type" | "content-encoding" | "authorization"
+                ) {
+                    return Err(anyhow!(
+                        "outputs[].extra_headers: header `{name}` is managed internally \
+                         and cannot be overridden (use `bearer_auth` for Authorization)"
+                    ));
+                }
+                HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    anyhow!("outputs[].extra_headers: invalid header name `{name}`: {e}")
+                })?;
+                HeaderValue::from_str(value).map_err(|e| {
+                    anyhow!("outputs[].extra_headers: invalid header value for `{name}`: {e}")
+                })?;
+            }
         }
         OutputConfig::S3(c) => {
             Codec::from_config(&c.compression)
@@ -402,6 +431,51 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("outputs[0].url"), "{msg}");
         assert!(msg.contains("BS_TEST_VAR_MISSING_NODEF"), "{msg}");
+    }
+
+    #[test]
+    fn http_extra_header_values_are_env_expanded() {
+        unsafe { std::env::set_var("BS_TEST_DD_API_KEY", "secret123") };
+        let yaml = r#"
+type: http
+url: https://example.com/api
+extra_headers:
+  DD-API-KEY: ${BS_TEST_DD_API_KEY}
+"#;
+        let mut c: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        expand_env(&mut c).unwrap();
+        match c {
+            OutputConfig::Http(h) => {
+                assert_eq!(h.extra_headers.get("DD-API-KEY").unwrap(), "secret123");
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_extra_header_rejects_reserved_names() {
+        let yaml = r#"
+type: http
+url: https://example.com/api
+extra_headers:
+  Authorization: Bearer x
+"#;
+        let c: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_output(&c).unwrap_err();
+        assert!(format!("{err}").contains("managed internally"));
+    }
+
+    #[test]
+    fn http_extra_header_rejects_invalid_name() {
+        let yaml = r#"
+type: http
+url: https://example.com/api
+extra_headers:
+  "bad header": x
+"#;
+        let c: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_output(&c).unwrap_err();
+        assert!(format!("{err}").contains("invalid header name"));
     }
 
     #[test]

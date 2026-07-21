@@ -98,6 +98,8 @@ outputs:
   # - type: http
   #   url: https://logs.example.com/api/v1/logs
   #   bearer_auth: ${HTTP_BEARER_AUTH}
+  #   extra_headers:               # additional static headers, e.g. Datadog
+  #     DD-API-KEY: ${DD_API_KEY}
   #   timeout_secs: 30
   #   batch_max_mb: 2
   #   compressor_tasks: null     # null = auto (cpu_count / 8, min 1)

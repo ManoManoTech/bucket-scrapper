@@ -4,6 +4,7 @@ use super::observer::PipelineObserver;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -300,6 +301,8 @@ pub struct HttpWriterConfig {
     pub url: String,
     /// Optional bearer token for Authorization header
     pub bearer_token: Option<String>,
+    /// Additional static headers sent with every request (e.g. `DD-API-KEY`).
+    pub extra_headers: HashMap<String, String>,
     /// Maximum batch size in compressed bytes. Default limit is 30MB.
     pub batch_max_bytes: usize,
     /// Timeout for HTTP requests in seconds
@@ -345,6 +348,7 @@ impl Default for HttpWriterConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            extra_headers: HashMap::new(),
             batch_max_bytes: 2 * 1024 * 1024, // 2MB default
             timeout_secs: 30,
             max_retries: 3,
@@ -832,6 +836,9 @@ impl HttpResultWriter {
             if let Some(token) = &config.bearer_token {
                 request = request.header("Authorization", format!("Bearer {}", token));
             }
+            for (name, value) in &config.extra_headers {
+                request = request.header(name, value);
+            }
             let result = request
                 .body(body.clone()) // O(1) Arc bump
                 .send()
@@ -1200,6 +1207,7 @@ mod tests {
         let cfg = HttpWriterConfig {
             url: format!("{}/api/v1/logs", mock_server.uri()),
             bearer_token: None,
+            extra_headers: HashMap::new(),
             batch_max_bytes: 4 * 1024,
             timeout_secs: 5,
             max_retries: 0,
@@ -1319,6 +1327,7 @@ mod tests {
         let cfg = HttpWriterConfig {
             url: format!("{}/ingest", mock_server.uri()),
             bearer_token: None,
+            extra_headers: HashMap::new(),
             batch_max_bytes: BATCH_MAX_BYTES,
             timeout_secs: 5,
             max_retries: 0,
@@ -1427,6 +1436,7 @@ mod tests {
         let config = HttpWriterConfig {
             url: format!("{}/api/v1/logs", mock_server.uri()),
             bearer_token: Some("test-key".to_string()),
+            extra_headers: HashMap::new(),
             batch_max_bytes: 4 * 1024, // 4KB — small batches flush quickly
             timeout_secs: 5,
             max_retries: 5,

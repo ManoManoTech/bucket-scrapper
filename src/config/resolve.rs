@@ -57,6 +57,7 @@ pub struct OutputCli {
     // http
     pub http_url: Option<String>,
     pub http_bearer_auth: Option<String>,
+    pub http_headers: Vec<(String, String)>,
     pub http_timeout_secs: Option<u64>,
     pub http_batch_max_mb: Option<f64>,
     pub http_compressor_tasks: Option<usize>,
@@ -124,6 +125,9 @@ impl OutputCli {
         check!(output_dir, "--output-dir");
         check!(http_url, "--http-url");
         check!(http_bearer_auth, "--http-bearer-auth");
+        if !self.http_headers.is_empty() {
+            v.push("--http-header");
+        }
         check!(http_timeout_secs, "--http-timeout");
         check!(http_batch_max_mb, "--http-batch-max-mb");
         check!(http_compressor_tasks, "--http-compressor-tasks");
@@ -234,6 +238,7 @@ fn build_from_cli(cli: &OutputCli) -> Result<OutputConfig> {
             OutputConfig::Http(HttpOutputConfig {
                 url,
                 bearer_auth: cli.http_bearer_auth.clone(),
+                extra_headers: cli.http_headers.iter().cloned().collect(),
                 timeout_secs: cli.http_timeout_secs.unwrap_or(30),
                 batch_max_mb: cli.http_batch_max_mb.unwrap_or(2.0),
                 compressor_tasks: cli.http_compressor_tasks,
@@ -294,6 +299,9 @@ fn reject_inactive_flags(kind: OutputKind, cli: &OutputCli) -> Result<()> {
 
     reject_unless!(is_http, http_url, "--http-url");
     reject_unless!(is_http, http_bearer_auth, "--http-bearer-auth");
+    if !is_http && !cli.http_headers.is_empty() {
+        bad.push("--http-header");
+    }
     reject_unless!(is_http, http_timeout_secs, "--http-timeout");
     reject_unless!(is_http, http_batch_max_mb, "--http-batch-max-mb");
     reject_unless!(is_http, http_compressor_tasks, "--http-compressor-tasks");
@@ -416,6 +424,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_driven_http_collects_extra_headers() {
+        let cli = OutputCli {
+            output: Some(OutputKind::Http),
+            http_url: Some("https://example.com/api".to_string()),
+            http_headers: vec![("DD-API-KEY".to_string(), "abc123".to_string())],
+            ..Default::default()
+        };
+        let cfg = resolve_output(&cli, &ConfigSchema::default()).unwrap();
+        match cfg {
+            OutputConfig::Http(h) => {
+                assert_eq!(h.extra_headers.get("DD-API-KEY").unwrap(), "abc123");
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_driven_rejects_http_header_for_non_http_output() {
+        let cli = OutputCli {
+            output: Some(OutputKind::File),
+            output_dir: Some("/tmp".to_string()),
+            http_headers: vec![("DD-API-KEY".to_string(), "abc123".to_string())],
+            ..Default::default()
+        };
+        let err = resolve_output(&cli, &ConfigSchema::default()).unwrap_err();
+        assert!(format!("{err}").contains("--http-header"));
+    }
+
+    #[test]
     fn cli_driven_rejects_inactive_flags() {
         let cli = OutputCli {
             output: Some(OutputKind::File),
@@ -435,6 +472,7 @@ mod tests {
         schema.outputs.push(OutputConfig::Http(HttpOutputConfig {
             url: "https://api.example.com/${BS_TEST_RESOLVE_TOKEN}".to_string(),
             bearer_auth: Some("${BS_TEST_RESOLVE_TOKEN}".to_string()),
+            extra_headers: std::collections::HashMap::new(),
             timeout_secs: 10,
             batch_max_mb: 1.0,
             compressor_tasks: None,

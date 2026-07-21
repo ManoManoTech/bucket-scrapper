@@ -218,6 +218,12 @@ struct Cli {
     #[arg(long, env = "HTTP_BEARER_AUTH")]
     http_bearer_auth: Option<String>,
 
+    /// Additional static HTTP header, as `NAME=VALUE` (e.g.
+    /// `DD-API-KEY=...`). Repeatable. `content-type`, `content-encoding`,
+    /// and `authorization` are reserved (use `--http-bearer-auth` for auth).
+    #[arg(long = "http-header", value_parser = parse_http_header)]
+    http_headers: Vec<(String, String)>,
+
     /// Maximum batch size in MB for HTTP requests.
     #[arg(long)]
     http_batch_max_mb: Option<f64>,
@@ -304,6 +310,17 @@ struct Cli {
     s3_output_multipart_concurrency: Option<usize>,
 }
 
+/// Parse a `--http-header NAME=VALUE` CLI argument into its parts.
+fn parse_http_header(s: &str) -> Result<(String, String), String> {
+    let (name, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE, got `{s}`"))?;
+    if name.is_empty() {
+        return Err(format!("empty header name in `{s}`"));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
 /// CLI mirror of [`CodecFormat`] — kept separate so clap's `ValueEnum`
 /// derive lives in the binary crate and doesn't leak into the library.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -336,6 +353,7 @@ impl Cli {
             output_dir: self.output_dir.clone(),
             http_url: self.http_url.clone(),
             http_bearer_auth: self.http_bearer_auth.clone(),
+            http_headers: self.http_headers.clone(),
             http_timeout_secs: self.http_timeout_secs,
             http_batch_max_mb: self.http_batch_max_mb,
             http_compressor_tasks: self.http_compressor_tasks,
@@ -592,6 +610,7 @@ async fn main() -> Result<()> {
             output_type = "http",
             url = %c.url,
             bearer_auth = c.bearer_auth.is_some(),
+            extra_header_names = ?c.extra_headers.keys().collect::<Vec<_>>(),
             timeout_secs = c.timeout_secs,
             batch_max_mb = c.batch_max_mb,
             compression = ?c.compression.format,
@@ -832,6 +851,7 @@ async fn build_sink(
             let writer_cfg = HttpWriterConfig {
                 url: http_cfg.url.clone(),
                 bearer_token: http_cfg.bearer_auth.clone(),
+                extra_headers: http_cfg.extra_headers.clone(),
                 batch_max_bytes: (http_cfg.batch_max_mb * 1_000_000.0) as usize,
                 timeout_secs: http_cfg.timeout_secs,
                 max_retries: http_cfg.max_retries.min(cli_max_retries.max(1)).min(10),

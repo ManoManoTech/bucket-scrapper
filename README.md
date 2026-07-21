@@ -129,18 +129,21 @@ outputs:
   - type: http
     url: https://logs.example.com/api/v1/logs
     bearer_auth: ${HTTP_BEARER_AUTH}    # ${ENV} interpolation supported
+    extra_headers:                      # additional static headers, e.g. Datadog
+      DD-API-KEY: ${DD_API_KEY}
     timeout_secs: 30
     batch_max_mb: 2
     # compression: { format: zstd, level: 3 }
 ```
 
-Or via CLI (URL and token can also come from `HTTP_URL` / `HTTP_BEARER_AUTH`):
+Or via CLI (URL and token can also come from `HTTP_URL` / `HTTP_BEARER_AUTH`; `--http-header` is repeatable):
 
 ```bash
 bucket-scrapper -s 2024-01-15T10:00:00Z \
   --output http \
   --http-url "https://logs.example.com/api/v1/logs" \
-  --http-bearer-auth "your-token"
+  --http-bearer-auth "your-token" \
+  --http-header "DD-API-KEY=${DD_API_KEY}"
 ```
 
 ### S3 sink

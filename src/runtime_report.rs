@@ -1028,6 +1028,7 @@ mod tests {
         let http = OutputConfig::Http(HttpOutputConfig {
             url: "http://x".into(),
             bearer_auth: None,
+            extra_headers: std::collections::HashMap::new(),
             timeout_secs: 30,
             batch_max_mb: 2.0,
             compressor_tasks: Some(7), // user-set
@@ -1063,6 +1064,7 @@ mod tests {
         let http = OutputConfig::Http(HttpOutputConfig {
             url: "http://x".into(),
             bearer_auth: None,
+            extra_headers: std::collections::HashMap::new(),
             timeout_secs: 30,
             batch_max_mb: 2.0,
             compressor_tasks: None, // inferred from default
