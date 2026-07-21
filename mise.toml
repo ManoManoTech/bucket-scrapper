@@ -4,4 +4,4 @@
 lefthook = "latest"
 # Pinned (not "latest", which froze to a stale install and drifted behind CI).
 # Keep this in lockstep with the toolchain in .github/workflows/ci.yml.
-rust = "1.96.0"
+rust = "1.97.1"
