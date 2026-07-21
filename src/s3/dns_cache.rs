@@ -34,7 +34,8 @@ impl CachingDnsResolver {
     pub async fn new(ttl_seconds: u64) -> Result<Self> {
         let resolver = hickory_resolver::TokioResolver::builder_tokio()
             .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {e}"))?
-            .build();
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build DNS resolver: {e}"))?;
 
         let cache = Cache::builder()
             .max_capacity(10_000)
